@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import io
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -207,9 +207,14 @@ def clear_cache():
     st.cache_data.clear()
 
 
+AUTO_SYNC_INTERVAL_MS = 300_000
+
+
 def init_sync_state() -> None:
     if "auto_sync_enabled" not in st.session_state:
         st.session_state.auto_sync_enabled = False
+    if "last_datagolf_sync_attempt_at" not in st.session_state:
+        st.session_state.last_datagolf_sync_attempt_at = None
     if "datagolf_sync_status" not in st.session_state:
         st.session_state.datagolf_sync_status = None
     if "daily_report_draft" not in st.session_state:
@@ -237,9 +242,40 @@ def format_sync_timestamp(value: datetime | None) -> str:
 def perform_live_sync(use_backoff: bool = True) -> datagolf_sync.SyncResult:
     result = datagolf_sync.execute_sync(sb, get_sync_secrets(), use_backoff=use_backoff)
     st.session_state.datagolf_sync_status = result
+    st.session_state.last_datagolf_sync_attempt_at = result.synced_at
     if result.auto_sync_suspended:
         st.session_state.auto_sync_enabled = False
     return result
+
+
+def get_last_sync_attempt_time() -> datetime | None:
+    session_ts = st.session_state.get("last_datagolf_sync_attempt_at")
+    if session_ts is not None:
+        return session_ts
+    return datagolf_sync.get_last_sync_attempt(sb)
+
+
+def maybe_run_auto_sync() -> None:
+    if sb is None or not st.session_state.get("auto_sync_enabled"):
+        return
+    if datagolf_sync.is_auto_sync_suspended(sb):
+        st.session_state.auto_sync_enabled = False
+        return
+    last_attempt = get_last_sync_attempt_time()
+    if not datagolf_sync.is_auto_sync_due(sb, last_attempt=last_attempt):
+        return
+    result = perform_live_sync(use_backoff=False)
+    if result.success:
+        clear_cache()
+
+
+def setup_auto_refresh() -> None:
+    if not st.session_state.get("auto_sync_enabled"):
+        return
+    from streamlit_autorefresh import st_autorefresh
+
+    st_autorefresh(interval=AUTO_SYNC_INTERVAL_MS, key="datagolf_auto_refresh")
+    maybe_run_auto_sync()
 
 
 def render_datagolf_sync_status(result: datagolf_sync.SyncResult | None) -> None:
@@ -311,21 +347,6 @@ def render_field_import_result(result: datagolf_sync.FieldImportResult) -> None:
         with st.expander(f"Tvetydige / ikke importerte ({len(result.ambiguous_names)})"):
             for name in result.ambiguous_names:
                 st.write(name)
-
-
-@st.fragment(run_every=timedelta(minutes=5))
-def datagolf_auto_sync_fragment() -> None:
-    if sb is None:
-        return
-    if datagolf_sync.is_auto_sync_suspended(sb):
-        st.session_state.auto_sync_enabled = False
-        return
-    if st.session_state.get("auto_sync_enabled"):
-        result = perform_live_sync(use_backoff=False)
-        if result.success:
-            clear_cache()
-            st.rerun()
-
 
 def parse_excel(file_bytes: bytes | None = None) -> tuple[pd.DataFrame, list[str]]:
     source = io.BytesIO(file_bytes) if file_bytes else DEFAULT_FILE
@@ -515,7 +536,7 @@ st.markdown(f'''
 ''', unsafe_allow_html=True)
 
 init_sync_state()
-datagolf_auto_sync_fragment()
+setup_auto_refresh()
 
 with st.sidebar:
     mode = st.radio("Modus", ["Deltakervisning", "Admin"])

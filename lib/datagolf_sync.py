@@ -6,7 +6,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -198,6 +198,9 @@ def log_sync_event(
         logger.warning("Could not write sync_log: %s", exc)
 
 
+AUTO_SYNC_INTERVAL = timedelta(minutes=5)
+
+
 def get_last_successful_sync(client: Client | None) -> datetime | None:
     if client is None:
         return None
@@ -215,6 +218,38 @@ def get_last_successful_sync(client: Client | None) -> datetime | None:
     except Exception as exc:
         logger.warning("Could not read last successful sync: %s", exc)
     return None
+
+
+def get_last_sync_attempt(client: Client | None) -> datetime | None:
+    if client is None:
+        return None
+    try:
+        response = (
+            client.table("sync_log")
+            .select("created_at")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if response.data:
+            return parse_sync_timestamp(response.data[0]["created_at"])
+    except Exception as exc:
+        logger.warning("Could not read last sync attempt: %s", exc)
+    return None
+
+
+def is_auto_sync_due(
+    client: Client | None,
+    last_attempt: datetime | None = None,
+    now: datetime | None = None,
+) -> bool:
+    reference = last_attempt if last_attempt is not None else get_last_sync_attempt(client)
+    if reference is None:
+        return True
+    current = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    return current - reference >= AUTO_SYNC_INTERVAL
 
 
 def count_consecutive_rate_limits(client: Client | None) -> int:
@@ -1040,6 +1075,36 @@ def run_field_import_test() -> dict[str, Any]:
             "expected": [],
             "actual": ambiguous_names,
             "passed": ambiguous_names == [],
+        },
+    ]
+    return {
+        "passed": all(item["passed"] for item in checks),
+        "checks": checks,
+    }
+
+
+def run_auto_sync_interval_test() -> dict[str, Any]:
+    now = datetime(2026, 6, 19, 12, 0, tzinfo=timezone.utc)
+    recent = now - timedelta(minutes=2)
+    due = now - timedelta(minutes=6)
+    checks = [
+        {
+            "name": "Sync due when no prior attempt",
+            "expected": True,
+            "actual": is_auto_sync_due(None, last_attempt=None, now=now),
+            "passed": is_auto_sync_due(None, last_attempt=None, now=now),
+        },
+        {
+            "name": "Sync not due within 5 minutes",
+            "expected": False,
+            "actual": is_auto_sync_due(None, last_attempt=recent, now=now),
+            "passed": not is_auto_sync_due(None, last_attempt=recent, now=now),
+        },
+        {
+            "name": "Sync due after 5 minutes",
+            "expected": True,
+            "actual": is_auto_sync_due(None, last_attempt=due, now=now),
+            "passed": is_auto_sync_due(None, last_attempt=due, now=now),
         },
     ]
     return {

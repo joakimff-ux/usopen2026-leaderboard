@@ -18,6 +18,7 @@ from lib.datagolf_sync import (
     execute_sync,
     get_api_key_from_mapping,
     preview_sync_scores,
+    run_auto_sync_interval_test,
     run_cumulative_delta_test,
     run_field_import_test,
     run_name_matching_test,
@@ -92,6 +93,17 @@ def run_test(secrets: dict[str, str]) -> int:
         print("Rate limit tests failed.")
         return 1
     print("Rate limit tests passed.")
+
+    auto_sync_interval = run_auto_sync_interval_test()
+    print("\nAuto-sync interval tests:")
+    for check in auto_sync_interval["checks"]:
+        status = "PASS" if check["passed"] else "FAIL"
+        print(f"  [{status}] {check['name']}")
+        print(f"         expected={check['expected']} actual={check['actual']}")
+    if not auto_sync_interval["passed"]:
+        print("Auto-sync interval tests failed.")
+        return 1
+    print("Auto-sync interval tests passed.")
 
     api_key = get_api_key_from_mapping(secrets)
     if not api_key:
