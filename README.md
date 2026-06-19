@@ -17,3 +17,13 @@ py -m streamlit run app.py
 ## Første import
 
 Gå til Admin -> Import fra Excel og trykk importknappen. Appen leser filen i `data/US Open 2026 - Resultater.xlsx` eller en opplastet Excel-fil.
+
+## Lagbytter etter dag 2
+
+Kjør `migrations/001_round_based_rosters.sql` i Supabase SQL editor én gang.
+
+Deretter kan admin under **Laguttak**:
+- redigere originalt lag for Dag 1–2
+- bytte inntil 3 spillere for Dag 3–4 etter cut
+
+Leaderboard bruker originalt lag for Dag 1–2 og oppdatert lag for Dag 3–4.

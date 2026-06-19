@@ -16,7 +16,9 @@ create table if not exists team_players (
     id bigint generated always as identity primary key,
     team_id bigint references teams(id) on delete cascade,
     player_id bigint references players(id) on delete cascade,
-    unique(team_id, player_id)
+    active_from_round integer not null default 1 check (active_from_round between 1 and 4),
+    active_to_round integer not null default 4 check (active_to_round between 1 and 4),
+    unique(team_id, player_id, active_from_round)
 );
 
 create table if not exists scores (

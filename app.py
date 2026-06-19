@@ -16,6 +16,15 @@ ROUNDS = [1, 2, 3, 4]
 PLAYERS_PER_TEAM = 7
 COUNTING_SCORES = 5
 DROPPED_SCORES = PLAYERS_PER_TEAM - COUNTING_SCORES
+MAX_POST_CUT_SWAPS = 3
+PRE_CUT_FROM, PRE_CUT_TO = 1, 2
+POST_CUT_FROM, POST_CUT_TO = 3, 4
+ROSTER_LABELS = {
+    1: "Originalt lag",
+    2: "Originalt lag",
+    3: "Etter bytter",
+    4: "Etter bytter",
+}
 
 st.set_page_config(page_title="US Open 2026 - kuppongen", page_icon="⛳", layout="wide")
 
@@ -74,7 +83,123 @@ def fetch_table(name: str) -> pd.DataFrame:
 
 
 def fetch_all() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    return fetch_table("teams"), fetch_table("players"), fetch_table("team_players"), fetch_table("scores")
+    teams = fetch_table("teams")
+    players = fetch_table("players")
+    links = ensure_post_cut_rosters(fetch_table("team_players"))
+    scores = fetch_table("scores")
+    return teams, players, links, scores
+
+
+def links_have_round_ranges(links: pd.DataFrame) -> bool:
+    return (
+        not links.empty
+        and "active_from_round" in links.columns
+        and "active_to_round" in links.columns
+    )
+
+
+def roster_period_for_round(round_no: int) -> tuple[int, int]:
+    if round_no <= 2:
+        return PRE_CUT_FROM, PRE_CUT_TO
+    return POST_CUT_FROM, POST_CUT_TO
+
+
+def filter_team_roster(
+    links: pd.DataFrame,
+    team_id: int,
+    active_from_round: int,
+    active_to_round: int,
+) -> pd.DataFrame:
+    if links.empty:
+        return links
+    if links_have_round_ranges(links):
+        return links[
+            (links.team_id.astype(int) == team_id)
+            & (links.active_from_round.astype(int) == active_from_round)
+            & (links.active_to_round.astype(int) == active_to_round)
+        ]
+    return links[links.team_id.astype(int) == team_id]
+
+
+def get_team_player_ids(
+    links: pd.DataFrame,
+    team_id: int,
+    round_no: int,
+) -> set[int]:
+    active_from, active_to = roster_period_for_round(round_no)
+    team_links = filter_team_roster(links, team_id, active_from, active_to)
+    if team_links.empty:
+        return set()
+    return set(team_links.player_id.astype(int).tolist())
+
+
+def count_post_cut_swaps(original_ids: set[int], post_cut_ids: set[int]) -> int:
+    return len(original_ids - post_cut_ids)
+
+
+def ensure_post_cut_rosters(links: pd.DataFrame) -> pd.DataFrame:
+    """Copy pre-cut rosters to post-cut when round columns exist but copies are missing."""
+    if not links_have_round_ranges(links) or links.empty:
+        return links
+
+    pre_cut = links[
+        (links.active_from_round.astype(int) == PRE_CUT_FROM)
+        & (links.active_to_round.astype(int) == PRE_CUT_TO)
+    ]
+    post_cut = links[
+        (links.active_from_round.astype(int) == POST_CUT_FROM)
+        & (links.active_to_round.astype(int) == POST_CUT_TO)
+    ]
+    if pre_cut.empty:
+        return links
+
+    existing_post = {
+        (int(row.team_id), int(row.player_id))
+        for _, row in post_cut.iterrows()
+    }
+    inserts = []
+    for _, row in pre_cut.iterrows():
+        key = (int(row.team_id), int(row.player_id))
+        if key not in existing_post:
+            inserts.append(
+                {
+                    "team_id": key[0],
+                    "player_id": key[1],
+                    "active_from_round": POST_CUT_FROM,
+                    "active_to_round": POST_CUT_TO,
+                }
+            )
+
+    if inserts:
+        sb.table("team_players").upsert(
+            inserts,
+            on_conflict="team_id,player_id,active_from_round",
+        ).execute()
+        return fetch_table("team_players")
+    return links
+
+
+def save_team_roster(
+    team_id: int,
+    player_ids: list[int],
+    active_from_round: int,
+    active_to_round: int,
+) -> None:
+    sb.table("team_players").delete().eq("team_id", team_id).eq(
+        "active_from_round", active_from_round
+    ).eq("active_to_round", active_to_round).execute()
+    if player_ids:
+        sb.table("team_players").insert(
+            [
+                {
+                    "team_id": team_id,
+                    "player_id": pid,
+                    "active_from_round": active_from_round,
+                    "active_to_round": active_to_round,
+                }
+                for pid in player_ids
+            ]
+        ).execute()
 
 
 def clear_cache():
@@ -184,9 +309,26 @@ def import_excel_to_supabase(file_bytes: bytes | None = None):
     for _, row in players_df.iterrows():
         for team in teams:
             if bool(row.get(team)) and team in team_id and row["name"] in player_id:
-                links.append({"team_id": int(team_id[team]), "player_id": int(player_id[row["name"]])})
+                pid = int(player_id[row["name"]])
+                tid = int(team_id[team])
+                links.append(
+                    {
+                        "team_id": tid,
+                        "player_id": pid,
+                        "active_from_round": PRE_CUT_FROM,
+                        "active_to_round": PRE_CUT_TO,
+                    }
+                )
+                links.append(
+                    {
+                        "team_id": tid,
+                        "player_id": pid,
+                        "active_from_round": POST_CUT_FROM,
+                        "active_to_round": POST_CUT_TO,
+                    }
+                )
     if links:
-        sb.table("team_players").upsert(links, on_conflict="team_id,player_id").execute()
+        sb.table("team_players").upsert(links, on_conflict="team_id,player_id,active_from_round").execute()
 
 
 def fmt_score(x):
@@ -218,16 +360,25 @@ def build_model(teams: pd.DataFrame, players: pd.DataFrame, links: pd.DataFrame,
     detail = []
     summary = []
     for _, t in teams.sort_values("name").iterrows():
-        team_links = links[links.team_id == t.id] if not links.empty else pd.DataFrame()
-        picked_ids = set(team_links.player_id.astype(int).tolist()) if not team_links.empty else set()
-        picked = players[players.id.astype(int).isin(picked_ids)].sort_values("name")
+        team_id = int(t.id)
         total = 0
         row = {"Lag": t["name"]}
         for rnd, day in zip(ROUNDS, DAYS):
+            picked_ids = get_team_player_ids(links, team_id, rnd)
+            picked = players[players.id.astype(int).isin(picked_ids)].sort_values("name")
             round_rows = []
             for _, p in picked.iterrows():
                 val = score_map.get((int(p.id), rnd))
-                round_rows.append({"Lag": t["name"], "Dag": day, "Spiller": p["name"], "Score": val})
+                round_rows.append(
+                    {
+                        "Lag": t["name"],
+                        "Dag": day,
+                        "Runde": rnd,
+                        "Spiller": p["name"],
+                        "Score": val,
+                        "Lagtype": ROSTER_LABELS[rnd],
+                    }
+                )
             scored = pd.DataFrame(round_rows).dropna(subset=["Score"]).sort_values("Score", ascending=True)
             counting = scored.head(COUNTING_SCORES).copy()
             dropped = scored.iloc[COUNTING_SCORES:].copy()
@@ -366,10 +517,13 @@ if mode == "Admin" and is_admin:
                 sb.table("players").delete().eq("id", pid).execute()
                 st.rerun()
     with tabs[4]:
-        st.subheader("Legg spillere på lag")
+        st.subheader("Originalt lag (Dag 1–2)")
         if teams.empty or players.empty:
             st.info("Legg til lag og spillere først.")
-        else:
+        elif not links_have_round_ranges(links):
+            st.warning(
+                "Kjør migrations/001_round_based_rosters.sql i Supabase for å aktivere lagbytter etter dag 2."
+            )
             t_name = st.selectbox("Lag", teams.sort_values("name")["name"].tolist(), key="assign_team")
             tid = int(teams.loc[teams.name == t_name, "id"].iloc[0])
             current_ids = links[links.team_id == tid].player_id.astype(int).tolist() if not links.empty else []
@@ -381,8 +535,71 @@ if mode == "Admin" and is_admin:
                 sb.table("team_players").delete().eq("team_id", tid).execute()
                 new_ids = players[players.name.isin(selected)].id.astype(int).tolist()
                 if new_ids:
-                    sb.table("team_players").insert([{"team_id": tid, "player_id": pid} for pid in new_ids]).execute()
+                    sb.table("team_players").insert(
+                        [{"team_id": tid, "player_id": pid} for pid in new_ids]
+                    ).execute()
+                clear_cache()
                 st.rerun()
+        else:
+            t_name = st.selectbox("Lag", teams.sort_values("name")["name"].tolist(), key="assign_team")
+            tid = int(teams.loc[teams.name == t_name, "id"].iloc[0])
+            pre_cut_links = filter_team_roster(links, tid, PRE_CUT_FROM, PRE_CUT_TO)
+            current_ids = pre_cut_links.player_id.astype(int).tolist() if not pre_cut_links.empty else []
+            player_options = players.sort_values("name")["name"].tolist()
+            current_names = players[players.id.astype(int).isin(current_ids)]["name"].tolist()
+            selected = st.multiselect(
+                "Velg 7 spillere for Dag 1–2",
+                player_options,
+                default=current_names,
+                key="pre_cut_roster",
+            )
+            st.caption(f"Valgt: {len(selected)} av {PLAYERS_PER_TEAM}")
+            if st.button("Lagre originalt lag"):
+                if len(selected) != PLAYERS_PER_TEAM:
+                    st.error(f"Originalt lag må ha nøyaktig {PLAYERS_PER_TEAM} spillere.")
+                else:
+                    new_ids = players[players.name.isin(selected)].id.astype(int).tolist()
+                    save_team_roster(tid, new_ids, PRE_CUT_FROM, PRE_CUT_TO)
+                    clear_cache()
+                    st.success("Originalt lag lagret for Dag 1–2.")
+                    st.rerun()
+
+            st.divider()
+            st.subheader("Bytter etter dag 2")
+            st.caption("Dag 3–4 bruker oppdatert lag. Maks 3 bytter per lag.")
+
+            original_ids = get_team_player_ids(links, tid, 1)
+            original_names = players[players.id.astype(int).isin(original_ids)].sort_values("name")["name"].tolist()
+            st.write("**Originalt lag (Dag 1–2):**", ", ".join(original_names) if original_names else "Ingen spillere")
+
+            post_cut_links = filter_team_roster(links, tid, POST_CUT_FROM, POST_CUT_TO)
+            post_cut_ids = post_cut_links.player_id.astype(int).tolist() if not post_cut_links.empty else current_ids
+            post_cut_names = players[players.id.astype(int).isin(post_cut_ids)]["name"].tolist()
+            post_cut_selected = st.multiselect(
+                "Velg 7 spillere for Dag 3–4",
+                player_options,
+                default=post_cut_names,
+                key="post_cut_roster",
+            )
+            post_cut_new_ids = set(players[players.name.isin(post_cut_selected)].id.astype(int).tolist())
+            swaps_used = count_post_cut_swaps(original_ids, post_cut_new_ids)
+            st.caption(f"Bytter brukt: {swaps_used}/{MAX_POST_CUT_SWAPS}")
+
+            if st.button("Lagre lag etter bytter"):
+                if len(post_cut_selected) != PLAYERS_PER_TEAM:
+                    st.error(f"Lag etter bytter må ha nøyaktig {PLAYERS_PER_TEAM} spillere.")
+                elif swaps_used > MAX_POST_CUT_SWAPS:
+                    st.error(f"Maks {MAX_POST_CUT_SWAPS} bytter er tillatt etter dag 2.")
+                else:
+                    save_team_roster(
+                        tid,
+                        list(post_cut_new_ids),
+                        POST_CUT_FROM,
+                        POST_CUT_TO,
+                    )
+                    clear_cache()
+                    st.success("Lag for Dag 3–4 er lagret.")
+                    st.rerun()
 
 st.subheader("🏆 Leaderboard")
 if leaderboard.empty:
@@ -395,19 +612,32 @@ if details.empty:
     st.info("Ingen scorer registrert ennå.")
 else:
     team = st.selectbox("Velg lag", sorted(details["Lag"].unique()))
-    for day in DAYS:
+    for rnd, day in zip(ROUNDS, DAYS):
         day_df = details[(details["Lag"] == team) & (details["Dag"] == day)].copy()
         if day_df.empty:
             continue
         day_df["Score"] = day_df["Score"].map(fmt_score)
-        with st.expander(f"{day} - {team}", expanded=(day == DAYS[0])):
+        roster_label = ROSTER_LABELS[rnd]
+        with st.expander(f"{day} - {team} ({roster_label})", expanded=(day == DAYS[0])):
+            st.caption(f"Lagtype: {roster_label}")
             st.dataframe(day_df[["Teller", "Rang", "Spiller", "Score"]], width="stretch", hide_index=True)
 
 st.subheader("📋 Spillerstall")
 if not teams.empty and not players.empty:
     roster_rows = []
     for _, t in teams.sort_values("name").iterrows():
-        ids = links[links.team_id == t.id].player_id.astype(int).tolist() if not links.empty else []
-        names = players[players.id.astype(int).isin(ids)].sort_values("name")["name"].tolist()
-        roster_rows.append({"Lag": t["name"], "Antall": len(names), "Spillere": ", ".join(names)})
+        tid = int(t.id)
+        pre_ids = get_team_player_ids(links, tid, 1)
+        post_ids = get_team_player_ids(links, tid, 3) if links_have_round_ranges(links) else pre_ids
+        pre_names = players[players.id.astype(int).isin(pre_ids)].sort_values("name")["name"].tolist()
+        post_names = players[players.id.astype(int).isin(post_ids)].sort_values("name")["name"].tolist()
+        swaps = count_post_cut_swaps(pre_ids, post_ids) if links_have_round_ranges(links) else 0
+        roster_rows.append(
+            {
+                "Lag": t["name"],
+                "Dag 1–2": ", ".join(pre_names),
+                "Dag 3–4": ", ".join(post_names),
+                "Bytter": f"{swaps}/{MAX_POST_CUT_SWAPS}" if links_have_round_ranges(links) else "-",
+            }
+        )
     st.dataframe(pd.DataFrame(roster_rows), width="stretch", hide_index=True)
