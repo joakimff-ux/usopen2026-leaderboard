@@ -14,6 +14,7 @@ except ModuleNotFoundError:
 from supabase import create_client
 
 from lib.datagolf_sync import (
+    DataGolfRateLimitError,
     execute_sync,
     get_api_key_from_mapping,
     preview_sync_scores,
@@ -97,7 +98,13 @@ def run_test(secrets: dict[str, str]) -> int:
         print("DATA_GOLF_API_KEY is not configured. Skipping live preview.")
         return 0
 
-    preview = preview_sync_scores(api_key=api_key, use_backoff=False)
+    try:
+        preview = preview_sync_scores(api_key=api_key, use_backoff=False)
+    except DataGolfRateLimitError as exc:
+        print("\nLive score preview skipped: DataGolf HTTP 429.")
+        print(f"  {exc}")
+        return 0
+
     print("\nLive score preview (relative to par):")
     print(f"  Event: {preview['event_name']}")
     print(f"  Records found: {preview['records_found']}")
