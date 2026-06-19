@@ -541,9 +541,9 @@ def admin_login():
 
 st.markdown(f'''
 <div class="hero">
-  <h1>⛳ US Open 2026</h1>
-  <p>Fantasy golf med live leaderboard og administrasjon rett i nettleseren.</p>
-  <span class="pill">7 spillere per lag</span><span class="pill">5 laveste scorer teller</span><span class="pill">2 dårligste droppes hver dag</span><span class="pill">Lavest totalscore vinner</span>
+  <h1>⛳ US Open 2026 Kupongen</h1>
+  <p>Fantasy golf med live leaderboard.</p>
+  <span class="pill">🥇 1. plass: 4.000 kr</span><span class="pill">7 spillere per lag</span><span class="pill">5 laveste scorer teller</span><span class="pill">2 dårligste droppes hver dag</span><span class="pill">Lavest totalscore vinner</span>
 </div>
 ''', unsafe_allow_html=True)
 
