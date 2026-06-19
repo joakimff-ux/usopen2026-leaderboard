@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -16,10 +17,17 @@ from supabase import Client
 logger = logging.getLogger(__name__)
 
 ABORTED_NO_WRITE_MSG = "Existing scores were not modified."
+RATE_LIMIT_BACKOFF_SECONDS = [30, 60, 120]
+MAX_CONSECUTIVE_RATE_LIMITS = 3
+SYNC_LOG_STATUSES = ("success", "error", "rate_limited")
 
 
 class DataGolfRateLimitError(RuntimeError):
     """Raised when DataGolf returns HTTP 429."""
+
+    def __init__(self, message: str, retry_count: int = 0) -> None:
+        super().__init__(message)
+        self.retry_count = retry_count
 
 
 BASE_URL = "https://feeds.datagolf.com"
@@ -48,6 +56,11 @@ class SyncResult:
     sample_writes: list[dict[str, Any]] = field(default_factory=list)
     event_name: str | None = None
     error: str | None = None
+    warning: str | None = None
+    rate_limited: bool = False
+    last_successful_sync: datetime | None = None
+    auto_sync_suspended: bool = False
+    retry_count: int = 0
 
 
 @dataclass
@@ -86,10 +99,42 @@ def build_in_play_url(api_key: str, tour: str = DEFAULT_TOUR) -> str:
     return f"{IN_PLAY_ENDPOINT}?{query}"
 
 
-def fetch_live_tournament_data(api_key: str, tour: str = DEFAULT_TOUR) -> dict[str, Any]:
+def fetch_live_tournament_data(
+    api_key: str,
+    tour: str = DEFAULT_TOUR,
+    use_backoff: bool = True,
+    sleep_fn: Callable[[float], None] | None = None,
+) -> dict[str, Any]:
     if not api_key:
         raise ValueError("DATA_GOLF_API_KEY is not configured.")
 
+    sleeper = sleep_fn or time.sleep
+    retry_count = 0
+    max_attempts = len(RATE_LIMIT_BACKOFF_SECONDS) + 1 if use_backoff else 1
+
+    for attempt in range(max_attempts):
+        try:
+            return _fetch_live_tournament_data_once(api_key=api_key, tour=tour)
+        except DataGolfRateLimitError as exc:
+            retry_count = attempt + 1
+            if use_backoff and attempt < len(RATE_LIMIT_BACKOFF_SECONDS):
+                logger.warning(
+                    "DataGolf HTTP 429 on attempt %s, retrying in %ss",
+                    retry_count,
+                    RATE_LIMIT_BACKOFF_SECONDS[attempt],
+                )
+                sleeper(RATE_LIMIT_BACKOFF_SECONDS[attempt])
+                continue
+            raise DataGolfRateLimitError(
+                f"DataGolf API rate limited (HTTP 429) after {retry_count} attempt(s). "
+                f"{ABORTED_NO_WRITE_MSG}",
+                retry_count=retry_count,
+            ) from exc
+
+    raise RuntimeError("DataGolf fetch failed unexpectedly.")
+
+
+def _fetch_live_tournament_data_once(api_key: str, tour: str = DEFAULT_TOUR) -> dict[str, Any]:
     url = build_in_play_url(api_key, tour=tour)
     try:
         with urlopen(url, timeout=30) as response:
@@ -97,7 +142,8 @@ def fetch_live_tournament_data(api_key: str, tour: str = DEFAULT_TOUR) -> dict[s
     except HTTPError as exc:
         if exc.code == 429:
             raise DataGolfRateLimitError(
-                f"DataGolf API rate limited (HTTP 429). {ABORTED_NO_WRITE_MSG}"
+                f"DataGolf API rate limited (HTTP 429). {ABORTED_NO_WRITE_MSG}",
+                retry_count=0,
             ) from exc
         raise RuntimeError(
             f"DataGolf API request failed with HTTP {exc.code}. {ABORTED_NO_WRITE_MSG}"
@@ -111,6 +157,91 @@ def fetch_live_tournament_data(api_key: str, tour: str = DEFAULT_TOUR) -> dict[s
         return json.loads(payload)
     except json.JSONDecodeError as exc:
         raise RuntimeError("DataGolf API returned invalid JSON.") from exc
+
+
+def parse_sync_timestamp(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        cleaned = value.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(cleaned)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def log_sync_event(
+    client: Client | None,
+    status: str,
+    message: str,
+    http_status: int | None = None,
+    scores_written: int = 0,
+    retry_count: int = 0,
+) -> None:
+    if client is None or status not in SYNC_LOG_STATUSES:
+        return
+    try:
+        client.table("sync_log").insert(
+            {
+                "status": status,
+                "http_status": http_status,
+                "message": message,
+                "scores_written": scores_written,
+                "retry_count": retry_count,
+            }
+        ).execute()
+    except Exception as exc:
+        logger.warning("Could not write sync_log: %s", exc)
+
+
+def get_last_successful_sync(client: Client | None) -> datetime | None:
+    if client is None:
+        return None
+    try:
+        response = (
+            client.table("sync_log")
+            .select("created_at")
+            .eq("status", "success")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if response.data:
+            return parse_sync_timestamp(response.data[0]["created_at"])
+    except Exception as exc:
+        logger.warning("Could not read last successful sync: %s", exc)
+    return None
+
+
+def count_consecutive_rate_limits(client: Client | None) -> int:
+    if client is None:
+        return 0
+    try:
+        response = (
+            client.table("sync_log")
+            .select("status")
+            .order("created_at", desc=True)
+            .limit(10)
+            .execute()
+        )
+        count = 0
+        for row in response.data or []:
+            if row.get("status") == "rate_limited":
+                count += 1
+            else:
+                break
+        return count
+    except Exception as exc:
+        logger.warning("Could not read sync_log for rate limits: %s", exc)
+        return 0
+
+
+def is_auto_sync_suspended(client: Client | None) -> bool:
+    return count_consecutive_rate_limits(client) >= MAX_CONSECUTIVE_RATE_LIMITS
 
 
 def extract_player_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -491,8 +622,12 @@ def build_score_updates(
     return score_rows, matched_players, unmatched_players, player_round_scores
 
 
-def preview_sync_scores(api_key: str, tour: str = DEFAULT_TOUR) -> dict[str, Any]:
-    payload = fetch_live_tournament_data(api_key=api_key, tour=tour)
+def preview_sync_scores(
+    api_key: str,
+    tour: str = DEFAULT_TOUR,
+    use_backoff: bool = False,
+) -> dict[str, Any]:
+    payload = fetch_live_tournament_data(api_key=api_key, tour=tour, use_backoff=use_backoff)
     records = extract_player_records(payload)
     event_round = extract_current_round(payload)
     sample_players = []
@@ -529,17 +664,22 @@ def sync_live_scores(
     client: Client,
     api_key: str,
     tour: str = DEFAULT_TOUR,
+    use_backoff: bool = True,
 ) -> SyncResult:
     synced_at = datetime.now(timezone.utc)
 
     try:
-        payload = fetch_live_tournament_data(api_key=api_key, tour=tour)
+        payload = fetch_live_tournament_data(
+            api_key=api_key,
+            tour=tour,
+            use_backoff=use_backoff,
+        )
         records = extract_player_records(payload)
         event_round = extract_current_round(payload)
         event_name = extract_event_name(payload)
 
         if not records:
-            return SyncResult(
+            result = SyncResult(
                 success=False,
                 synced_at=synced_at,
                 event_name=event_name,
@@ -548,6 +688,8 @@ def sync_live_scores(
                     f"{ABORTED_NO_WRITE_MSG}"
                 ),
             )
+            log_sync_event(client, "error", result.error or "No player records")
+            return finalize_sync_result(client, result)
 
         db_players = fetch_players(client)
         player_lookup = build_player_lookup(db_players)
@@ -558,7 +700,7 @@ def sync_live_scores(
         )
 
         if not score_rows:
-            return SyncResult(
+            result = SyncResult(
                 success=False,
                 synced_at=synced_at,
                 matched_players=sorted(set(matched_players)),
@@ -569,6 +711,8 @@ def sync_live_scores(
                     f"{ABORTED_NO_WRITE_MSG}"
                 ),
             )
+            log_sync_event(client, "error", result.error or "No valid scores")
+            return finalize_sync_result(client, result)
 
         client.table("scores").upsert(score_rows, on_conflict="player_id,round_no").execute()
 
@@ -581,7 +725,7 @@ def sync_live_scores(
             for player_name in sorted(player_round_scores.keys())[:10]
         ]
 
-        return SyncResult(
+        result = SyncResult(
             success=True,
             synced_at=synced_at,
             players_updated=len(matched_player_ids),
@@ -591,41 +735,104 @@ def sync_live_scores(
             sample_writes=sample_writes,
             event_name=event_name,
         )
+        log_sync_event(
+            client,
+            "success",
+            f"Synced {len(score_rows)} scores for {len(matched_player_ids)} players.",
+            scores_written=len(score_rows),
+        )
+        result.last_successful_sync = synced_at
+        return finalize_sync_result(client, result)
     except DataGolfRateLimitError as exc:
         logger.warning("DataGolf sync aborted due to rate limit")
-        return SyncResult(
+        warning = (
+            f"DataGolf API rate limited (HTTP 429). {ABORTED_NO_WRITE_MSG} "
+            f"Prøvde {exc.retry_count} gang(er)"
+            + (
+                f" med backoff ({', '.join(str(s) for s in RATE_LIMIT_BACKOFF_SECONDS)} sek)."
+                if use_backoff
+                else "."
+            )
+        )
+        result = SyncResult(
             success=False,
             synced_at=synced_at,
-            error=str(exc),
+            warning=warning,
+            rate_limited=True,
+            retry_count=exc.retry_count,
         )
+        log_sync_event(
+            client,
+            "rate_limited",
+            warning,
+            http_status=429,
+            retry_count=exc.retry_count,
+        )
+        return finalize_sync_result(client, result)
     except Exception as exc:
         logger.exception("DataGolf sync failed")
         message = str(exc)
         if ABORTED_NO_WRITE_MSG not in message:
             message = f"{message} {ABORTED_NO_WRITE_MSG}"
-        return SyncResult(
+        result = SyncResult(
             success=False,
             synced_at=synced_at,
             error=message,
         )
+        log_sync_event(client, "error", message)
+        return finalize_sync_result(client, result)
 
 
-def execute_sync(client: Client, secrets: dict[str, Any], tour: str = DEFAULT_TOUR) -> SyncResult:
+def finalize_sync_result(client: Client | None, result: SyncResult) -> SyncResult:
+    if result.success:
+        if result.last_successful_sync is None:
+            result.last_successful_sync = result.synced_at
+    else:
+        result.last_successful_sync = get_last_successful_sync(client)
+    result.auto_sync_suspended = is_auto_sync_suspended(client)
+    return result
+
+
+def execute_sync(
+    client: Client,
+    secrets: dict[str, Any],
+    tour: str = DEFAULT_TOUR,
+    use_backoff: bool = True,
+) -> SyncResult:
     synced_at = datetime.now(timezone.utc)
     api_key = get_api_key_from_mapping(secrets)
     if not api_key:
-        return SyncResult(
-            success=False,
-            synced_at=synced_at,
-            error="DATA_GOLF_API_KEY is not configured.",
+        return finalize_sync_result(
+            client,
+            SyncResult(
+                success=False,
+                synced_at=synced_at,
+                error="DATA_GOLF_API_KEY is not configured.",
+            ),
         )
     if client is None:
-        return SyncResult(
-            success=False,
-            synced_at=synced_at,
-            error="Supabase client is not configured.",
+        return finalize_sync_result(
+            client,
+            SyncResult(
+                success=False,
+                synced_at=synced_at,
+                error="Supabase client is not configured.",
+            ),
         )
-    return sync_live_scores(client, api_key=api_key, tour=tour)
+    if use_backoff is False and is_auto_sync_suspended(client):
+        return finalize_sync_result(
+            client,
+            SyncResult(
+                success=False,
+                synced_at=synced_at,
+                warning=(
+                    "Auto-sync er midlertidig deaktivert etter 3 påfølgende HTTP 429-svar fra DataGolf. "
+                    f"{ABORTED_NO_WRITE_MSG}"
+                ),
+                rate_limited=True,
+            ),
+        )
+    return sync_live_scores(client, api_key=api_key, tour=tour, use_backoff=use_backoff)
 
 
 def run_cumulative_delta_test() -> dict[str, Any]:
@@ -702,6 +909,87 @@ def run_name_matching_test() -> dict[str, Any]:
         "passed": all(item["passed"] for item in results),
         "checks": results,
     }
+
+
+def run_rate_limit_test() -> dict[str, Any]:
+    global _fetch_live_tournament_data_once
+
+    sleeps: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    def always_429(api_key: str, tour: str = DEFAULT_TOUR) -> dict[str, Any]:
+        raise DataGolfRateLimitError("HTTP 429", retry_count=0)
+
+    original_fetch = _fetch_live_tournament_data_once
+    _fetch_live_tournament_data_once = always_429
+    raised = False
+    retry_count = 0
+    try:
+        try:
+            fetch_live_tournament_data("test-key", use_backoff=True, sleep_fn=fake_sleep)
+        except DataGolfRateLimitError as exc:
+            raised = True
+            retry_count = exc.retry_count
+    finally:
+        _fetch_live_tournament_data_once = original_fetch
+
+    checks = [
+        {
+            "name": "Backoff sleeps 30, 60, 120",
+            "expected": [30.0, 60.0, 120.0],
+            "actual": sleeps,
+            "passed": sleeps == [30.0, 60.0, 120.0],
+        },
+        {
+            "name": "Raises after final 429",
+            "expected": True,
+            "actual": raised,
+            "passed": raised,
+        },
+        {
+            "name": "Retry count after 4 attempts",
+            "expected": 4,
+            "actual": retry_count,
+            "passed": raised and retry_count == 4,
+        },
+        {
+            "name": "Consecutive rate limit counter",
+            "expected": 3,
+            "actual": _count_consecutive_from_rows(
+                [
+                    {"status": "rate_limited"},
+                    {"status": "rate_limited"},
+                    {"status": "rate_limited"},
+                    {"status": "success"},
+                ]
+            ),
+            "passed": _count_consecutive_from_rows(
+                [
+                    {"status": "rate_limited"},
+                    {"status": "rate_limited"},
+                    {"status": "rate_limited"},
+                    {"status": "success"},
+                ]
+            )
+            == 3,
+        },
+    ]
+    return {
+        "passed": all(item["passed"] for item in checks),
+        "checks": checks,
+    }
+
+
+def _count_consecutive_from_rows(rows: list[dict[str, str]]) -> int:
+    count = 0
+    for row in rows:
+        if row.get("status") == "rate_limited":
+            count += 1
+        else:
+            break
+    return count
 
 
 def run_field_import_test() -> dict[str, Any]:

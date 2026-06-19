@@ -39,3 +39,13 @@ create table if not exists daily_comments (
     updated_at timestamptz default now(),
     unique (round_no)
 );
+
+create table if not exists sync_log (
+    id bigint generated always as identity primary key,
+    status text not null check (status in ('success', 'error', 'rate_limited')),
+    http_status integer,
+    message text not null,
+    scores_written integer default 0,
+    retry_count integer default 0,
+    created_at timestamptz default now()
+);

@@ -20,6 +20,7 @@ from lib.datagolf_sync import (
     run_cumulative_delta_test,
     run_field_import_test,
     run_name_matching_test,
+    run_rate_limit_test,
 )
 
 SECRETS_PATH = Path(".streamlit/secrets.toml")
@@ -80,12 +81,23 @@ def run_test(secrets: dict[str, str]) -> int:
         return 1
     print("Field import tests passed.")
 
+    rate_limit = run_rate_limit_test()
+    print("\nRate limit / backoff tests:")
+    for check in rate_limit["checks"]:
+        status = "PASS" if check["passed"] else "FAIL"
+        print(f"  [{status}] {check['name']}")
+        print(f"         expected={check['expected']} actual={check['actual']}")
+    if not rate_limit["passed"]:
+        print("Rate limit tests failed.")
+        return 1
+    print("Rate limit tests passed.")
+
     api_key = get_api_key_from_mapping(secrets)
     if not api_key:
         print("DATA_GOLF_API_KEY is not configured. Skipping live preview.")
         return 0
 
-    preview = preview_sync_scores(api_key=api_key)
+    preview = preview_sync_scores(api_key=api_key, use_backoff=False)
     print("\nLive score preview (relative to par):")
     print(f"  Event: {preview['event_name']}")
     print(f"  Records found: {preview['records_found']}")
@@ -117,6 +129,10 @@ def run_sync(secrets: dict[str, str]) -> int:
     print(f"Scores written: {result.scores_written}")
     print(f"Matched players: {len(result.matched_players)}")
     print(f"Unmatched players: {len(result.unmatched_players)}")
+    if result.last_successful_sync:
+        print(f"Last successful sync: {result.last_successful_sync.isoformat()}")
+    if result.auto_sync_suspended:
+        print("Auto-sync suspended: yes")
 
     if result.matched_players:
         print("\nMatched players:")
@@ -138,6 +154,9 @@ def run_sync(secrets: dict[str, str]) -> int:
         )
         print(f"  {row['player_name']}: {rounds}")
 
+    if result.warning:
+        print(f"\nWarning: {result.warning}")
+        return 1
     if result.error:
         print(f"\nError: {result.error}")
         return 1

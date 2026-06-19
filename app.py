@@ -234,26 +234,49 @@ def format_sync_timestamp(value: datetime | None) -> str:
     return value.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
-def perform_live_sync() -> datagolf_sync.SyncResult:
-    result = datagolf_sync.execute_sync(sb, get_sync_secrets())
+def perform_live_sync(use_backoff: bool = True) -> datagolf_sync.SyncResult:
+    result = datagolf_sync.execute_sync(sb, get_sync_secrets(), use_backoff=use_backoff)
     st.session_state.datagolf_sync_status = result
+    if result.auto_sync_suspended:
+        st.session_state.auto_sync_enabled = False
     return result
 
 
 def render_datagolf_sync_status(result: datagolf_sync.SyncResult | None) -> None:
+    last_success = datagolf_sync.get_last_successful_sync(sb)
+    auto_sync_suspended = datagolf_sync.is_auto_sync_suspended(sb)
+
+    if result is not None:
+        last_success = result.last_successful_sync or last_success
+        auto_sync_suspended = result.auto_sync_suspended or auto_sync_suspended
+
+    st.metric("Sist vellykket synk", format_sync_timestamp(last_success))
+
     if result is None:
         st.info("Ingen synkronisering kjørt ennå. Klikk knappen over for å hente U.S. Open-scorer fra DataGolf.")
+        if auto_sync_suspended:
+            st.warning(
+                "Auto-sync er midlertidig deaktivert etter 3 påfølgende HTTP 429-svar fra DataGolf."
+            )
         return
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Sist synket", format_sync_timestamp(result.synced_at))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Siste forsøk", format_sync_timestamp(result.synced_at))
     c2.metric("Scorer oppdatert", result.scores_written)
     c3.metric("Matchede spillere", len(result.matched_players))
-    c4.metric("Umatchede spillere", len(result.unmatched_players))
 
     if result.event_name:
         st.caption(f"DataGolf-turnering: {result.event_name}")
-    if result.error:
+    if result.retry_count:
+        st.caption(f"DataGolf-forsøk i siste sync: {result.retry_count}")
+    if auto_sync_suspended:
+        st.warning(
+            "Auto-sync er midlertidig deaktivert etter 3 påfølgende HTTP 429-svar fra DataGolf. "
+            "Kjør manuell sync når API-et svarer igjen."
+        )
+    if result.warning:
+        st.warning(result.warning)
+    elif result.error:
         st.error(f"API-feil: {result.error}")
     if result.matched_players:
         with st.expander(f"Matchede spillere ({len(result.matched_players)})"):
@@ -294,8 +317,11 @@ def render_field_import_result(result: datagolf_sync.FieldImportResult) -> None:
 def datagolf_auto_sync_fragment() -> None:
     if sb is None:
         return
+    if datagolf_sync.is_auto_sync_suspended(sb):
+        st.session_state.auto_sync_enabled = False
+        return
     if st.session_state.get("auto_sync_enabled"):
-        result = perform_live_sync()
+        result = perform_live_sync(use_backoff=False)
         if result.success:
             clear_cache()
             st.rerun()
@@ -522,7 +548,7 @@ if mode == "Admin" and is_admin:
             key="sync_all_scores_datagolf",
         ):
             with st.spinner("Henter U.S. Open-scorer fra DataGolf..."):
-                result = perform_live_sync()
+                result = perform_live_sync(use_backoff=True)
             if result.success:
                 clear_cache()
                 st.success(
@@ -530,15 +556,21 @@ if mode == "Admin" and is_admin:
                     f"{len(result.matched_players)} spillere. Leaderboard er oppdatert."
                 )
                 st.rerun()
+            elif result.rate_limited:
+                st.warning(result.warning or "DataGolf rate limit (HTTP 429). Eksisterende scorer er beholdt.")
             else:
                 st.error(result.error or "DataGolf-synkronisering feilet.")
 
+        auto_sync_suspended = datagolf_sync.is_auto_sync_suspended(sb)
         auto_sync = st.checkbox(
             "Auto-sync every 5 minutes",
-            value=st.session_state.auto_sync_enabled,
+            value=st.session_state.auto_sync_enabled and not auto_sync_suspended,
             key="datagolf_auto_sync_checkbox",
+            disabled=auto_sync_suspended,
         )
-        st.session_state.auto_sync_enabled = auto_sync
+        st.session_state.auto_sync_enabled = auto_sync and not auto_sync_suspended
+        if auto_sync_suspended:
+            st.caption("Auto-sync er pauset til DataGolf slutter å returnere HTTP 429.")
 
         render_datagolf_sync_status(st.session_state.get("datagolf_sync_status"))
 
