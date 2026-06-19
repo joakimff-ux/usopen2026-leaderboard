@@ -18,6 +18,7 @@ from lib.datagolf_sync import (
     get_api_key_from_mapping,
     preview_sync_scores,
     run_cumulative_delta_test,
+    run_field_import_test,
     run_name_matching_test,
 )
 
@@ -67,6 +68,17 @@ def run_test(secrets: dict[str, str]) -> int:
         print("Cumulative-to-delta tests failed.")
         return 1
     print("Cumulative-to-delta tests passed.")
+
+    field_import = run_field_import_test()
+    print("\nField import tests:")
+    for check in field_import["checks"]:
+        status = "PASS" if check["passed"] else "FAIL"
+        print(f"  [{status}] {check['name']}")
+        print(f"         expected={check['expected']} actual={check['actual']}")
+    if not field_import["passed"]:
+        print("Field import tests failed.")
+        return 1
+    print("Field import tests passed.")
 
     api_key = get_api_key_from_mapping(secrets)
     if not api_key:

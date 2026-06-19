@@ -260,6 +260,31 @@ def render_datagolf_sync_status(result: datagolf_sync.SyncResult | None) -> None
                 st.write(name)
 
 
+def render_field_import_result(result: datagolf_sync.FieldImportResult) -> None:
+    if result.event_name:
+        st.caption(f"DataGolf-turnering: {result.event_name}")
+    if result.error:
+        st.error(result.error)
+        return
+    if not result.success:
+        st.error("Import av startliste feilet.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Spillere i startliste", result.field_count)
+    c2.metric("Fant fra før", result.existing_count)
+    c3.metric("Nye spillere lagt til", result.added_count)
+
+    if result.new_players:
+        with st.expander(f"Nye spillere ({len(result.new_players)})"):
+            for name in result.new_players:
+                st.write(name)
+    if result.ambiguous_names:
+        with st.expander(f"Tvetydige / ikke importerte ({len(result.ambiguous_names)})"):
+            for name in result.ambiguous_names:
+                st.write(name)
+
+
 @st.fragment(run_every=timedelta(minutes=5))
 def datagolf_auto_sync_fragment() -> None:
     if sb is None:
@@ -510,6 +535,27 @@ if mode == "Admin" and is_admin:
         if st.button("Legg til spiller") and new_player.strip():
             sb.table("players").upsert({"name": new_player.strip(), "tier": tier.strip() or None}, on_conflict="name").execute()
             st.rerun()
+
+        st.divider()
+        st.subheader("DataGolf startliste")
+        st.caption(
+            "Henter hele U.S. Open-feltet fra DataGolf og legger kun til spillere som ikke finnes fra før. "
+            "Eksisterende lag og rosters endres ikke."
+        )
+        if st.button("Hent hele startlisten fra DataGolf", key="import_datagolf_field"):
+            with st.spinner("Henter startliste fra DataGolf..."):
+                field_result = datagolf_sync.import_missing_field_players(
+                    sb,
+                    datagolf_sync.get_api_key_from_mapping(get_sync_secrets()),
+                )
+            render_field_import_result(field_result)
+            if field_result.success and field_result.added_count:
+                clear_cache()
+                st.success("Startliste importert. Nye spillere er tilgjengelige for Dag 3–4-bytter.")
+                st.rerun()
+            elif field_result.success:
+                st.info("Ingen nye spillere å legge til.")
+
         if not players.empty:
             del_player = st.selectbox("Fjern spiller", players.sort_values("name")["name"].tolist())
             if st.button("Fjern valgt spiller"):

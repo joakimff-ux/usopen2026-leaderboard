@@ -50,6 +50,18 @@ class SyncResult:
     error: str | None = None
 
 
+@dataclass
+class FieldImportResult:
+    success: bool
+    existing_count: int = 0
+    added_count: int = 0
+    field_count: int = 0
+    new_players: list[str] = field(default_factory=list)
+    ambiguous_names: list[str] = field(default_factory=list)
+    event_name: str | None = None
+    error: str | None = None
+
+
 def normalize_name(name: str) -> str:
     cleaned = name.strip().lower()
     cleaned = cleaned.replace(".", " ").replace("-", " ")
@@ -289,6 +301,124 @@ def build_player_lookup(players: list[dict[str, Any]]) -> dict[str, dict[str, An
     for player in players:
         lookup[normalize_name(player["name"])] = player
     return lookup
+
+
+def find_ambiguous_normalized_names(players: list[dict[str, Any]]) -> set[str]:
+    """Return normalized names that map to multiple database players."""
+    seen: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for player in players:
+        key = normalize_name(player["name"])
+        if key in seen and seen[key] != player["name"]:
+            ambiguous.add(key)
+        seen[key] = player["name"]
+    return ambiguous
+
+
+def extract_field_player_names(records: list[dict[str, Any]]) -> list[str]:
+    """Collect unique DataGolf field names using standard First Last formatting."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for record in records:
+        datagolf_name = extract_player_name(record)
+        if not datagolf_name:
+            continue
+        standard_name = datagolf_name_to_standard(datagolf_name).strip()
+        normalized = normalize_name(standard_name)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        names.append(standard_name)
+    return sorted(names)
+
+
+def classify_field_players(
+    field_names: list[str],
+    player_lookup: dict[str, dict[str, Any]],
+    ambiguous_keys: set[str],
+) -> tuple[int, list[str], list[str]]:
+    """
+    Split DataGolf field names into existing matches, new inserts, and ambiguous rows.
+    """
+    existing_count = 0
+    to_add: list[str] = []
+    ambiguous_names: list[str] = []
+
+    for standard_name in field_names:
+        datagolf_name = standard_name
+        normalized = normalize_name(standard_name)
+        if normalized in ambiguous_keys:
+            ambiguous_names.append(standard_name)
+            continue
+
+        if match_database_player(datagolf_name, player_lookup) is not None:
+            existing_count += 1
+            continue
+
+        to_add.append(standard_name)
+
+    return existing_count, to_add, sorted(set(ambiguous_names))
+
+
+def import_missing_field_players(
+    client: Client,
+    api_key: str,
+    tour: str = DEFAULT_TOUR,
+    extra_tier_label: str = "Ekstra",
+) -> FieldImportResult:
+    """Import DataGolf field players that are not already in the players table."""
+    if not api_key:
+        return FieldImportResult(success=False, error="DATA_GOLF_API_KEY is not configured.")
+    if client is None:
+        return FieldImportResult(success=False, error="Supabase client is not configured.")
+
+    try:
+        payload = fetch_live_tournament_data(api_key=api_key, tour=tour)
+        records = extract_player_records(payload)
+        event_name = extract_event_name(payload)
+        if not records:
+            return FieldImportResult(
+                success=False,
+                event_name=event_name,
+                error="DataGolf response did not contain any player records.",
+            )
+
+        field_names = extract_field_player_names(records)
+        db_players = fetch_players(client)
+        player_lookup = build_player_lookup(db_players)
+        ambiguous_keys = find_ambiguous_normalized_names(db_players)
+        existing_count, to_add, ambiguous_names = classify_field_players(
+            field_names,
+            player_lookup,
+            ambiguous_keys,
+        )
+
+        new_players: list[str] = []
+        for name in to_add:
+            try:
+                client.table("players").insert(
+                    {"name": name, "tier": extra_tier_label or None}
+                ).execute()
+                new_players.append(name)
+                player_lookup[normalize_name(name)] = {"name": name}
+            except Exception as exc:
+                logger.warning("Could not insert field player %s: %s", name, exc)
+                ambiguous_names.append(name)
+
+        return FieldImportResult(
+            success=True,
+            existing_count=existing_count,
+            added_count=len(new_players),
+            field_count=len(field_names),
+            new_players=sorted(new_players),
+            ambiguous_names=sorted(set(ambiguous_names)),
+            event_name=event_name,
+        )
+    except DataGolfRateLimitError as exc:
+        return FieldImportResult(success=False, error=str(exc))
+    except Exception as exc:
+        logger.exception("DataGolf field import failed")
+        return FieldImportResult(success=False, error=str(exc))
 
 
 def match_database_player(
@@ -571,4 +701,60 @@ def run_name_matching_test() -> dict[str, Any]:
     return {
         "passed": all(item["passed"] for item in results),
         "checks": results,
+    }
+
+
+def run_field_import_test() -> dict[str, Any]:
+    sample_players = [
+        {"id": 1, "name": "Scottie Scheffler"},
+        {"id": 2, "name": "Mav McNealy"},
+        {"id": 3, "name": "Rai Rai"},
+    ]
+    lookup = build_player_lookup(sample_players)
+    ambiguous_keys = find_ambiguous_normalized_names(sample_players)
+    field_names = extract_field_player_names(
+        [
+            {"player_name": "Scheffler, Scottie"},
+            {"player_name": "McNealy, Maverick"},
+            {"player_name": "Rai, Aaron"},
+            {"player_name": "Rahm, Jon"},
+            {"player_name": "Rahm, Jon"},
+            {"player_name": ""},
+        ]
+    )
+    existing_count, to_add, ambiguous_names = classify_field_players(
+        field_names,
+        lookup,
+        ambiguous_keys,
+    )
+    checks = [
+        {
+            "name": "Unique field names extracted",
+            "expected": ["Aaron Rai", "Jon Rahm", "Maverick McNealy", "Scottie Scheffler"],
+            "actual": field_names,
+            "passed": field_names
+            == ["Aaron Rai", "Jon Rahm", "Maverick McNealy", "Scottie Scheffler"],
+        },
+        {
+            "name": "Existing players counted",
+            "expected": 3,
+            "actual": existing_count,
+            "passed": existing_count == 3,
+        },
+        {
+            "name": "Only missing players queued",
+            "expected": ["Jon Rahm"],
+            "actual": to_add,
+            "passed": to_add == ["Jon Rahm"],
+        },
+        {
+            "name": "No ambiguous names in clean sample",
+            "expected": [],
+            "actual": ambiguous_names,
+            "passed": ambiguous_names == [],
+        },
+    ]
+    return {
+        "passed": all(item["passed"] for item in checks),
+        "checks": checks,
     }
