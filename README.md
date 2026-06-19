@@ -27,3 +27,9 @@ Deretter kan admin under **Laguttak**:
 - bytte inntil 3 spillere for Dag 3–4 etter cut
 
 Leaderboard bruker originalt lag for Dag 1–2 og oppdatert lag for Dag 3–4.
+
+## Dagsrapport
+
+Kjør `migrations/002_daily_comments.sql` i Supabase SQL editor.
+
+Admin → **Dagsrapport** genererer norsk oppsummering (uten OpenAI). Lagrede kommentarer vises som **Dagens kommentar** over leaderboard.

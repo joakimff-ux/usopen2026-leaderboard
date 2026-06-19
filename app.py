@@ -9,6 +9,7 @@ import streamlit as st
 from supabase import create_client
 
 from lib import datagolf_sync
+from lib.daily_report import TONES, generate_daily_report
 
 DEFAULT_FILE = Path(__file__).parent / "data" / "US Open 2026 - Resultater.xlsx"
 DAYS = ["Dag 1", "Dag 2", "Dag 3", "Dag 4"]
@@ -211,6 +212,10 @@ def init_sync_state() -> None:
         st.session_state.auto_sync_enabled = False
     if "datagolf_sync_status" not in st.session_state:
         st.session_state.datagolf_sync_status = None
+    if "daily_report_draft" not in st.session_state:
+        st.session_state.daily_report_draft = ""
+    if "daily_report_title" not in st.session_state:
+        st.session_state.daily_report_title = ""
 
 
 def get_sync_secrets() -> dict[str, str]:
@@ -425,6 +430,44 @@ def build_model(teams: pd.DataFrame, players: pd.DataFrame, links: pd.DataFrame,
     return leaderboard, details
 
 
+def fetch_latest_daily_comment() -> dict | None:
+    try:
+        response = (
+            sb.table("daily_comments")
+            .select("*")
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return response.data[0] if response.data else None
+    except Exception:
+        return None
+
+
+def save_daily_comment(round_no: int, title: str, body: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "round_no": int(round_no),
+        "title": title.strip(),
+        "body": body.strip(),
+        "updated_at": now,
+    }
+    sb.table("daily_comments").upsert(payload, on_conflict="round_no").execute()
+
+
+def copy_text_to_clipboard(text: str) -> None:
+    import json
+
+    import streamlit.components.v1 as components
+
+    components.html(
+        f"""<script>
+        navigator.clipboard.writeText({json.dumps(text)});
+        </script>""",
+        height=0,
+    )
+
+
 def admin_login():
     configured = get_any_secret(["ADMIN_PASSWORD", "admin_password"])
     if not configured:
@@ -462,7 +505,7 @@ teams, players, links, scores = fetch_all()
 leaderboard, details = build_model(teams, players, links, scores)
 
 if mode == "Admin" and is_admin:
-    tabs = st.tabs(["Importer", "Scorer", "Lag", "Spillere", "Laguttak"])
+    tabs = st.tabs(["Importer", "Scorer", "Lag", "Spillere", "Laguttak", "Dagsrapport"])
     with tabs[0]:
         st.subheader("Importer fra Excel")
         uploaded = st.file_uploader("Last opp Excel-oppsett", type=["xlsx"])
@@ -646,6 +689,90 @@ if mode == "Admin" and is_admin:
                     clear_cache()
                     st.success("Lag for Dag 3–4 er lagret.")
                     st.rerun()
+
+                    st.success("Lag for Dag 3–4 er lagret.")
+                    st.rerun()
+    with tabs[5]:
+        st.subheader("Dagsrapport")
+        st.caption("Generer en norsk oppsummering for deltakerne basert på leaderboard og tellende scorer.")
+
+        c1, c2 = st.columns(2)
+        report_round = c1.selectbox(
+            "Runde / dag",
+            ROUNDS,
+            format_func=lambda r: DAYS[r - 1],
+            key="daily_report_round",
+        )
+        report_tone = c2.selectbox("Tone", list(TONES), index=1, key="daily_report_tone")
+
+        action1, action2, action3 = st.columns(3)
+        if action1.button("Generer dagsrapport", type="primary", key="generate_daily_report"):
+            title, body = generate_daily_report(
+                leaderboard,
+                details,
+                int(report_round),
+                tone=report_tone,
+            )
+            st.session_state.daily_report_title = title
+            st.session_state.daily_report_draft = body
+            st.rerun()
+
+        report_title = st.text_input(
+            "Tittel",
+            value=st.session_state.get("daily_report_title", f"{DAYS[int(report_round) - 1]} – dagsrapport"),
+        )
+        report_body = st.text_area(
+            "Dagsrapport (rediger før publisering)",
+            value=st.session_state.get("daily_report_draft", ""),
+            height=260,
+        )
+
+        if action2.button("Kopier tekst", key="copy_daily_report"):
+            if report_body.strip():
+                copy_text_to_clipboard(report_body)
+                st.toast("Tekst kopiert til utklippstavlen.")
+            else:
+                st.warning("Ingen tekst å kopiere.")
+
+        if action3.button("Lagre kommentar", key="save_daily_report"):
+            if not report_body.strip():
+                st.error("Skriv eller generer en dagsrapport først.")
+            else:
+                try:
+                    save_daily_comment(
+                        int(report_round),
+                        report_title or f"{DAYS[int(report_round) - 1]} – dagsrapport",
+                        report_body,
+                    )
+                    clear_cache()
+                    st.success("Dagsrapport lagret.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(
+                        "Kunne ikke lagre. Kjør migrations/002_daily_comments.sql i Supabase først. "
+                        f"({exc})"
+                    )
+
+        saved_for_round = pd.DataFrame()
+        try:
+            saved_for_round = fetch_table("daily_comments")
+        except Exception:
+            saved_for_round = pd.DataFrame()
+
+        if not saved_for_round.empty:
+            st.divider()
+            st.caption("Lagrede dagsrapporter")
+            st.dataframe(
+                saved_for_round.sort_values("round_no")[["round_no", "title", "updated_at"]],
+                width="stretch",
+                hide_index=True,
+            )
+
+latest_comment = fetch_latest_daily_comment()
+if latest_comment and latest_comment.get("body"):
+    st.markdown("### 💬 Dagens kommentar")
+    st.markdown(f"**{latest_comment.get('title', 'Dagsrapport')}**")
+    st.write(latest_comment["body"])
 
 st.subheader("🏆 Leaderboard")
 if leaderboard.empty:
