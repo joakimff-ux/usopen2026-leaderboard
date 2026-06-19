@@ -70,6 +70,17 @@ def build_model(teams, players, links, scores):
     return pd.DataFrame(summary), pd.DataFrame(detail)
 
 
+def ordered_round_days_with_scores(details: pd.DataFrame, team: str) -> list[tuple[int, str]]:
+    team_details = details[details["Lag"] == team]
+    present = [
+        (rnd, day)
+        for rnd, day in zip(ROUNDS, DAYS)
+        if not team_details[team_details["Dag"] == day].empty
+    ]
+    present.reverse()
+    return present
+
+
 def make_links(team_id: int, pre_ids: list[int], post_ids: list[int]) -> pd.DataFrame:
     rows = []
     for pid in pre_ids:
@@ -127,9 +138,27 @@ def main() -> int:
     assert row["Dag 4"] == post_cut_day4, row["Dag 4"]
     assert row["Totalt"] == pre_cut_day1 + pre_cut_day2 + post_cut_day3 + post_cut_day4
 
+    detail_rows = pd.DataFrame(
+        [
+            {"Lag": "Testlag", "Dag": "Dag 1"},
+            {"Lag": "Testlag", "Dag": "Dag 2"},
+            {"Lag": "Testlag", "Dag": "Dag 3"},
+        ]
+    )
+    assert ordered_round_days_with_scores(detail_rows, "Testlag") == [
+        (3, "Dag 3"),
+        (2, "Dag 2"),
+        (1, "Dag 1"),
+    ]
+    assert ordered_round_days_with_scores(detail_rows[detail_rows["Dag"] == "Dag 1"], "Testlag") == [
+        (1, "Dag 1"),
+    ]
+    assert ordered_round_days_with_scores(detail_rows, "Mangler") == []
+
     print("PASS: Dag 1-2 use original roster")
     print("PASS: Dag 3-4 use post-cut roster")
     print("PASS: 3 swaps counted correctly")
+    print("PASS: newest scored round shown first")
     print(f"Sample totals: Dag1={row['Dag 1']}, Dag2={row['Dag 2']}, Dag3={row['Dag 3']}, Dag4={row['Dag 4']}")
     return 0
 

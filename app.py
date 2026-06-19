@@ -427,6 +427,18 @@ def prepare_leaderboard_display(leaderboard: pd.DataFrame) -> pd.DataFrame:
     return leaderboard[columns]
 
 
+def ordered_round_days_with_scores(details: pd.DataFrame, team: str) -> list[tuple[int, str]]:
+    """Return rounds with scores for a team, newest round first."""
+    team_details = details[details["Lag"] == team]
+    present = [
+        (rnd, day)
+        for rnd, day in zip(ROUNDS, DAYS)
+        if not team_details[team_details["Dag"] == day].empty
+    ]
+    present.reverse()
+    return present
+
+
 def build_model(teams: pd.DataFrame, players: pd.DataFrame, links: pd.DataFrame, scores: pd.DataFrame):
     if teams.empty or players.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -838,13 +850,12 @@ if details.empty:
     st.info("Ingen scorer registrert ennå.")
 else:
     team = st.selectbox("Velg lag", sorted(details["Lag"].unique()))
-    for rnd, day in zip(ROUNDS, DAYS):
-        day_df = details[(details["Lag"] == team) & (details["Dag"] == day)].copy()
-        if day_df.empty:
-            continue
+    team_details = details[details["Lag"] == team]
+    for idx, (rnd, day) in enumerate(ordered_round_days_with_scores(details, team)):
+        day_df = team_details[team_details["Dag"] == day].copy()
         day_df["Score"] = day_df["Score"].map(fmt_score)
         roster_label = ROSTER_LABELS[rnd]
-        with st.expander(f"{day} - {team} ({roster_label})", expanded=(day == DAYS[0])):
+        with st.expander(f"{day} - {team} ({roster_label})", expanded=(idx == 0)):
             st.caption(f"Lagtype: {roster_label}")
             st.dataframe(day_df[["Teller", "Rang", "Spiller", "Score"]], width="stretch", hide_index=True)
 
