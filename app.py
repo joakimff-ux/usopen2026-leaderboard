@@ -195,6 +195,19 @@ def fmt_score(x):
     return "E" if x == 0 else (f"{x:+d}" if x > 0 else str(x))
 
 
+def prepare_leaderboard_display(leaderboard: pd.DataFrame) -> pd.DataFrame:
+    """Show only ranking columns and hide day columns with no registered scores."""
+    if leaderboard.empty:
+        return leaderboard
+
+    visible_days = [
+        day for day in DAYS
+        if day in leaderboard.columns and leaderboard[day].notna().any()
+    ]
+    columns = ["Plass", "Lag", *visible_days, "Totalt"]
+    return leaderboard[columns]
+
+
 def build_model(teams: pd.DataFrame, players: pd.DataFrame, links: pd.DataFrame, scores: pd.DataFrame):
     if teams.empty or players.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -209,8 +222,7 @@ def build_model(teams: pd.DataFrame, players: pd.DataFrame, links: pd.DataFrame,
         picked_ids = set(team_links.player_id.astype(int).tolist()) if not team_links.empty else set()
         picked = players[players.id.astype(int).isin(picked_ids)].sort_values("name")
         total = 0
-        row = {"Lag": t["name"], "Spillere": len(picked)}
-        complete = True
+        row = {"Lag": t["name"]}
         for rnd, day in zip(ROUNDS, DAYS):
             round_rows = []
             for _, p in picked.iterrows():
@@ -221,8 +233,6 @@ def build_model(teams: pd.DataFrame, players: pd.DataFrame, links: pd.DataFrame,
             dropped = scored.iloc[COUNTING_SCORES:].copy()
             day_sum = counting.Score.sum() if len(counting) else None
             row[day] = day_sum
-            if len(counting) < COUNTING_SCORES:
-                complete = False
             if day_sum is not None:
                 total += int(day_sum)
             for rank, (_, r) in enumerate(counting.iterrows(), 1):
@@ -230,7 +240,6 @@ def build_model(teams: pd.DataFrame, players: pd.DataFrame, links: pd.DataFrame,
             for _, r in dropped.iterrows():
                 detail.append({**r.to_dict(), "Rang": None, "Teller": "❌ Droppes"})
         row["Totalt"] = total
-        row["Status"] = "OK" if complete else "Mangler scorer"
         summary.append(row)
     leaderboard = pd.DataFrame(summary)
     if not leaderboard.empty:
@@ -379,7 +388,7 @@ st.subheader("🏆 Leaderboard")
 if leaderboard.empty:
     st.info("Ingen data ennå. Gå til Admin og importer fra Excel.")
 else:
-    st.dataframe(leaderboard, width="stretch", hide_index=True)
+    st.dataframe(prepare_leaderboard_display(leaderboard), width="stretch", hide_index=True)
 
 st.subheader("🔎 Tellende og droppede scorer")
 if details.empty:
