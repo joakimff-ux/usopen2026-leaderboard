@@ -139,17 +139,20 @@ def count_post_cut_swaps(original_ids: set[int], post_cut_ids: set[int]) -> int:
     return len(original_ids - post_cut_ids)
 
 
-def sync_laguttak_roster_state(
+def prepare_laguttak_roster_state(
     team_id: int,
     original_names: list[str],
     post_cut_names: list[str],
+    *,
+    force_reload: bool = False,
 ) -> tuple[str, str]:
-    """Reset roster widget state when the selected team changes."""
+    """Initialize roster widget state before multiselect widgets are created."""
     prev_team_id = st.session_state.get("laguttak_team_id")
     pre_key = f"original_roster_{team_id}"
     post_key = f"post_cut_roster_{team_id}"
+    team_changed = prev_team_id != team_id
 
-    if prev_team_id != team_id:
+    if team_changed:
         if prev_team_id is not None:
             for stale_key in (
                 f"original_roster_{prev_team_id}",
@@ -158,7 +161,10 @@ def sync_laguttak_roster_state(
             ):
                 st.session_state.pop(stale_key, None)
         st.session_state.laguttak_team_id = team_id
+
+    if team_changed or force_reload or pre_key not in st.session_state:
         st.session_state[pre_key] = original_names
+    if team_changed or force_reload or post_key not in st.session_state:
         st.session_state[post_key] = post_cut_names
 
     return pre_key, post_key
@@ -832,7 +838,13 @@ if mode == "Admin" and is_admin:
             )
             post_cut_names = players[players.id.astype(int).isin(post_cut_ids)].sort_values("name")["name"].tolist()
 
-            pre_key, post_key = sync_laguttak_roster_state(tid, current_names, post_cut_names)
+            force_reload = st.session_state.pop("laguttak_force_reload_team_id", None) == tid
+            pre_key, post_key = prepare_laguttak_roster_state(
+                tid,
+                current_names,
+                post_cut_names,
+                force_reload=force_reload,
+            )
             st.caption(
                 f"Debug: team_id={tid}, team={t_name}, "
                 f"original roster count={len(original_names)}, "
@@ -889,8 +901,8 @@ if mode == "Admin" and is_admin:
                         POST_CUT_FROM,
                         POST_CUT_TO,
                     )
-                    st.session_state[post_key] = post_cut_selected
                     clear_cache()
+                    st.session_state.laguttak_force_reload_team_id = tid
                     st.success("Lag for Dag 3–4 er lagret.")
                     st.rerun()
     with tabs[5]:
