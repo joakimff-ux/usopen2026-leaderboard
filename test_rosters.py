@@ -93,6 +93,8 @@ def get_global_highest_scored_round(details: pd.DataFrame) -> int:
 
 
 def team_scored_rounds(details: pd.DataFrame, team: str) -> set[int]:
+    if details.empty or "Lag" not in details.columns:
+        return set()
     team_details = details[details["Lag"] == team]
     scored_rounds: set[int] = set()
     for rnd, day in zip(ROUNDS, DAYS):
