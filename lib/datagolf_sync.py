@@ -315,9 +315,41 @@ def extract_event_name(payload: dict[str, Any]) -> str | None:
 def extract_current_round(payload: dict[str, Any]) -> int | None:
     info = payload.get("info")
     if isinstance(info, dict):
-        current_round = info.get("current_round")
-        if isinstance(current_round, int) and 1 <= current_round <= 4:
-            return current_round
+        for field in ("current_round", "round", "live_round"):
+            current_round = info.get(field)
+            if isinstance(current_round, int) and 1 <= current_round <= 4:
+                return current_round
+            try:
+                numeric = int(float(current_round))
+                if 1 <= numeric <= 4:
+                    return numeric
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def extract_player_current_round(record: dict[str, Any]) -> int | None:
+    for field in ("round", "current_round", "live_round"):
+        value = record.get(field)
+        if isinstance(value, int) and 1 <= value <= 4:
+            return value
+        try:
+            numeric = int(float(value))
+            if 1 <= numeric <= 4:
+                return numeric
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def extract_live_today_score(record: dict[str, Any]) -> int | None:
+    """Parse live round score from fields used before R# is finalized."""
+    for field in ("today", "round_score", "score_today", "current_round_score"):
+        if field not in record:
+            continue
+        parsed = parse_relative_to_par(record.get(field))
+        if parsed is not None:
+            return parsed
     return None
 
 
@@ -379,14 +411,73 @@ def extract_round_scores(
     record: dict[str, Any],
     event_current_round: int | None = None,
 ) -> dict[int, int]:
-    """Read per-round scores directly from DataGolf R1-R4 fields."""
-    del event_current_round
+    """Read per-round scores from R1-R4; fill active round from live today/round fields."""
     round_scores: dict[int, int] = {}
     for round_num in range(1, 5):
         parsed = parse_round_field_value(record.get(f"R{round_num}"))
         if parsed is not None:
             round_scores[round_num] = parsed
+
+    player_round = extract_player_current_round(record)
+    if player_round is None:
+        player_round = event_current_round
+    if player_round is not None and player_round not in round_scores:
+        if parse_round_field_value(record.get(f"R{player_round}")) is None:
+            live_score = extract_live_today_score(record)
+            if live_score is not None:
+                round_scores[player_round] = live_score
+
     return round_scores
+
+
+def analyze_live_score_records(
+    records: list[dict[str, Any]],
+    event_current_round: int | None,
+) -> dict[str, Any]:
+    """Debug summary for live round detection."""
+    with_r3_field = 0
+    with_live_today = 0
+    with_round_no_3 = 0
+    sample_players: list[dict[str, Any]] = []
+
+    for record in records:
+        if parse_round_field_value(record.get("R3")) is not None:
+            with_r3_field += 1
+        if extract_live_today_score(record) is not None:
+            with_live_today += 1
+        parsed = extract_round_scores(record, event_current_round)
+        if 3 in parsed:
+            with_round_no_3 += 1
+
+    for record in records[:10]:
+        datagolf_name = extract_player_name(record) or "?"
+        sample_players.append(
+            {
+                "player_name": datagolf_name,
+                "R1": record.get("R1"),
+                "R2": record.get("R2"),
+                "R3": record.get("R3"),
+                "R4": record.get("R4"),
+                "today": record.get("today"),
+                "current_score": record.get("current_score"),
+                "thru": record.get("thru"),
+                "tee_time": record.get("tee_time"),
+                "round": record.get("round"),
+                "parsed_rounds": extract_round_scores(record, event_current_round),
+            }
+        )
+
+    return {
+        "record_count": len(records),
+        "with_r3_field": with_r3_field,
+        "with_live_today": with_live_today,
+        "with_round_no_3_parsed": with_round_no_3,
+        "sample_players": sample_players,
+    }
+
+
+def count_round_writes(score_rows: list[dict[str, Any]], round_no: int) -> int:
+    return sum(1 for row in score_rows if int(row["round_no"]) == round_no)
 
 
 def extract_player_name(record: dict[str, Any]) -> str | None:
@@ -612,8 +703,19 @@ def verify_round_score_mapping(
             )
             continue
 
-        raw_rounds = {f"R{round_num}": record.get(f"R{round_num}") for round_num in range(1, 5)}
-        supabase_writes = extract_round_scores(record)
+        raw_rounds = {
+            f"R{round_num}": record.get(f"R{round_num}") for round_num in range(1, 5)
+        }
+        raw_rounds.update(
+            {
+                "today": record.get("today"),
+                "current_score": record.get("current_score"),
+                "thru": record.get("thru"),
+                "tee_time": record.get("tee_time"),
+                "round": record.get("round"),
+            }
+        )
+        supabase_writes = extract_round_scores(record, event_current_round=extract_current_round(payload))
         players.append(
             {
                 "target_name": target_name,
@@ -786,6 +888,7 @@ def sync_live_scores(
         )
 
         if not score_rows:
+            analysis = analyze_live_score_records(records, event_round)
             result = SyncResult(
                 success=False,
                 synced_at=synced_at,
@@ -797,11 +900,32 @@ def sync_live_scores(
                     f"{ABORTED_NO_WRITE_MSG}"
                 ),
             )
+            logger.error(
+                "Sync aborted: no score rows. event=%s records=%s r3_field=%s live_today=%s parsed_r3=%s",
+                event_name,
+                analysis["record_count"],
+                analysis["with_r3_field"],
+                analysis["with_live_today"],
+                analysis["with_round_no_3_parsed"],
+            )
             log_sync_event(client, "error", result.error or "No valid scores")
             return finalize_sync_result(client, result)
 
         record_score_events(client, score_rows)
         client.table("scores").upsert(score_rows, on_conflict="player_id,round_no").execute()
+
+        analysis = analyze_live_score_records(records, event_round)
+        round_3_writes = count_round_writes(score_rows, 3)
+        logger.info(
+            "DataGolf sync: event=%s records=%s r3_field=%s live_today=%s parsed_r3=%s written_r3=%s total_writes=%s",
+            event_name,
+            analysis["record_count"],
+            analysis["with_r3_field"],
+            analysis["with_live_today"],
+            analysis["with_round_no_3_parsed"],
+            round_3_writes,
+            len(score_rows),
+        )
 
         matched_player_ids = {row["player_id"] for row in score_rows}
         sample_writes = [
@@ -922,6 +1046,44 @@ def execute_sync(
     return sync_live_scores(client, api_key=api_key, tour=tour, use_backoff=use_backoff)
 
 
+def run_live_round_test() -> dict[str, Any]:
+    """Round 3 in progress: R3 empty, today field supplies live score."""
+    live_record = {
+        "R1": 72,
+        "R2": 71,
+        "R3": None,
+        "R4": None,
+        "today": 1,
+        "thru": 4,
+        "round": 3,
+        "current_score": 3,
+    }
+    parsed = extract_round_scores(live_record, event_current_round=3)
+    passed = parsed == {1: 2, 2: 1, 3: 1}
+
+    completed_r3 = {"R1": -2, "R2": 1, "R3": 3, "R4": None, "today": 0, "round": 3}
+    completed_parsed = extract_round_scores(completed_r3, event_current_round=4)
+    r3_direct = completed_parsed == {1: -2, 2: 1, 3: 3}
+
+    return {
+        "passed": passed and r3_direct,
+        "checks": [
+            {
+                "name": "Live round 3 from today when R3 empty",
+                "expected": {1: 2, 2: 1, 3: 1},
+                "actual": parsed,
+                "passed": passed,
+            },
+            {
+                "name": "Completed R3 used directly when populated",
+                "expected": {1: -2, 2: 1, 3: 3},
+                "actual": completed_parsed,
+                "passed": r3_direct,
+            },
+        ],
+    }
+
+
 def run_round_score_test() -> dict[str, Any]:
     hovland_record = {"R1": 4, "R2": 5, "R3": None, "R4": None}
     hovland_scores = extract_round_scores(hovland_record)
@@ -971,7 +1133,12 @@ def run_round_score_test() -> dict[str, Any]:
 
 
 def run_cumulative_delta_test() -> dict[str, Any]:
-    return run_round_score_test()
+    round_test = run_round_score_test()
+    live_test = run_live_round_test()
+    return {
+        "passed": round_test["passed"] and live_test["passed"],
+        "checks": round_test["checks"] + live_test["checks"],
+    }
 
 
 def run_name_matching_test() -> dict[str, Any]:
