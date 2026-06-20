@@ -164,46 +164,62 @@ def sync_laguttak_roster_state(
     return pre_key, post_key
 
 
-def ensure_post_cut_rosters(links: pd.DataFrame) -> pd.DataFrame:
-    """Copy pre-cut rosters to post-cut when round columns exist but copies are missing."""
+def teams_missing_post_cut_roster(links: pd.DataFrame) -> set[int]:
+    """Teams that have a pre-cut roster but no Dag 3-4 roster yet."""
     if not links_have_round_ranges(links) or links.empty:
-        return links
+        return set()
+
+    pre_cut_teams = set(
+        links[
+            (links.active_from_round.astype(int) == PRE_CUT_FROM)
+            & (links.active_to_round.astype(int) == PRE_CUT_TO)
+        ].team_id.astype(int).tolist()
+    )
+    post_cut_teams = set(
+        links[
+            (links.active_from_round.astype(int) == POST_CUT_FROM)
+            & (links.active_to_round.astype(int) == POST_CUT_TO)
+        ].team_id.astype(int).tolist()
+    )
+    return pre_cut_teams - post_cut_teams
+
+
+def build_post_cut_seed_rows(links: pd.DataFrame) -> list[dict[str, int]]:
+    """Copy pre-cut rosters only for teams without any saved post-cut roster."""
+    if not links_have_round_ranges(links) or links.empty:
+        return []
+
+    missing_teams = teams_missing_post_cut_roster(links)
+    if not missing_teams:
+        return []
 
     pre_cut = links[
         (links.active_from_round.astype(int) == PRE_CUT_FROM)
         & (links.active_to_round.astype(int) == PRE_CUT_TO)
     ]
-    post_cut = links[
-        (links.active_from_round.astype(int) == POST_CUT_FROM)
-        & (links.active_to_round.astype(int) == POST_CUT_TO)
+    return [
+        {
+            "team_id": int(row.team_id),
+            "player_id": int(row.player_id),
+            "active_from_round": POST_CUT_FROM,
+            "active_to_round": POST_CUT_TO,
+        }
+        for _, row in pre_cut.iterrows()
+        if int(row.team_id) in missing_teams
     ]
-    if pre_cut.empty:
+
+
+def ensure_post_cut_rosters(links: pd.DataFrame) -> pd.DataFrame:
+    """Seed Dag 3-4 rosters only when a team has no post-cut roster saved yet."""
+    inserts = build_post_cut_seed_rows(links)
+    if not inserts:
         return links
 
-    existing_post = {
-        (int(row.team_id), int(row.player_id))
-        for _, row in post_cut.iterrows()
-    }
-    inserts = []
-    for _, row in pre_cut.iterrows():
-        key = (int(row.team_id), int(row.player_id))
-        if key not in existing_post:
-            inserts.append(
-                {
-                    "team_id": key[0],
-                    "player_id": key[1],
-                    "active_from_round": POST_CUT_FROM,
-                    "active_to_round": POST_CUT_TO,
-                }
-            )
-
-    if inserts:
-        sb.table("team_players").upsert(
-            inserts,
-            on_conflict="team_id,player_id,active_from_round",
-        ).execute()
-        return fetch_table("team_players")
-    return links
+    sb.table("team_players").upsert(
+        inserts,
+        on_conflict="team_id,player_id,active_from_round",
+    ).execute()
+    return fetch_table("team_players")
 
 
 def save_team_roster(
@@ -818,7 +834,9 @@ if mode == "Admin" and is_admin:
 
             pre_key, post_key = sync_laguttak_roster_state(tid, current_names, post_cut_names)
             st.caption(
-                f"Debug: team_id={tid}, team={t_name}, original roster={original_names}, "
+                f"Debug: team_id={tid}, team={t_name}, "
+                f"original roster count={len(original_names)}, "
+                f"post-cut roster count={len(post_cut_names)}, "
                 f"post-cut roster={post_cut_names}"
             )
 
@@ -849,13 +867,19 @@ if mode == "Admin" and is_admin:
                 player_options,
                 key=post_key,
             )
-            post_cut_new_ids = set(players[players.name.isin(post_cut_selected)].id.astype(int).tolist())
+            post_cut_new_ids_list = players[players.name.isin(post_cut_selected)].id.astype(int).tolist()
+            post_cut_new_ids = set(post_cut_new_ids_list)
             swaps_used = count_post_cut_swaps(original_ids, post_cut_new_ids)
             st.caption(f"Bytter brukt: {swaps_used}/{MAX_POST_CUT_SWAPS}")
 
             if st.button("Lagre lag etter bytter"):
                 if len(post_cut_selected) != PLAYERS_PER_TEAM:
                     st.error(f"Lag etter bytter må ha nøyaktig {PLAYERS_PER_TEAM} spillere.")
+                elif len(post_cut_new_ids) != PLAYERS_PER_TEAM:
+                    st.error(
+                        f"Post-cut roster må inneholde nøyaktig {PLAYERS_PER_TEAM} unike spillere. "
+                        f"Fant {len(post_cut_new_ids)}."
+                    )
                 elif swaps_used > MAX_POST_CUT_SWAPS:
                     st.error(f"Maks {MAX_POST_CUT_SWAPS} bytter er tillatt etter dag 2.")
                 else:
@@ -865,6 +889,7 @@ if mode == "Admin" and is_admin:
                         POST_CUT_FROM,
                         POST_CUT_TO,
                     )
+                    st.session_state[post_key] = post_cut_selected
                     clear_cache()
                     st.success("Lag for Dag 3–4 er lagret.")
                     st.rerun()

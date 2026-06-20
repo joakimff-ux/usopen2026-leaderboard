@@ -111,6 +111,53 @@ def score_round_for_team(team_name, round_no, day, player_scores, roster_label):
     return team_score, detail_rows
 
 
+def count_post_cut_swaps(original_ids: set[int], post_cut_ids: set[int]) -> int:
+    return len(original_ids - post_cut_ids)
+
+
+def teams_missing_post_cut_roster(links: pd.DataFrame) -> set[int]:
+    if not links_have_round_ranges(links) or links.empty:
+        return set()
+
+    pre_cut_teams = set(
+        links[
+            (links.active_from_round.astype(int) == PRE_CUT_FROM)
+            & (links.active_to_round.astype(int) == PRE_CUT_TO)
+        ].team_id.astype(int).tolist()
+    )
+    post_cut_teams = set(
+        links[
+            (links.active_from_round.astype(int) == POST_CUT_FROM)
+            & (links.active_to_round.astype(int) == POST_CUT_TO)
+        ].team_id.astype(int).tolist()
+    )
+    return pre_cut_teams - post_cut_teams
+
+
+def build_post_cut_seed_rows(links: pd.DataFrame) -> list[dict[str, int]]:
+    if not links_have_round_ranges(links) or links.empty:
+        return []
+
+    missing_teams = teams_missing_post_cut_roster(links)
+    if not missing_teams:
+        return []
+
+    pre_cut = links[
+        (links.active_from_round.astype(int) == PRE_CUT_FROM)
+        & (links.active_to_round.astype(int) == PRE_CUT_TO)
+    ]
+    return [
+        {
+            "team_id": int(row.team_id),
+            "player_id": int(row.player_id),
+            "active_from_round": POST_CUT_FROM,
+            "active_to_round": POST_CUT_TO,
+        }
+        for _, row in pre_cut.iterrows()
+        if int(row.team_id) in missing_teams
+    ]
+
+
 def make_links(team_id: int, pre_ids: list[int], post_ids: list[int]) -> pd.DataFrame:
     rows = []
     for pid in pre_ids:
@@ -207,11 +254,22 @@ def main() -> int:
     ], counted
     assert dropped == ["Kristoffer Reitan", "Brooks Koepka"], dropped
 
+    original = [1, 2, 3, 4, 5, 6, 7]
+    swapped = [1, 2, 3, 8, 9, 10, 7]
+    links_with_post_cut = make_links(1, original, swapped)
+    assert build_post_cut_seed_rows(links_with_post_cut) == []
+
+    links_without_post_cut = make_links(1, original, [])
+    seeded = build_post_cut_seed_rows(links_without_post_cut)
+    assert len(seeded) == 7
+    assert {row["player_id"] for row in seeded} == set(original)
+
     print("PASS: Dag 1-2 use original roster")
     print("PASS: Dag 3-4 use post-cut roster")
     print("PASS: 3 swaps counted correctly")
     print("PASS: newest scored round shown first")
     print("PASS: Joakim Dag 2 team score uses 5 best rounds")
+    print("PASS: post-cut seeding only runs for teams without Dag 3-4 roster")
     print(f"Sample totals: Dag1={row['Dag 1']}, Dag2={row['Dag 2']}, Dag3={row['Dag 3']}, Dag4={row['Dag 4']}")
     return 0
 
