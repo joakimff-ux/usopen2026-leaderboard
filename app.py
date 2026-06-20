@@ -475,33 +475,6 @@ def score_round_for_team(
     return team_score, detail_rows
 
 
-def build_team_round_debug_table(
-    team_name: str,
-    round_no: int,
-    day: str,
-    player_scores: list[dict[str, Any]],
-) -> pd.DataFrame:
-    _, detail_rows = score_round_for_team(
-        team_name,
-        round_no,
-        day,
-        player_scores,
-        ROSTER_LABELS[round_no],
-    )
-    rows = []
-    for row in detail_rows:
-        if row["Status"] == "missing":
-            continue
-        rows.append(
-            {
-                "Spiller": row["Spiller"],
-                "Runde-score": fmt_score(row["Score"]),
-                "Status": "counted" if row["Status"] == "counted" else "dropped",
-            }
-        )
-    return pd.DataFrame(rows)
-
-
 def collect_team_round_player_scores(
     team_id: int,
     round_no: int,
@@ -975,56 +948,6 @@ else:
                 )
                 if pd.notna(leaderboard_value) and int(leaderboard_value) != counted_sum:
                     st.error("Avvik mellom beregnet lagscore og leaderboard.")
-
-    debug_team = "Joakim"
-    if debug_team in set(details["Lag"].unique()):
-        st.divider()
-        st.markdown(f"### 🧪 Debug: {debug_team} poengberegning")
-        debug_team_row = leaderboard[leaderboard["Lag"] == debug_team]
-        if not debug_team_row.empty:
-            debug_tid = int(teams[teams["name"] == debug_team].iloc[0]["id"])
-            score_map = {
-                (int(s.player_id), int(s.round_no)): int(s.score)
-                for _, s in scores.iterrows()
-            }
-            for rnd, day in zip(ROUNDS, DAYS):
-                player_scores = collect_team_round_player_scores(
-                    debug_tid, rnd, players, links, score_map
-                )
-                if not any(row["Score"] is not None for row in player_scores):
-                    continue
-                day_sum, _ = score_round_for_team(
-                    debug_team,
-                    rnd,
-                    day,
-                    player_scores,
-                    ROSTER_LABELS[rnd],
-                )
-                st.markdown(f"**{day}**")
-                st.dataframe(
-                    build_team_round_debug_table(debug_team, rnd, day, player_scores),
-                    width="stretch",
-                    hide_index=True,
-                )
-                leaderboard_value = debug_team_row.iloc[0].get(day)
-                st.write(f"**Lagscore = {fmt_score(day_sum)}**")
-                if pd.notna(leaderboard_value):
-                    match = int(leaderboard_value) == int(day_sum)
-                    st.write(
-                        f"Leaderboard {day}: {fmt_score(leaderboard_value)} · "
-                        f"{'✅ Stemmer' if match else '❌ Avvik'}"
-                    )
-            total_computed = sum(
-                int(debug_team_row.iloc[0][day])
-                for day in DAYS
-                if day in debug_team_row.columns and pd.notna(debug_team_row.iloc[0][day])
-            )
-            total_leaderboard = int(debug_team_row.iloc[0]["Totalt"])
-            st.write(
-                f"**Totalt = {fmt_score(total_computed)}** · "
-                f"Leaderboard totalt: {fmt_score(total_leaderboard)} · "
-                f"{'✅ Stemmer' if total_computed == total_leaderboard else '❌ Avvik'}"
-            )
 
 st.subheader("📋 Spillerstall")
 if not teams.empty and not players.empty:
