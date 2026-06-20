@@ -37,3 +37,5 @@ Admin → **Dagsrapport** genererer norsk fantasy-kompis-rapport (uten OpenAI) m
 ## DataGolf sync-logg
 
 Kjør `migrations/003_sync_log.sql` i Supabase SQL editor for API-feillogging og siste vellykkede synk.
+
+Kjør `migrations/005_app_settings.sql` for persistent auto-sync-innstilling (`auto_sync_enabled`).

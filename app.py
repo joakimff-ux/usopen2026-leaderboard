@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 from supabase import create_client
 
-from lib import datagolf_sync
+from lib import app_settings, datagolf_sync
 from lib.daily_report import TONES, generate_daily_report
 from lib.live_events import build_live_events_display, fetch_recent_score_events
 
@@ -346,8 +346,6 @@ AUTO_SYNC_INTERVAL_MS = 300_000
 
 
 def init_sync_state() -> None:
-    if "auto_sync_enabled" not in st.session_state:
-        st.session_state.auto_sync_enabled = False
     if "last_datagolf_sync_attempt_at" not in st.session_state:
         st.session_state.last_datagolf_sync_attempt_at = None
     if "datagolf_sync_status" not in st.session_state:
@@ -356,6 +354,34 @@ def init_sync_state() -> None:
         st.session_state.daily_report_draft = ""
     if "daily_report_title" not in st.session_state:
         st.session_state.daily_report_title = ""
+
+
+def is_auto_sync_enabled() -> bool:
+    return app_settings.get_auto_sync_enabled(sb)
+
+
+def ensure_auto_sync_checkbox_initialized() -> None:
+    if "datagolf_auto_sync_checkbox" not in st.session_state:
+        st.session_state.datagolf_auto_sync_checkbox = is_auto_sync_enabled()
+
+
+def persist_auto_sync_enabled() -> None:
+    enabled = bool(st.session_state.get("datagolf_auto_sync_checkbox", False))
+    if not app_settings.set_auto_sync_enabled(sb, enabled):
+        st.session_state.auto_sync_save_error = (
+            "Kunne ikke lagre auto-sync-innstilling. Kjør migrations/005_app_settings.sql i Supabase."
+        )
+
+
+def render_auto_sync_status_label() -> None:
+    auto_sync_suspended = datagolf_sync.is_auto_sync_suspended(sb)
+    if is_auto_sync_enabled():
+        if auto_sync_suspended:
+            st.warning("Auto-sync aktiv (midlertidig pauset pga. DataGolf rate limit)")
+        else:
+            st.success("Auto-sync aktiv")
+    else:
+        st.info("Auto-sync av")
 
 
 def get_sync_secrets() -> dict[str, str]:
@@ -378,8 +404,6 @@ def perform_live_sync(use_backoff: bool = True) -> datagolf_sync.SyncResult:
     result = datagolf_sync.execute_sync(sb, get_sync_secrets(), use_backoff=use_backoff)
     st.session_state.datagolf_sync_status = result
     st.session_state.last_datagolf_sync_attempt_at = result.synced_at
-    if result.auto_sync_suspended:
-        st.session_state.auto_sync_enabled = False
     return result
 
 
@@ -391,10 +415,9 @@ def get_last_sync_attempt_time() -> datetime | None:
 
 
 def maybe_run_auto_sync() -> None:
-    if sb is None or not st.session_state.get("auto_sync_enabled"):
+    if sb is None or not is_auto_sync_enabled():
         return
     if datagolf_sync.is_auto_sync_suspended(sb):
-        st.session_state.auto_sync_enabled = False
         return
     last_attempt = get_last_sync_attempt_time()
     if not datagolf_sync.is_auto_sync_due(sb, last_attempt=last_attempt):
@@ -405,7 +428,7 @@ def maybe_run_auto_sync() -> None:
 
 
 def setup_auto_refresh() -> None:
-    if not st.session_state.get("auto_sync_enabled"):
+    if not is_auto_sync_enabled():
         return
     from streamlit_autorefresh import st_autorefresh
 
@@ -945,13 +968,16 @@ if mode == "Admin" and is_admin:
                 st.error(result.error or "DataGolf-synkronisering feilet.")
 
         auto_sync_suspended = datagolf_sync.is_auto_sync_suspended(sb)
-        auto_sync = st.checkbox(
-            "Auto-sync every 5 minutes",
-            value=st.session_state.auto_sync_enabled and not auto_sync_suspended,
+        render_auto_sync_status_label()
+        ensure_auto_sync_checkbox_initialized()
+        st.checkbox(
+            "Auto-sync hvert 5. minutt",
             key="datagolf_auto_sync_checkbox",
-            disabled=auto_sync_suspended,
+            on_change=persist_auto_sync_enabled,
         )
-        st.session_state.auto_sync_enabled = auto_sync and not auto_sync_suspended
+        if st.session_state.get("auto_sync_save_error"):
+            st.error(st.session_state.auto_sync_save_error)
+            st.session_state.auto_sync_save_error = None
         if auto_sync_suspended:
             st.caption("Auto-sync er pauset til DataGolf slutter å returnere HTTP 429.")
 
@@ -1222,6 +1248,16 @@ if latest_comment and latest_comment.get("body"):
     st.markdown("### 💬 Dagens kommentar")
     st.markdown(f"**{latest_comment.get('title', 'Dagsrapport')}**")
     st.write(latest_comment["body"])
+
+last_success = datagolf_sync.get_last_successful_sync(sb)
+if is_auto_sync_enabled():
+    st.caption(
+        f"Auto-sync aktiv · Sist oppdatert: {format_sync_timestamp(last_success)}"
+    )
+else:
+    st.caption(
+        f"Auto-sync av · Sist oppdatert: {format_sync_timestamp(last_success)}"
+    )
 
 st.subheader("🏆 Leaderboard")
 if leaderboard.empty:

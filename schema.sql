@@ -61,3 +61,9 @@ create table if not exists score_events (
 );
 
 create index if not exists score_events_created_at_idx on score_events (created_at desc);
+
+create table if not exists app_settings (
+    key text primary key,
+    value text not null,
+    updated_at timestamptz not null default now()
+);
