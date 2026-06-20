@@ -192,12 +192,17 @@ def build_post_cut_swaps_display(
     return sorted(rows, key=lambda row: row["Plass"])
 
 
-def format_swap_player_list(names: list[str], arrow: str, color: str) -> str:
-    if not names:
-        return "—"
-    return ", ".join(
-        f'<span style="color:{color};font-weight:700">{arrow}</span> {name}'
-        for name in names
+def swap_rows_to_dataframe(swap_rows: list[dict[str, Any]]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Lag": row["Lag"],
+                "Ut": ", ".join(row["out_names"]),
+                "Inn": ", ".join(row["in_names"]),
+                "Antall bytter": f"{row['swap_count']}/{MAX_POST_CUT_SWAPS}",
+            }
+            for row in swap_rows
+        ]
     )
 
 
@@ -213,29 +218,11 @@ def render_post_cut_swaps_section(
         st.info("Ingen lag har gjort bytter ennå.")
         return
 
-    table_html = """
-    <table style="width:100%;border-collapse:collapse;margin-top:0.5rem;">
-      <thead>
-        <tr style="text-align:left;border-bottom:1px solid rgba(11,61,46,.15);">
-          <th style="padding:0.65rem 0.8rem;">Lag</th>
-          <th style="padding:0.65rem 0.8rem;">Ut</th>
-          <th style="padding:0.65rem 0.8rem;">Inn</th>
-          <th style="padding:0.65rem 0.8rem;">Antall bytter</th>
-        </tr>
-      </thead>
-      <tbody>
-    """
-    for row in swap_rows:
-        table_html += f"""
-        <tr style="border-bottom:1px solid rgba(11,61,46,.08);vertical-align:top;">
-          <td style="padding:0.65rem 0.8rem;"><strong>{row['Lag']}</strong></td>
-          <td style="padding:0.65rem 0.8rem;">{format_swap_player_list(row['out_names'], '↓', '#c0392b')}</td>
-          <td style="padding:0.65rem 0.8rem;">{format_swap_player_list(row['in_names'], '↑', '#1b7a3d')}</td>
-          <td style="padding:0.65rem 0.8rem;">{row['swap_count']}/{MAX_POST_CUT_SWAPS}</td>
-        </tr>
-        """
-    table_html += "</tbody></table>"
-    st.markdown(table_html, unsafe_allow_html=True)
+    st.dataframe(
+        swap_rows_to_dataframe(swap_rows),
+        width="stretch",
+        hide_index=True,
+    )
 
 
 def prepare_laguttak_roster_state(
