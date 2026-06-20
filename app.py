@@ -12,7 +12,11 @@ from supabase import create_client
 
 from lib import app_settings, datagolf_sync
 from lib.daily_report import TONES, generate_daily_report
-from lib.live_events import build_live_events_display, fetch_recent_score_events
+from lib.live_events import (
+    build_live_events_display,
+    count_live_events,
+    fetch_recent_live_events,
+)
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("lib.app_settings").setLevel(logging.INFO)
@@ -505,6 +509,16 @@ def render_datagolf_sync_status(result: datagolf_sync.SyncResult | None) -> None
     c2.metric("Scorer oppdatert", result.scores_written)
     c3.metric("Matchede spillere", len(result.matched_players))
 
+    live_written = getattr(result, "live_events_written", 0)
+    live_detected = getattr(result, "score_changes_detected", 0)
+    if live_detected or live_written:
+        st.caption(
+            f"Live hendelser: {live_detected} scoreendringer funnet, {live_written} lagret i live_events."
+        )
+    live_events_error = getattr(result, "live_events_error", None)
+    if live_events_error:
+        st.error(f"live_events-feil: {live_events_error}")
+
     if result.event_name:
         st.caption(f"DataGolf-turnering: {result.event_name}")
     if result.retry_count:
@@ -713,7 +727,8 @@ def render_live_events_section(
     scores: pd.DataFrame,
 ) -> None:
     st.subheader("Live hendelser på banen")
-    events = fetch_recent_score_events(sb, limit=50)
+    total_events = count_live_events(sb)
+    events = fetch_recent_live_events(sb, limit=50)
     score_map = build_score_map(scores)
     display = build_live_events_display(
         events,
@@ -725,7 +740,12 @@ def render_live_events_section(
         limit=20,
     )
     if display.empty:
-        st.info("Ingen nye scoreendringer siden siste oppdatering.")
+        if total_events > 0:
+            st.warning(
+                "Hendelser finnes i databasen, men ingen av de siste er for spillere på et aktivt lag."
+            )
+        else:
+            st.info("Ingen scoreendringer registrert ennå. Hendelser opprettes automatisk ved DataGolf-sync.")
         return
     st.dataframe(display, width="stretch", hide_index=True)
 
@@ -800,6 +820,35 @@ def render_score_round_debug(
             for day, count in detection["teams_with_day_totals"].items()
         ]
         st.write(f"- Lag med dagscore: {' · '.join(totals_lines)}")
+
+    st.divider()
+    st.markdown("**Debug: live_events**")
+    live_count = count_live_events(sb)
+    st.write(f"- Antall live_events i databasen: {live_count}")
+    recent_events = fetch_recent_live_events(sb, limit=5)
+    if recent_events.empty:
+        st.write("- Siste 5 hendelser: ingen")
+    else:
+        st.write("- Siste 5 hendelser:")
+        st.dataframe(
+            recent_events[
+                ["player_name", "round_no", "old_score", "new_score", "change", "event_text", "created_at"]
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+
+    sync_status = st.session_state.get("datagolf_sync_status")
+    if sync_status is None:
+        st.write("- Siste sync: ingen sync kjørt i denne økten")
+    else:
+        st.write(
+            f"- Siste sync: endrede scorer funnet={getattr(sync_status, 'score_changes_detected', 0)}, "
+            f"live_events skrevet={getattr(sync_status, 'live_events_written', 0)}"
+        )
+        sync_events_error = getattr(sync_status, "live_events_error", None)
+        if sync_events_error:
+            st.error(f"live_events-feil ved siste sync: {sync_events_error}")
 
 
 def prepare_leaderboard_display(leaderboard: pd.DataFrame, scores: pd.DataFrame) -> pd.DataFrame:

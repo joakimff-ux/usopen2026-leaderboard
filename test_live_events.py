@@ -5,11 +5,12 @@ from __future__ import annotations
 import pandas as pd
 
 from lib.live_events import (
+    LiveEventsWriteResult,
     build_live_events_display,
     build_score_change_text,
     classify_score_change,
     player_counting_status,
-    record_score_events,
+    record_live_events,
 )
 
 
@@ -21,9 +22,15 @@ class FakeQuery:
         self.selected = "*"
         self.ordered = False
         self.limited: int | None = None
+        self.count_mode = False
 
-    def select(self, columns: str):
+    def select(self, columns: str, count: str | None = None):
         self.selected = columns
+        self.count_mode = count == "exact"
+        return self
+
+    def eq(self, column: str, value: object):
+        self.filters.setdefault("eq", []).append((column, value))
         return self
 
     def in_(self, column: str, values: list[int]):
@@ -42,17 +49,25 @@ class FakeQuery:
         self.store.setdefault(self.table_name, []).extend(rows)
         return self
 
-    def execute(self):
+    def _filtered_rows(self) -> list[dict]:
         rows = list(self.store.get(self.table_name, []))
-        if self.table_name == "scores" and "in" in self.filters:
-            _, values = self.filters["in"]
+        if "in" in self.filters:
+            column, values = self.filters["in"]
             allowed = set(values)
-            rows = [row for row in rows if row["player_id"] in allowed]
+            rows = [row for row in rows if row[column] in allowed]
+        for column, value in self.filters.get("eq", []):
+            rows = [row for row in rows if row.get(column) == value]
         if self.ordered:
             column, desc = self.ordered
             rows = sorted(rows, key=lambda row: row[column], reverse=desc)
         if self.limited is not None:
             rows = rows[: self.limited]
+        return rows
+
+    def execute(self):
+        rows = self._filtered_rows()
+        if self.count_mode:
+            return type("Result", (), {"data": rows, "count": len(rows)})()
         return type("Result", (), {"data": rows, "count": len(rows)})()
 
 
@@ -99,15 +114,24 @@ def main() -> int:
 
     store = {
         "scores": [{"player_id": 10, "round_no": 2, "score": 0}],
-        "score_events": [],
+        "live_events": [],
+        "team_players": [
+            {"player_id": 10, "active_from_round": 1, "active_to_round": 2},
+        ],
     }
     client = FakeClient(store)
-    written = record_score_events(
+    db_players = [{"id": 10, "name": "Viktor Hovland"}]
+    result = record_live_events(
         client,
         [{"player_id": 10, "round_no": 2, "score": -1}],
+        db_players,
+        active_round=2,
     )
-    assert written == 1
-    assert store["score_events"][0]["delta"] == -1
+    assert isinstance(result, LiveEventsWriteResult)
+    assert result.written == 1
+    assert result.changes_detected == 1
+    assert store["live_events"][0]["change"] == -1
+    assert "birdie" in store["live_events"][0]["event_text"]
 
     teams = pd.DataFrame([{"id": 1, "name": "Joakim"}])
     players = pd.DataFrame(
@@ -130,7 +154,8 @@ def main() -> int:
                 "round_no": 2,
                 "old_score": 0,
                 "new_score": -1,
-                "delta": -1,
+                "change": -1,
+                "event_text": build_score_change_text(0, -1, -1),
             }
         ]
     )
@@ -150,7 +175,7 @@ def main() -> int:
     assert "Teller" in display.iloc[0]["Teller/Droppes"]
 
     print("PASS: live event classification")
-    print("PASS: record score events on sync diff")
+    print("PASS: record live events on sync diff")
     print("PASS: live events display for rostered players")
     return 0
 

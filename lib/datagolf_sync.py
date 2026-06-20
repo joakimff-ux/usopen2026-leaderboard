@@ -14,7 +14,7 @@ from urllib.request import urlopen
 
 from supabase import Client
 
-from lib.live_events import record_score_events
+from lib.live_events import record_live_events
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +66,9 @@ class SyncResult:
     last_successful_sync: datetime | None = None
     auto_sync_suspended: bool = False
     retry_count: int = 0
+    live_events_written: int = 0
+    score_changes_detected: int = 0
+    live_events_error: str | None = None
 
 
 @dataclass
@@ -911,7 +914,16 @@ def sync_live_scores(
             log_sync_event(client, "error", result.error or "No valid scores")
             return finalize_sync_result(client, result)
 
-        record_score_events(client, score_rows)
+        record_result = record_live_events(client, score_rows, db_players, event_round)
+        if record_result.changes_detected:
+            logger.info(
+                "Live events: detected=%s written=%s active_round=%s",
+                record_result.changes_detected,
+                record_result.written,
+                event_round,
+            )
+        if record_result.error:
+            logger.error("Live events insert failed: %s", record_result.error)
         client.table("scores").upsert(score_rows, on_conflict="player_id,round_no").execute()
 
         analysis = analyze_live_score_records(records, event_round)
@@ -945,6 +957,9 @@ def sync_live_scores(
             unmatched_players=sorted(set(unmatched_players)),
             sample_writes=sample_writes,
             event_name=event_name,
+            live_events_written=record_result.written,
+            score_changes_detected=record_result.changes_detected,
+            live_events_error=record_result.error,
         )
         log_sync_event(
             client,

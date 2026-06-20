@@ -42,4 +42,6 @@ Kjør `migrations/005_app_settings.sql` for persistent auto-sync-innstilling (`a
 
 Hvis lagring feiler med `code=42501` (RLS), kjør også `migrations/006_app_settings_rls.sql`.
 
+Kjør `migrations/007_live_events.sql` for «Live hendelser på banen».
+
 Test mot Supabase: `python test_app_settings_db.py`
