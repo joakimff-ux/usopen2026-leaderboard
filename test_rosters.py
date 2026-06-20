@@ -55,13 +55,13 @@ def build_model(teams, players, links, scores):
         for rnd, day in zip(ROUNDS, DAYS):
             picked_ids = get_team_player_ids(links, team_id, rnd)
             picked = players[players.id.astype(int).isin(picked_ids)].sort_values("name")
-            round_rows = []
-            for _, p in picked.iterrows():
-                val = score_map.get((int(p.id), rnd))
-                round_rows.append({"Lag": t["name"], "Dag": day, "Spiller": p["name"], "Score": val})
-            scored = pd.DataFrame(round_rows).dropna(subset=["Score"]).sort_values("Score", ascending=True)
-            counting = scored.head(COUNTING_SCORES)
-            day_sum = counting.Score.sum() if len(counting) else None
+            player_scores = [
+                {"Spiller": p["name"], "Score": score_map.get((int(p.id), rnd))}
+                for _, p in picked.iterrows()
+            ]
+            day_sum, _ = score_round_for_team(
+                t["name"], rnd, day, player_scores, ROSTER_LABELS[rnd]
+            )
             row[day] = day_sum
             if day_sum is not None:
                 total += int(day_sum)
@@ -82,14 +82,47 @@ def describe_post_cut_swaps(original_ids: set[int], post_cut_ids: set[int], play
     return len(out_ids), out_names, in_names
 
 
-def get_global_highest_scored_round(details: pd.DataFrame) -> int:
+def rounds_with_scores(scores: pd.DataFrame) -> set[int]:
+    if scores.empty or "round_no" not in scores.columns:
+        return set()
+    return {int(value) for value in scores["round_no"].dropna().unique()}
+
+
+def prepare_leaderboard_display(leaderboard: pd.DataFrame, scores: pd.DataFrame) -> pd.DataFrame:
+    if leaderboard.empty:
+        return leaderboard
+
+    started_rounds = rounds_with_scores(scores)
+    visible_days = [
+        day
+        for rnd, day in zip(ROUNDS, DAYS)
+        if day in leaderboard.columns
+        and (rnd in started_rounds or leaderboard[day].notna().any())
+    ]
+    columns = ["Plass", "Lag", *visible_days, "Totalt"]
+    return leaderboard[columns]
+
+
+def get_highest_scored_round_from_details(details: pd.DataFrame) -> int:
     highest = 0
     if details.empty:
-        return 0
+        return highest
     for rnd, day in zip(ROUNDS, DAYS):
         if not details[details["Dag"] == day].dropna(subset=["Score"]).empty:
             highest = rnd
     return highest
+
+
+def get_next_active_round(scores: pd.DataFrame, details: pd.DataFrame) -> int:
+    completed = get_highest_scored_round_from_details(details)
+    started = rounds_with_scores(scores)
+    if started and max(started) > completed:
+        return max(started)
+    return min(completed + 1, 4)
+
+
+def get_global_highest_scored_round(details: pd.DataFrame) -> int:
+    return get_highest_scored_round_from_details(details)
 
 
 def team_scored_rounds(details: pd.DataFrame, team: str) -> set[int]:
@@ -103,13 +136,17 @@ def team_scored_rounds(details: pd.DataFrame, team: str) -> set[int]:
     return scored_rounds
 
 
-def ordered_round_days_with_scores(details: pd.DataFrame, team: str) -> list[tuple[int, str]]:
-    global_highest = get_global_highest_scored_round(details)
-    next_active = min(global_highest + 1, 4)
+def ordered_round_days_with_scores(
+    details: pd.DataFrame,
+    team: str,
+    scores: pd.DataFrame,
+) -> list[tuple[int, str]]:
+    next_active = get_next_active_round(scores, details)
     scored_rounds = team_scored_rounds(details, team)
+    completed_global = get_highest_scored_round_from_details(details)
 
     ordered: list[tuple[int, str]] = [(next_active, DAYS[next_active - 1])]
-    for rnd in range(global_highest, 0, -1):
+    for rnd in range(completed_global, 0, -1):
         if rnd == next_active or rnd not in scored_rounds:
             continue
         ordered.append((rnd, DAYS[rnd - 1]))
@@ -121,7 +158,8 @@ def score_round_for_team(team_name, round_no, day, player_scores, roster_label):
     scored = frame.dropna(subset=["Score"]).sort_values("Score", ascending=True)
     counting = scored.head(COUNTING_SCORES)
     dropped = scored.iloc[COUNTING_SCORES:]
-    team_score = int(counting["Score"].sum()) if not counting.empty else None
+    roster_complete = len(scored) >= PLAYERS_PER_TEAM
+    team_score = int(counting["Score"].sum()) if roster_complete and not counting.empty else None
     detail_rows = []
     for rank, (_, row) in enumerate(counting.iterrows(), 1):
         detail_rows.append(
@@ -258,12 +296,13 @@ def main() -> int:
             {"Lag": "Annen", "Dag": "Dag 2", "Score": 1},
         ]
     )
-    assert ordered_round_days_with_scores(detail_rows, "Testlag") == [
+    empty_scores = pd.DataFrame(columns=["player_id", "round_no", "score"])
+    assert ordered_round_days_with_scores(detail_rows, "Testlag", empty_scores) == [
         (3, "Dag 3"),
         (2, "Dag 2"),
         (1, "Dag 1"),
     ]
-    assert ordered_round_days_with_scores(detail_rows, "Annen") == [
+    assert ordered_round_days_with_scores(detail_rows, "Annen", empty_scores) == [
         (3, "Dag 3"),
         (2, "Dag 2"),
         (1, "Dag 1"),
@@ -275,7 +314,7 @@ def main() -> int:
             {"Lag": "Annen", "Dag": "Dag 1", "Score": 0},
         ]
     )
-    assert ordered_round_days_with_scores(only_day1, "Testlag") == [(2, "Dag 2"), (1, "Dag 1")]
+    assert ordered_round_days_with_scores(only_day1, "Testlag", empty_scores) == [(2, "Dag 2"), (1, "Dag 1")]
 
     day3_scored = pd.DataFrame(
         [
@@ -285,14 +324,37 @@ def main() -> int:
             {"Lag": "Annen", "Dag": "Dag 1", "Score": 0},
         ]
     )
-    assert ordered_round_days_with_scores(day3_scored, "Testlag") == [
+    scores_with_r3 = pd.DataFrame([{"player_id": 1, "round_no": 3, "score": 0}])
+    assert ordered_round_days_with_scores(day3_scored, "Testlag", scores_with_r3) == [
         (4, "Dag 4"),
         (3, "Dag 3"),
         (2, "Dag 2"),
         (1, "Dag 1"),
     ]
 
-    assert ordered_round_days_with_scores(pd.DataFrame(), "Testlag") == [(1, "Dag 1")]
+    assert ordered_round_days_with_scores(pd.DataFrame(), "Testlag", empty_scores) == [(1, "Dag 1")]
+
+    partial_day3_scores = pd.DataFrame([{"player_id": 1, "round_no": 3, "score": -1}])
+    partial_lb = pd.DataFrame(
+        [
+            {
+                "Plass": 1,
+                "Lag": "Testlag",
+                "Dag 1": 28,
+                "Dag 2": 75,
+                "Dag 3": None,
+                "Totalt": 103,
+            }
+        ]
+    )
+    displayed = prepare_leaderboard_display(partial_lb, partial_day3_scores)
+    assert "Dag 3" in displayed.columns, displayed.columns.tolist()
+    assert pd.isna(displayed.iloc[0]["Dag 3"])
+
+    partial_player_scores = [{"Spiller": f"Player {i}", "Score": None} for i in range(1, 8)]
+    partial_player_scores[0]["Score"] = -1
+    day_sum, _ = score_round_for_team("Testlag", 3, "Dag 3", partial_player_scores, "Etter bytter")
+    assert day_sum is None, day_sum
 
     joakim_round_2 = [
         {"Spiller": "Collin Morikawa", "Score": -5},

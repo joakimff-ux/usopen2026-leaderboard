@@ -561,7 +561,8 @@ def score_round_for_team(
     scored = frame.dropna(subset=["Score"]).sort_values("Score", ascending=True)
     counting = scored.head(COUNTING_SCORES)
     dropped = scored.iloc[COUNTING_SCORES:]
-    team_score = int(counting["Score"].sum()) if not counting.empty else None
+    roster_complete = len(scored) >= PLAYERS_PER_TEAM
+    team_score = int(counting["Score"].sum()) if roster_complete and not counting.empty else None
 
     detail_rows: list[dict[str, Any]] = []
     for rank, (_, row) in enumerate(counting.iterrows(), 1):
@@ -660,27 +661,48 @@ def render_live_events_section(
     st.dataframe(display, width="stretch", hide_index=True)
 
 
-def prepare_leaderboard_display(leaderboard: pd.DataFrame) -> pd.DataFrame:
-    """Show only ranking columns and hide day columns with no registered scores."""
+def rounds_with_scores(scores: pd.DataFrame) -> set[int]:
+    if scores.empty or "round_no" not in scores.columns:
+        return set()
+    return {int(value) for value in scores["round_no"].dropna().unique()}
+
+
+def prepare_leaderboard_display(leaderboard: pd.DataFrame, scores: pd.DataFrame) -> pd.DataFrame:
+    """Show day columns once that round has started in scores, or any team has a day total."""
     if leaderboard.empty:
         return leaderboard
 
+    started_rounds = rounds_with_scores(scores)
     visible_days = [
-        day for day in DAYS
-        if day in leaderboard.columns and leaderboard[day].notna().any()
+        day
+        for rnd, day in zip(ROUNDS, DAYS)
+        if day in leaderboard.columns
+        and (rnd in started_rounds or leaderboard[day].notna().any())
     ]
     columns = ["Plass", "Lag", *visible_days, "Totalt"]
     return leaderboard[columns]
 
 
-def get_global_highest_scored_round(details: pd.DataFrame) -> int:
+def get_highest_scored_round_from_details(details: pd.DataFrame) -> int:
     highest = 0
     if details.empty:
-        return 0
+        return highest
     for rnd, day in zip(ROUNDS, DAYS):
         if not details[details["Dag"] == day].dropna(subset=["Score"]).empty:
             highest = rnd
     return highest
+
+
+def get_global_highest_scored_round(details: pd.DataFrame) -> int:
+    return get_highest_scored_round_from_details(details)
+
+
+def get_next_active_round(scores: pd.DataFrame, details: pd.DataFrame) -> int:
+    completed = get_highest_scored_round_from_details(details)
+    started = rounds_with_scores(scores)
+    if started and max(started) > completed:
+        return max(started)
+    return min(completed + 1, 4)
 
 
 def team_scored_rounds(details: pd.DataFrame, team: str) -> set[int]:
@@ -694,14 +716,18 @@ def team_scored_rounds(details: pd.DataFrame, team: str) -> set[int]:
     return scored_rounds
 
 
-def ordered_round_days_with_scores(details: pd.DataFrame, team: str) -> list[tuple[int, str]]:
+def ordered_round_days_with_scores(
+    details: pd.DataFrame,
+    team: str,
+    scores: pd.DataFrame,
+) -> list[tuple[int, str]]:
     """Show next active round first, then prior rounds with scores (newest first)."""
-    global_highest = get_global_highest_scored_round(details)
-    next_active = min(global_highest + 1, 4)
+    next_active = get_next_active_round(scores, details)
     scored_rounds = team_scored_rounds(details, team)
+    completed_global = get_highest_scored_round_from_details(details)
 
     ordered: list[tuple[int, str]] = [(next_active, DAYS[next_active - 1])]
-    for rnd in range(global_highest, 0, -1):
+    for rnd in range(completed_global, 0, -1):
         if rnd == next_active or rnd not in scored_rounds:
             continue
         ordered.append((rnd, DAYS[rnd - 1]))
@@ -1134,7 +1160,7 @@ st.subheader("🏆 Leaderboard")
 if leaderboard.empty:
     st.info("Ingen data ennå. Gå til Admin og importer fra Excel.")
 else:
-    st.dataframe(prepare_leaderboard_display(leaderboard), width="stretch", hide_index=True)
+    st.dataframe(prepare_leaderboard_display(leaderboard, scores), width="stretch", hide_index=True)
 
 render_live_events_section(teams, players, links, scores)
 
@@ -1144,7 +1170,7 @@ if details.empty:
 else:
     team = st.selectbox("Velg lag", sorted(details["Lag"].unique()))
     team_details = details[details["Lag"] == team]
-    for idx, (rnd, day) in enumerate(ordered_round_days_with_scores(details, team)):
+    for idx, (rnd, day) in enumerate(ordered_round_days_with_scores(details, team, scores)):
         day_df = team_details[team_details["Dag"] == day].copy()
         roster_label = ROSTER_LABELS[rnd]
         status_order = {"counted": 0, "dropped": 1, "missing": 2}
