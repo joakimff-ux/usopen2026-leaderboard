@@ -32,7 +32,7 @@ Leaderboard bruker originalt lag for Dag 1–2 og oppdatert lag for Dag 3–4.
 
 Kjør `migrations/002_daily_comments.sql` i Supabase SQL editor.
 
-Admin → **Dagsrapport** genererer norsk oppsummering (uten OpenAI). Lagrede kommentarer vises som **Dagens kommentar** over leaderboard.
+Admin → **Dagsrapport** genererer norsk fantasy-kompis-rapport (uten OpenAI) med valgbar tone: Saklig, Morsom, Frekk eller Brutal. Lagrede kommentarer vises som **Dagens kommentar** over leaderboard.
 
 ## DataGolf sync-logg
 

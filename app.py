@@ -1050,7 +1050,7 @@ if mode == "Admin" and is_admin:
                     st.rerun()
     with tabs[5]:
         st.subheader("Dagsrapport")
-        st.caption("Generer en norsk oppsummering for deltakerne basert på leaderboard og tellende scorer.")
+        st.caption("Generer en norsk fantasy-kompis-rapport basert på leaderboard og tellende scorer.")
 
         c1, c2 = st.columns(2)
         report_round = c1.selectbox(
@@ -1080,7 +1080,7 @@ if mode == "Admin" and is_admin:
         report_body = st.text_area(
             "Dagsrapport (rediger før publisering)",
             value=st.session_state.get("daily_report_draft", ""),
-            height=260,
+            height=360,
         )
 
         if action2.button("Kopier tekst", key="copy_daily_report"):
