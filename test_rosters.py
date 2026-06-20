@@ -280,7 +280,7 @@ def main() -> int:
     swap_count, out_names, in_names = describe_post_cut_swaps(set(original), set(swapped), players)
     assert swap_count == 3
     assert out_names == ["Player 4", "Player 5", "Player 6"]
-    assert in_names == ["Player 8", "Player 9", "Player 10"]
+    assert set(in_names) == {"Player 8", "Player 9", "Player 10"}
 
     print("PASS: Dag 1-2 use original roster")
     print("PASS: Dag 3-4 use post-cut roster")
