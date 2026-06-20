@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,9 @@ from supabase import create_client
 from lib import app_settings, datagolf_sync
 from lib.daily_report import TONES, generate_daily_report
 from lib.live_events import build_live_events_display, fetch_recent_score_events
+
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("lib.app_settings").setLevel(logging.INFO)
 
 DEFAULT_FILE = Path(__file__).parent / "data" / "US Open 2026 - Resultater.xlsx"
 DAYS = ["Dag 1", "Dag 2", "Dag 3", "Dag 4"]
@@ -357,20 +361,62 @@ def init_sync_state() -> None:
 
 
 def is_auto_sync_enabled() -> bool:
-    return app_settings.get_auto_sync_enabled(sb)
+    result = app_settings.get_auto_sync_setting(sb)
+    if result.error:
+        st.session_state.auto_sync_read_error = result.error
+        return False
+    st.session_state.pop("auto_sync_read_error", None)
+    return app_settings.parse_bool(result.value)
 
 
 def ensure_auto_sync_checkbox_initialized() -> None:
     if "datagolf_auto_sync_checkbox" not in st.session_state:
-        st.session_state.datagolf_auto_sync_checkbox = is_auto_sync_enabled()
+        result = app_settings.get_auto_sync_setting(sb)
+        if result.error:
+            st.session_state.auto_sync_read_error = result.error
+            st.session_state.datagolf_auto_sync_checkbox = False
+        else:
+            st.session_state.datagolf_auto_sync_checkbox = app_settings.parse_bool(result.value)
 
 
 def persist_auto_sync_enabled() -> None:
     enabled = bool(st.session_state.get("datagolf_auto_sync_checkbox", False))
-    if not app_settings.set_auto_sync_enabled(sb, enabled):
-        st.session_state.auto_sync_save_error = (
-            "Kunne ikke lagre auto-sync-innstilling. Kjør migrations/005_app_settings.sql i Supabase."
-        )
+    result = app_settings.save_auto_sync_setting(sb, enabled)
+    if not result.ok:
+        st.session_state.auto_sync_save_error = result.error or "Ukjent Supabase-feil ved lagring av auto-sync."
+        st.session_state.auto_sync_probe = app_settings.probe_app_settings(sb)
+
+
+def render_app_settings_diagnostics() -> None:
+    with st.expander("Debug: app_settings i Supabase", expanded=bool(st.session_state.get("auto_sync_save_error"))):
+        if st.button("Kjør select/upsert-test", key="probe_app_settings"):
+            st.session_state.auto_sync_probe = app_settings.probe_app_settings(sb)
+
+        read_result = app_settings.get_auto_sync_setting(sb)
+        st.write("**get_auto_sync_setting()**")
+        if read_result.error:
+            st.error(read_result.error)
+        elif read_result.value is None:
+            st.info("Ingen rad for auto_sync_enabled ennå.")
+        else:
+            st.success(f"value={read_result.value!r} → enabled={app_settings.parse_bool(read_result.value)}")
+
+        probe = st.session_state.get("auto_sync_probe")
+        if probe is not None:
+            st.write("**select * from app_settings**")
+            if probe.select_ok:
+                st.success(f"OK ({len(probe.select_rows or [])} rader): {probe.select_rows}")
+            else:
+                st.error(probe.select_error or "Select feilet.")
+            st.write("**upsert auto_sync_enabled=true**")
+            if probe.upsert_ok:
+                st.success("OK")
+            else:
+                st.error(probe.upsert_error or "Upsert feilet.")
+                if probe.upsert_error and "42501" in probe.upsert_error:
+                    st.caption(
+                        "RLS-policy mangler. Kjør migrations/006_app_settings_rls.sql i Supabase SQL editor."
+                    )
 
 
 def render_auto_sync_status_label() -> None:
@@ -975,11 +1021,15 @@ if mode == "Admin" and is_admin:
             key="datagolf_auto_sync_checkbox",
             on_change=persist_auto_sync_enabled,
         )
+        if st.session_state.get("auto_sync_read_error"):
+            st.error(f"Kunne ikke lese auto-sync fra Supabase: {st.session_state.auto_sync_read_error}")
         if st.session_state.get("auto_sync_save_error"):
-            st.error(st.session_state.auto_sync_save_error)
+            st.error(f"Kunne ikke lagre auto-sync: {st.session_state.auto_sync_save_error}")
             st.session_state.auto_sync_save_error = None
         if auto_sync_suspended:
             st.caption("Auto-sync er pauset til DataGolf slutter å returnere HTTP 429.")
+
+        render_app_settings_diagnostics()
 
         render_datagolf_sync_status(st.session_state.get("datagolf_sync_status"))
 

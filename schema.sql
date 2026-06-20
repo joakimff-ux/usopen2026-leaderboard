@@ -67,3 +67,24 @@ create table if not exists app_settings (
     value text not null,
     updated_at timestamptz not null default now()
 );
+
+alter table app_settings enable row level security;
+
+create policy "app_settings_select_public"
+    on app_settings
+    for select
+    to anon, authenticated
+    using (true);
+
+create policy "app_settings_insert_public"
+    on app_settings
+    for insert
+    to anon, authenticated
+    with check (true);
+
+create policy "app_settings_update_public"
+    on app_settings
+    for update
+    to anon, authenticated
+    using (true)
+    with check (true);

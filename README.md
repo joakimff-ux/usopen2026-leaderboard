@@ -39,3 +39,7 @@ Admin → **Dagsrapport** genererer norsk fantasy-kompis-rapport (uten OpenAI) m
 Kjør `migrations/003_sync_log.sql` i Supabase SQL editor for API-feillogging og siste vellykkede synk.
 
 Kjør `migrations/005_app_settings.sql` for persistent auto-sync-innstilling (`auto_sync_enabled`).
+
+Hvis lagring feiler med `code=42501` (RLS), kjør også `migrations/006_app_settings_rls.sql`.
+
+Test mot Supabase: `python test_app_settings_db.py`
