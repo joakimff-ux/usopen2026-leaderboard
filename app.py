@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import streamlit as st
@@ -414,6 +415,111 @@ def fmt_score(x):
     return "E" if x == 0 else (f"{x:+d}" if x > 0 else str(x))
 
 
+def score_round_for_team(
+    team_name: str,
+    round_no: int,
+    day: str,
+    player_scores: list[dict[str, Any]],
+    roster_label: str,
+) -> tuple[int | None, list[dict[str, Any]]]:
+    """Pick the 5 lowest round scores from up to 7 roster players."""
+    frame = pd.DataFrame(player_scores)
+    scored = frame.dropna(subset=["Score"]).sort_values("Score", ascending=True)
+    counting = scored.head(COUNTING_SCORES)
+    dropped = scored.iloc[COUNTING_SCORES:]
+    team_score = int(counting["Score"].sum()) if not counting.empty else None
+
+    detail_rows: list[dict[str, Any]] = []
+    for rank, (_, row) in enumerate(counting.iterrows(), 1):
+        detail_rows.append(
+            {
+                "Lag": team_name,
+                "Dag": day,
+                "Runde": round_no,
+                "Spiller": row["Spiller"],
+                "Score": int(row["Score"]),
+                "Lagtype": roster_label,
+                "Rang": rank,
+                "Teller": "✅ Teller",
+                "Status": "counted",
+            }
+        )
+    for _, row in dropped.iterrows():
+        detail_rows.append(
+            {
+                "Lag": team_name,
+                "Dag": day,
+                "Runde": round_no,
+                "Spiller": row["Spiller"],
+                "Score": int(row["Score"]),
+                "Lagtype": roster_label,
+                "Rang": None,
+                "Teller": "❌ Droppes",
+                "Status": "dropped",
+            }
+        )
+    for _, row in frame[frame["Score"].isna()].iterrows():
+        detail_rows.append(
+            {
+                "Lag": team_name,
+                "Dag": day,
+                "Runde": round_no,
+                "Spiller": row["Spiller"],
+                "Score": None,
+                "Lagtype": roster_label,
+                "Rang": None,
+                "Teller": "Mangler score",
+                "Status": "missing",
+            }
+        )
+    return team_score, detail_rows
+
+
+def build_team_round_debug_table(
+    team_name: str,
+    round_no: int,
+    day: str,
+    player_scores: list[dict[str, Any]],
+) -> pd.DataFrame:
+    _, detail_rows = score_round_for_team(
+        team_name,
+        round_no,
+        day,
+        player_scores,
+        ROSTER_LABELS[round_no],
+    )
+    rows = []
+    for row in detail_rows:
+        if row["Status"] == "missing":
+            continue
+        rows.append(
+            {
+                "Spiller": row["Spiller"],
+                "Runde-score": fmt_score(row["Score"]),
+                "Status": "counted" if row["Status"] == "counted" else "dropped",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def collect_team_round_player_scores(
+    team_id: int,
+    round_no: int,
+    players: pd.DataFrame,
+    links: pd.DataFrame,
+    score_map: dict[tuple[int, int], int],
+) -> list[dict[str, Any]]:
+    picked_ids = get_team_player_ids(links, team_id, round_no)
+    picked = players[players.id.astype(int).isin(picked_ids)].sort_values("name")
+    return [
+        {
+            "Spiller": p["name"],
+            "Score": score_map.get((int(p.id), round_no)),
+        }
+        for _, p in picked.iterrows()
+    ]
+
+
 def prepare_leaderboard_display(leaderboard: pd.DataFrame) -> pd.DataFrame:
     """Show only ranking columns and hide day columns with no registered scores."""
     if leaderboard.empty:
@@ -450,35 +556,24 @@ def build_model(teams: pd.DataFrame, players: pd.DataFrame, links: pd.DataFrame,
     summary = []
     for _, t in teams.sort_values("name").iterrows():
         team_id = int(t.id)
+        team_name = t["name"]
         total = 0
-        row = {"Lag": t["name"]}
+        row = {"Lag": team_name}
         for rnd, day in zip(ROUNDS, DAYS):
-            picked_ids = get_team_player_ids(links, team_id, rnd)
-            picked = players[players.id.astype(int).isin(picked_ids)].sort_values("name")
-            round_rows = []
-            for _, p in picked.iterrows():
-                val = score_map.get((int(p.id), rnd))
-                round_rows.append(
-                    {
-                        "Lag": t["name"],
-                        "Dag": day,
-                        "Runde": rnd,
-                        "Spiller": p["name"],
-                        "Score": val,
-                        "Lagtype": ROSTER_LABELS[rnd],
-                    }
-                )
-            scored = pd.DataFrame(round_rows).dropna(subset=["Score"]).sort_values("Score", ascending=True)
-            counting = scored.head(COUNTING_SCORES).copy()
-            dropped = scored.iloc[COUNTING_SCORES:].copy()
-            day_sum = counting.Score.sum() if len(counting) else None
+            player_scores = collect_team_round_player_scores(
+                team_id, rnd, players, links, score_map
+            )
+            day_sum, round_detail = score_round_for_team(
+                team_name,
+                rnd,
+                day,
+                player_scores,
+                ROSTER_LABELS[rnd],
+            )
             row[day] = day_sum
             if day_sum is not None:
                 total += int(day_sum)
-            for rank, (_, r) in enumerate(counting.iterrows(), 1):
-                detail.append({**r.to_dict(), "Rang": rank, "Teller": "✅ Teller"})
-            for _, r in dropped.iterrows():
-                detail.append({**r.to_dict(), "Rang": None, "Teller": "❌ Droppes"})
+            detail.extend(round_detail)
         row["Totalt"] = total
         summary.append(row)
     leaderboard = pd.DataFrame(summary)
@@ -853,11 +948,83 @@ else:
     team_details = details[details["Lag"] == team]
     for idx, (rnd, day) in enumerate(ordered_round_days_with_scores(details, team)):
         day_df = team_details[team_details["Dag"] == day].copy()
-        day_df["Score"] = day_df["Score"].map(fmt_score)
         roster_label = ROSTER_LABELS[rnd]
+        status_order = {"counted": 0, "dropped": 1, "missing": 2}
+        day_df["status_order"] = day_df["Status"].map(status_order)
+        day_df = day_df.sort_values(
+            ["status_order", "Score"],
+            ascending=[True, True],
+            na_position="last",
+        )
+        counted_sum = int(day_df[day_df["Status"] == "counted"]["Score"].sum())
+        display_df = day_df.copy()
+        display_df["Score"] = display_df["Score"].map(fmt_score)
         with st.expander(f"{day} - {team} ({roster_label})", expanded=(idx == 0)):
             st.caption(f"Lagtype: {roster_label}")
-            st.dataframe(day_df[["Teller", "Rang", "Spiller", "Score"]], width="stretch", hide_index=True)
+            st.dataframe(
+                display_df[["Teller", "Rang", "Spiller", "Score"]],
+                width="stretch",
+                hide_index=True,
+            )
+            team_row = leaderboard[leaderboard["Lag"] == team]
+            if not team_row.empty and day in team_row.columns:
+                leaderboard_value = team_row.iloc[0][day]
+                st.caption(
+                    f"**Lagscore {day}:** {fmt_score(counted_sum)} "
+                    f"(sum av 5 beste) · Leaderboard viser: {fmt_score(leaderboard_value)}"
+                )
+                if pd.notna(leaderboard_value) and int(leaderboard_value) != counted_sum:
+                    st.error("Avvik mellom beregnet lagscore og leaderboard.")
+
+    debug_team = "Joakim"
+    if debug_team in set(details["Lag"].unique()):
+        st.divider()
+        st.markdown(f"### 🧪 Debug: {debug_team} poengberegning")
+        debug_team_row = leaderboard[leaderboard["Lag"] == debug_team]
+        if not debug_team_row.empty:
+            debug_tid = int(teams[teams["name"] == debug_team].iloc[0]["id"])
+            score_map = {
+                (int(s.player_id), int(s.round_no)): int(s.score)
+                for _, s in scores.iterrows()
+            }
+            for rnd, day in zip(ROUNDS, DAYS):
+                player_scores = collect_team_round_player_scores(
+                    debug_tid, rnd, players, links, score_map
+                )
+                if not any(row["Score"] is not None for row in player_scores):
+                    continue
+                day_sum, _ = score_round_for_team(
+                    debug_team,
+                    rnd,
+                    day,
+                    player_scores,
+                    ROSTER_LABELS[rnd],
+                )
+                st.markdown(f"**{day}**")
+                st.dataframe(
+                    build_team_round_debug_table(debug_team, rnd, day, player_scores),
+                    width="stretch",
+                    hide_index=True,
+                )
+                leaderboard_value = debug_team_row.iloc[0].get(day)
+                st.write(f"**Lagscore = {fmt_score(day_sum)}**")
+                if pd.notna(leaderboard_value):
+                    match = int(leaderboard_value) == int(day_sum)
+                    st.write(
+                        f"Leaderboard {day}: {fmt_score(leaderboard_value)} · "
+                        f"{'✅ Stemmer' if match else '❌ Avvik'}"
+                    )
+            total_computed = sum(
+                int(debug_team_row.iloc[0][day])
+                for day in DAYS
+                if day in debug_team_row.columns and pd.notna(debug_team_row.iloc[0][day])
+            )
+            total_leaderboard = int(debug_team_row.iloc[0]["Totalt"])
+            st.write(
+                f"**Totalt = {fmt_score(total_computed)}** · "
+                f"Leaderboard totalt: {fmt_score(total_leaderboard)} · "
+                f"{'✅ Stemmer' if total_computed == total_leaderboard else '❌ Avvik'}"
+            )
 
 st.subheader("📋 Spillerstall")
 if not teams.empty and not players.empty:

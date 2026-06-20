@@ -81,6 +81,36 @@ def ordered_round_days_with_scores(details: pd.DataFrame, team: str) -> list[tup
     return present
 
 
+def score_round_for_team(team_name, round_no, day, player_scores, roster_label):
+    frame = pd.DataFrame(player_scores)
+    scored = frame.dropna(subset=["Score"]).sort_values("Score", ascending=True)
+    counting = scored.head(COUNTING_SCORES)
+    dropped = scored.iloc[COUNTING_SCORES:]
+    team_score = int(counting["Score"].sum()) if not counting.empty else None
+    detail_rows = []
+    for rank, (_, row) in enumerate(counting.iterrows(), 1):
+        detail_rows.append(
+            {
+                "Lag": team_name,
+                "Dag": day,
+                "Spiller": row["Spiller"],
+                "Score": int(row["Score"]),
+                "Status": "counted",
+            }
+        )
+    for _, row in dropped.iterrows():
+        detail_rows.append(
+            {
+                "Lag": team_name,
+                "Dag": day,
+                "Spiller": row["Spiller"],
+                "Score": int(row["Score"]),
+                "Status": "dropped",
+            }
+        )
+    return team_score, detail_rows
+
+
 def make_links(team_id: int, pre_ids: list[int], post_ids: list[int]) -> pd.DataFrame:
     rows = []
     for pid in pre_ids:
@@ -155,10 +185,33 @@ def main() -> int:
     ]
     assert ordered_round_days_with_scores(detail_rows, "Mangler") == []
 
+    joakim_round_2 = [
+        {"Spiller": "Collin Morikawa", "Score": -5},
+        {"Spiller": "Scottie Scheffler", "Score": -2},
+        {"Spiller": "Kristoffer Reitan", "Score": 6},
+        {"Spiller": "Brooks Koepka", "Score": 7},
+        {"Spiller": "Viktor Hovland", "Score": -1},
+        {"Spiller": "Patrick Reed", "Score": 3},
+        {"Spiller": "Jackson Koivun", "Score": 1},
+    ]
+    day_sum, breakdown = score_round_for_team("Joakim", 2, "Dag 2", joakim_round_2, "Originalt lag")
+    counted = [row["Spiller"] for row in breakdown if row["Status"] == "counted"]
+    dropped = [row["Spiller"] for row in breakdown if row["Status"] == "dropped"]
+    assert day_sum == -4, day_sum
+    assert counted == [
+        "Collin Morikawa",
+        "Scottie Scheffler",
+        "Viktor Hovland",
+        "Jackson Koivun",
+        "Patrick Reed",
+    ], counted
+    assert dropped == ["Kristoffer Reitan", "Brooks Koepka"], dropped
+
     print("PASS: Dag 1-2 use original roster")
     print("PASS: Dag 3-4 use post-cut roster")
     print("PASS: 3 swaps counted correctly")
     print("PASS: newest scored round shown first")
+    print("PASS: Joakim Dag 2 team score uses 5 best rounds")
     print(f"Sample totals: Dag1={row['Dag 1']}, Dag2={row['Dag 2']}, Dag3={row['Dag 3']}, Dag4={row['Dag 4']}")
     return 0
 
