@@ -70,6 +70,18 @@ def build_model(teams, players, links, scores):
     return pd.DataFrame(summary), pd.DataFrame(detail)
 
 
+def count_post_cut_swaps(original_ids: set[int], post_cut_ids: set[int]) -> int:
+    return len(original_ids - post_cut_ids)
+
+
+def describe_post_cut_swaps(original_ids: set[int], post_cut_ids: set[int], players: pd.DataFrame):
+    out_ids = original_ids - post_cut_ids
+    in_ids = post_cut_ids - original_ids
+    out_names = players[players.id.astype(int).isin(out_ids)].sort_values("name")["name"].tolist()
+    in_names = players[players.id.astype(int).isin(in_ids)].sort_values("name")["name"].tolist()
+    return len(out_ids), out_names, in_names
+
+
 def ordered_round_days_with_scores(details: pd.DataFrame, team: str) -> list[tuple[int, str]]:
     team_details = details[details["Lag"] == team]
     present = [
@@ -264,12 +276,19 @@ def main() -> int:
     assert len(seeded) == 7
     assert {row["player_id"] for row in seeded} == set(original)
 
+    players = pd.DataFrame([{"id": i, "name": f"Player {i}"} for i in range(1, 11)])
+    swap_count, out_names, in_names = describe_post_cut_swaps(set(original), set(swapped), players)
+    assert swap_count == 3
+    assert out_names == ["Player 4", "Player 5", "Player 6"]
+    assert in_names == ["Player 8", "Player 9", "Player 10"]
+
     print("PASS: Dag 1-2 use original roster")
     print("PASS: Dag 3-4 use post-cut roster")
     print("PASS: 3 swaps counted correctly")
     print("PASS: newest scored round shown first")
     print("PASS: Joakim Dag 2 team score uses 5 best rounds")
     print("PASS: post-cut seeding only runs for teams without Dag 3-4 roster")
+    print("PASS: post-cut swap out/in names derived correctly")
     print(f"Sample totals: Dag1={row['Dag 1']}, Dag2={row['Dag 2']}, Dag3={row['Dag 3']}, Dag4={row['Dag 4']}")
     return 0
 

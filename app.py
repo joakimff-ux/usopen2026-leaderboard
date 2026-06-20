@@ -139,6 +139,67 @@ def count_post_cut_swaps(original_ids: set[int], post_cut_ids: set[int]) -> int:
     return len(original_ids - post_cut_ids)
 
 
+def describe_post_cut_swaps(
+    original_ids: set[int],
+    post_cut_ids: set[int],
+    players: pd.DataFrame,
+) -> tuple[int, list[str], list[str]]:
+    out_ids = original_ids - post_cut_ids
+    in_ids = post_cut_ids - original_ids
+    out_names = players[players.id.astype(int).isin(out_ids)].sort_values("name")["name"].tolist()
+    in_names = players[players.id.astype(int).isin(in_ids)].sort_values("name")["name"].tolist()
+    return len(out_ids), out_names, in_names
+
+
+def build_post_cut_swaps_display(
+    teams: pd.DataFrame,
+    players: pd.DataFrame,
+    links: pd.DataFrame,
+    leaderboard: pd.DataFrame,
+) -> pd.DataFrame:
+    """Build public swap summary rows sorted by leaderboard position."""
+    if not links_have_round_ranges(links) or teams.empty or players.empty:
+        return pd.DataFrame()
+
+    ranking = {
+        row["Lag"]: int(row["Plass"])
+        for _, row in leaderboard.iterrows()
+    } if not leaderboard.empty else {}
+
+    rows: list[dict[str, Any]] = []
+    for _, team in teams.iterrows():
+        team_id = int(team.id)
+        team_name = team["name"]
+        original_ids = get_team_player_ids(links, team_id, 1)
+        post_cut_ids = get_team_player_ids(links, team_id, 3)
+        swap_count, out_names, in_names = describe_post_cut_swaps(
+            original_ids,
+            post_cut_ids,
+            players,
+        )
+        if swap_count == 0:
+            continue
+        rows.append(
+            {
+                "Plass": ranking.get(team_name, 9999),
+                "Lag": team_name,
+                "Ut": ", ".join(out_names),
+                "Inn": ", ".join(in_names),
+                "Antall bytter": swap_count,
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values("Plass", ascending=True)
+        .drop(columns=["Plass"])
+        .reset_index(drop=True)
+    )
+
+
 def prepare_laguttak_roster_state(
     team_id: int,
     original_names: list[str],
@@ -992,6 +1053,14 @@ if leaderboard.empty:
     st.info("Ingen data ennå. Gå til Admin og importer fra Excel.")
 else:
     st.dataframe(prepare_leaderboard_display(leaderboard), width="stretch", hide_index=True)
+
+if mode == "Deltakervisning":
+    st.subheader("Bytter etter dag 2")
+    swap_display = build_post_cut_swaps_display(teams, players, links, leaderboard)
+    if swap_display.empty:
+        st.info("Ingen lag har gjort bytter ennå.")
+    else:
+        st.dataframe(swap_display, width="stretch", hide_index=True)
 
 st.subheader("🔎 Tellende og droppede scorer")
 if details.empty:
