@@ -139,6 +139,31 @@ def count_post_cut_swaps(original_ids: set[int], post_cut_ids: set[int]) -> int:
     return len(original_ids - post_cut_ids)
 
 
+def sync_laguttak_roster_state(
+    team_id: int,
+    original_names: list[str],
+    post_cut_names: list[str],
+) -> tuple[str, str]:
+    """Reset roster widget state when the selected team changes."""
+    prev_team_id = st.session_state.get("laguttak_team_id")
+    pre_key = f"original_roster_{team_id}"
+    post_key = f"post_cut_roster_{team_id}"
+
+    if prev_team_id != team_id:
+        if prev_team_id is not None:
+            for stale_key in (
+                f"original_roster_{prev_team_id}",
+                f"post_cut_roster_{prev_team_id}",
+                f"legacy_roster_{prev_team_id}",
+            ):
+                st.session_state.pop(stale_key, None)
+        st.session_state.laguttak_team_id = team_id
+        st.session_state[pre_key] = original_names
+        st.session_state[post_key] = post_cut_names
+
+    return pre_key, post_key
+
+
 def ensure_post_cut_rosters(links: pd.DataFrame) -> pd.DataFrame:
     """Copy pre-cut rosters to post-cut when round columns exist but copies are missing."""
     if not links_have_round_ranges(links) or links.empty:
@@ -750,8 +775,18 @@ if mode == "Admin" and is_admin:
             tid = int(teams.loc[teams.name == t_name, "id"].iloc[0])
             current_ids = links[links.team_id == tid].player_id.astype(int).tolist() if not links.empty else []
             player_options = players.sort_values("name")["name"].tolist()
-            current_names = players[players.id.astype(int).isin(current_ids)]["name"].tolist()
-            selected = st.multiselect("Velg 7 spillere", player_options, default=current_names)
+            current_names = players[players.id.astype(int).isin(current_ids)].sort_values("name")["name"].tolist()
+            legacy_key = f"legacy_roster_{tid}"
+            if st.session_state.get("laguttak_team_id") != tid:
+                if st.session_state.get("laguttak_team_id") is not None:
+                    prev_tid = st.session_state.laguttak_team_id
+                    st.session_state.pop(f"legacy_roster_{prev_tid}", None)
+                st.session_state.laguttak_team_id = tid
+                st.session_state[legacy_key] = current_names
+            selected = st.multiselect("Velg 7 spillere", player_options, key=legacy_key)
+            st.caption(
+                f"Debug: team_id={tid}, team={t_name}, original roster={current_names}, post-cut roster={current_names}"
+            )
             st.caption(f"Valgt: {len(selected)} av {PLAYERS_PER_TEAM}")
             if st.button("Lagre laguttak"):
                 sb.table("team_players").delete().eq("team_id", tid).execute()
@@ -768,12 +803,29 @@ if mode == "Admin" and is_admin:
             pre_cut_links = filter_team_roster(links, tid, PRE_CUT_FROM, PRE_CUT_TO)
             current_ids = pre_cut_links.player_id.astype(int).tolist() if not pre_cut_links.empty else []
             player_options = players.sort_values("name")["name"].tolist()
-            current_names = players[players.id.astype(int).isin(current_ids)]["name"].tolist()
+            current_names = players[players.id.astype(int).isin(current_ids)].sort_values("name")["name"].tolist()
+
+            original_ids = get_team_player_ids(links, tid, 1)
+            original_names = players[players.id.astype(int).isin(original_ids)].sort_values("name")["name"].tolist()
+
+            post_cut_links = filter_team_roster(links, tid, POST_CUT_FROM, POST_CUT_TO)
+            post_cut_ids = (
+                set(post_cut_links.player_id.astype(int).tolist())
+                if not post_cut_links.empty
+                else set(current_ids)
+            )
+            post_cut_names = players[players.id.astype(int).isin(post_cut_ids)].sort_values("name")["name"].tolist()
+
+            pre_key, post_key = sync_laguttak_roster_state(tid, current_names, post_cut_names)
+            st.caption(
+                f"Debug: team_id={tid}, team={t_name}, original roster={original_names}, "
+                f"post-cut roster={post_cut_names}"
+            )
+
             selected = st.multiselect(
                 "Velg 7 spillere for Dag 1–2",
                 player_options,
-                default=current_names,
-                key="pre_cut_roster",
+                key=pre_key,
             )
             st.caption(f"Valgt: {len(selected)} av {PLAYERS_PER_TEAM}")
             if st.button("Lagre originalt lag"):
@@ -790,18 +842,12 @@ if mode == "Admin" and is_admin:
             st.subheader("Bytter etter dag 2")
             st.caption("Dag 3–4 bruker oppdatert lag. Maks 3 bytter per lag.")
 
-            original_ids = get_team_player_ids(links, tid, 1)
-            original_names = players[players.id.astype(int).isin(original_ids)].sort_values("name")["name"].tolist()
             st.write("**Originalt lag (Dag 1–2):**", ", ".join(original_names) if original_names else "Ingen spillere")
 
-            post_cut_links = filter_team_roster(links, tid, POST_CUT_FROM, POST_CUT_TO)
-            post_cut_ids = post_cut_links.player_id.astype(int).tolist() if not post_cut_links.empty else current_ids
-            post_cut_names = players[players.id.astype(int).isin(post_cut_ids)]["name"].tolist()
             post_cut_selected = st.multiselect(
                 "Velg 7 spillere for Dag 3–4",
                 player_options,
-                default=post_cut_names,
-                key="post_cut_roster",
+                key=post_key,
             )
             post_cut_new_ids = set(players[players.name.isin(post_cut_selected)].id.astype(int).tolist())
             swaps_used = count_post_cut_swaps(original_ids, post_cut_new_ids)
@@ -820,9 +866,6 @@ if mode == "Admin" and is_admin:
                         POST_CUT_TO,
                     )
                     clear_cache()
-                    st.success("Lag for Dag 3–4 er lagret.")
-                    st.rerun()
-
                     st.success("Lag for Dag 3–4 er lagret.")
                     st.rerun()
     with tabs[5]:
