@@ -556,13 +556,13 @@ def score_round_for_team(
     player_scores: list[dict[str, Any]],
     roster_label: str,
 ) -> tuple[int | None, list[dict[str, Any]]]:
-    """Pick the 5 lowest round scores from up to 7 roster players."""
+    """Pick the 5 lowest round scores when at least 5 roster players have scores."""
     frame = pd.DataFrame(player_scores)
     scored = frame.dropna(subset=["Score"]).sort_values("Score", ascending=True)
     counting = scored.head(COUNTING_SCORES)
     dropped = scored.iloc[COUNTING_SCORES:]
-    roster_complete = len(scored) >= PLAYERS_PER_TEAM
-    team_score = int(counting["Score"].sum()) if roster_complete and not counting.empty else None
+    enough_scores = len(scored) >= COUNTING_SCORES
+    team_score = int(counting["Score"].sum()) if enough_scores and not counting.empty else None
 
     detail_rows: list[dict[str, Any]] = []
     for rank, (_, row) in enumerate(counting.iterrows(), 1):
@@ -665,6 +665,72 @@ def rounds_with_scores(scores: pd.DataFrame) -> set[int]:
     if scores.empty or "round_no" not in scores.columns:
         return set()
     return {int(value) for value in scores["round_no"].dropna().unique()}
+
+
+def score_counts_by_round(scores: pd.DataFrame) -> list[tuple[int, int]]:
+    if scores.empty or "round_no" not in scores.columns:
+        return []
+    counts = scores.groupby("round_no").size().sort_index()
+    return [(int(rnd), int(count)) for rnd, count in counts.items()]
+
+
+def describe_leaderboard_round_detection(
+    scores: pd.DataFrame,
+    leaderboard: pd.DataFrame,
+    details: pd.DataFrame,
+) -> dict[str, Any]:
+    started_rounds = sorted(rounds_with_scores(scores))
+    completed_round = get_highest_scored_round_from_details(details)
+    next_active = get_next_active_round(scores, details)
+    visible = prepare_leaderboard_display(leaderboard, scores)
+    visible_days = [column for column in visible.columns if column in DAYS]
+    teams_with_day_totals = {
+        day: int(leaderboard[day].notna().sum())
+        for day in visible_days
+        if day in leaderboard.columns
+    }
+    return {
+        "started_rounds": started_rounds,
+        "completed_round": completed_round,
+        "next_active_round": next_active,
+        "visible_days": visible_days,
+        "teams_with_day_totals": teams_with_day_totals,
+    }
+
+
+def render_score_round_debug(
+    scores: pd.DataFrame,
+    leaderboard: pd.DataFrame,
+    details: pd.DataFrame,
+) -> None:
+    st.divider()
+    st.subheader("Debug: Runder i scores")
+    st.caption("Verifiser at Supabase har Dag 3-data og at leaderboard-logikken oppdager den.")
+
+    round_counts = score_counts_by_round(scores)
+    if not round_counts:
+        st.info("Ingen scorer i scores-tabellen.")
+    else:
+        for round_no, count in round_counts:
+            st.write(f"Round {round_no}: {count} scores")
+
+    detection = describe_leaderboard_round_detection(scores, leaderboard, details)
+    st.markdown("**Leaderboard-logikk oppdager nå:**")
+    started = detection["started_rounds"]
+    st.write(
+        f"- Runder med score i databasen: "
+        f"{', '.join(f'Round {r}' for r in started) if started else 'ingen'}"
+    )
+    st.write(f"- Høyest fullførte runde (lag har dagscore): Dag {detection['completed_round'] or 'ingen'}")
+    st.write(f"- Neste aktive runde: Dag {detection['next_active_round']}")
+    visible = detection["visible_days"]
+    st.write(f"- Synlige dagkolonner i leaderboard: {', '.join(visible) if visible else 'ingen'}")
+    if detection["teams_with_day_totals"]:
+        totals_lines = [
+            f"{day}: {count} lag med komplett score"
+            for day, count in detection["teams_with_day_totals"].items()
+        ]
+        st.write(f"- Lag med dagscore: {' · '.join(totals_lines)}")
 
 
 def prepare_leaderboard_display(leaderboard: pd.DataFrame, scores: pd.DataFrame) -> pd.DataFrame:
@@ -907,6 +973,7 @@ if mode == "Admin" and is_admin:
                 st.success("Score lagret.")
                 st.rerun()
             st.dataframe(scores.merge(players[["id","name"]], left_on="player_id", right_on="id", how="left")[["name","round_no","score"]].sort_values(["round_no","name"]) if not scores.empty else pd.DataFrame(), width="stretch", hide_index=True)
+        render_score_round_debug(scores, leaderboard, details)
     with tabs[2]:
         st.subheader("Legg til / fjern lag")
         new_team = st.text_input("Nytt lagnavn")
@@ -1180,7 +1247,12 @@ else:
             ascending=[True, True],
             na_position="last",
         )
-        counted_sum = int(day_df[day_df["Status"] == "counted"]["Score"].sum())
+        scored_count = int(day_df["Score"].notna().sum())
+        counted_sum = (
+            int(day_df[day_df["Status"] == "counted"]["Score"].sum())
+            if scored_count >= COUNTING_SCORES
+            else None
+        )
         display_df = day_df.copy()
         display_df["Score"] = display_df["Score"].map(fmt_score)
         with st.expander(f"{day} - {team} ({roster_label})", expanded=(idx == 0)):
@@ -1197,7 +1269,11 @@ else:
                     f"**Lagscore {day}:** {fmt_score(counted_sum)} "
                     f"(sum av 5 beste) · Leaderboard viser: {fmt_score(leaderboard_value)}"
                 )
-                if pd.notna(leaderboard_value) and int(leaderboard_value) != counted_sum:
+                if (
+                    counted_sum is not None
+                    and pd.notna(leaderboard_value)
+                    and int(leaderboard_value) != counted_sum
+                ):
                     st.error("Avvik mellom beregnet lagscore og leaderboard.")
 
 render_post_cut_swaps_section(teams, players, links, leaderboard)

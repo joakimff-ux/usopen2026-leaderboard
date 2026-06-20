@@ -158,8 +158,8 @@ def score_round_for_team(team_name, round_no, day, player_scores, roster_label):
     scored = frame.dropna(subset=["Score"]).sort_values("Score", ascending=True)
     counting = scored.head(COUNTING_SCORES)
     dropped = scored.iloc[COUNTING_SCORES:]
-    roster_complete = len(scored) >= PLAYERS_PER_TEAM
-    team_score = int(counting["Score"].sum()) if roster_complete and not counting.empty else None
+    enough_scores = len(scored) >= COUNTING_SCORES
+    team_score = int(counting["Score"].sum()) if enough_scores and not counting.empty else None
     detail_rows = []
     for rank, (_, row) in enumerate(counting.iterrows(), 1):
         detail_rows.append(
@@ -356,6 +356,33 @@ def main() -> int:
     day_sum, _ = score_round_for_team("Testlag", 3, "Dag 3", partial_player_scores, "Etter bytter")
     assert day_sum is None, day_sum
 
+    anders_dag_3 = [
+        {"Spiller": "Mav McNealy", "Score": 0},
+        {"Spiller": "Rai Rai", "Score": 0},
+        {"Spiller": "Scottie Scheffler", "Score": 0},
+        {"Spiller": "Tommy Fleetwood", "Score": 0},
+        {"Spiller": "Russell Henley", "Score": 1},
+        {"Spiller": "Tyrrell Hatton", "Score": 1},
+        {"Spiller": "Viktor Hovland", "Score": None},
+    ]
+    day_sum, breakdown = score_round_for_team("Anders", 3, "Dag 3", anders_dag_3, "Etter bytter")
+    assert day_sum == 1, day_sum
+    assert [row["Spiller"] for row in breakdown if row["Status"] == "counted"] == [
+        "Mav McNealy",
+        "Rai Rai",
+        "Scottie Scheffler",
+        "Tommy Fleetwood",
+        "Russell Henley",
+    ]
+    assert [row["Spiller"] for row in breakdown if row["Status"] == "dropped"] == ["Tyrrell Hatton"]
+
+    philip_dag_3 = [
+        {"Spiller": f"Player {i}", "Score": 0}
+        for i in range(1, 6)
+    ] + [{"Spiller": "Player 6", "Score": None}, {"Spiller": "Player 7", "Score": None}]
+    day_sum, _ = score_round_for_team("Philip", 3, "Dag 3", philip_dag_3, "Etter bytter")
+    assert day_sum == 0, day_sum
+
     joakim_round_2 = [
         {"Spiller": "Collin Morikawa", "Score": -5},
         {"Spiller": "Scottie Scheffler", "Score": -2},
@@ -400,6 +427,8 @@ def main() -> int:
     print("PASS: newest scored round shown first")
     print("PASS: next active round ordering in score details")
     print("PASS: Joakim Dag 2 team score uses 5 best rounds")
+    print("PASS: Anders Dag 3 team score uses 5 best with one missing player")
+    print("PASS: Philip Dag 3 team score is 0 with five even-par rounds")
     print("PASS: post-cut seeding only runs for teams without Dag 3-4 roster")
     print("PASS: post-cut swap out/in names derived correctly")
     print(f"Sample totals: Dag1={row['Dag 1']}, Dag2={row['Dag 2']}, Dag3={row['Dag 3']}, Dag4={row['Dag 4']}")
