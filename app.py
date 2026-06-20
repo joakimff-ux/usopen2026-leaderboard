@@ -156,10 +156,10 @@ def build_post_cut_swaps_display(
     players: pd.DataFrame,
     links: pd.DataFrame,
     leaderboard: pd.DataFrame,
-) -> pd.DataFrame:
-    """Build public swap summary rows sorted by leaderboard position."""
+) -> list[dict[str, Any]]:
+    """Build swap summary rows sorted by leaderboard position."""
     if not links_have_round_ranges(links) or teams.empty or players.empty:
-        return pd.DataFrame()
+        return []
 
     ranking = {
         row["Lag"]: int(row["Plass"])
@@ -183,21 +183,59 @@ def build_post_cut_swaps_display(
             {
                 "Plass": ranking.get(team_name, 9999),
                 "Lag": team_name,
-                "Ut": ", ".join(out_names),
-                "Inn": ", ".join(in_names),
-                "Antall bytter": swap_count,
+                "out_names": out_names,
+                "in_names": in_names,
+                "swap_count": swap_count,
             }
         )
 
-    if not rows:
-        return pd.DataFrame()
+    return sorted(rows, key=lambda row: row["Plass"])
 
-    return (
-        pd.DataFrame(rows)
-        .sort_values("Plass", ascending=True)
-        .drop(columns=["Plass"])
-        .reset_index(drop=True)
+
+def format_swap_player_list(names: list[str], arrow: str, color: str) -> str:
+    if not names:
+        return "—"
+    return ", ".join(
+        f'<span style="color:{color};font-weight:700">{arrow}</span> {name}'
+        for name in names
     )
+
+
+def render_post_cut_swaps_section(
+    teams: pd.DataFrame,
+    players: pd.DataFrame,
+    links: pd.DataFrame,
+    leaderboard: pd.DataFrame,
+) -> None:
+    st.subheader("Bytter etter dag 2")
+    swap_rows = build_post_cut_swaps_display(teams, players, links, leaderboard)
+    if not swap_rows:
+        st.info("Ingen lag har gjort bytter ennå.")
+        return
+
+    table_html = """
+    <table style="width:100%;border-collapse:collapse;margin-top:0.5rem;">
+      <thead>
+        <tr style="text-align:left;border-bottom:1px solid rgba(11,61,46,.15);">
+          <th style="padding:0.65rem 0.8rem;">Lag</th>
+          <th style="padding:0.65rem 0.8rem;">Ut</th>
+          <th style="padding:0.65rem 0.8rem;">Inn</th>
+          <th style="padding:0.65rem 0.8rem;">Antall bytter</th>
+        </tr>
+      </thead>
+      <tbody>
+    """
+    for row in swap_rows:
+        table_html += f"""
+        <tr style="border-bottom:1px solid rgba(11,61,46,.08);vertical-align:top;">
+          <td style="padding:0.65rem 0.8rem;"><strong>{row['Lag']}</strong></td>
+          <td style="padding:0.65rem 0.8rem;">{format_swap_player_list(row['out_names'], '↓', '#c0392b')}</td>
+          <td style="padding:0.65rem 0.8rem;">{format_swap_player_list(row['in_names'], '↑', '#1b7a3d')}</td>
+          <td style="padding:0.65rem 0.8rem;">{row['swap_count']}/{MAX_POST_CUT_SWAPS}</td>
+        </tr>
+        """
+    table_html += "</tbody></table>"
+    st.markdown(table_html, unsafe_allow_html=True)
 
 
 def prepare_laguttak_roster_state(
@@ -1054,14 +1092,6 @@ if leaderboard.empty:
 else:
     st.dataframe(prepare_leaderboard_display(leaderboard), width="stretch", hide_index=True)
 
-if mode == "Deltakervisning":
-    st.subheader("Bytter etter dag 2")
-    swap_display = build_post_cut_swaps_display(teams, players, links, leaderboard)
-    if swap_display.empty:
-        st.info("Ingen lag har gjort bytter ennå.")
-    else:
-        st.dataframe(swap_display, width="stretch", hide_index=True)
-
 st.subheader("🔎 Tellende og droppede scorer")
 if details.empty:
     st.info("Ingen scorer registrert ennå.")
@@ -1097,6 +1127,8 @@ else:
                 )
                 if pd.notna(leaderboard_value) and int(leaderboard_value) != counted_sum:
                     st.error("Avvik mellom beregnet lagscore og leaderboard.")
+
+render_post_cut_swaps_section(teams, players, links, leaderboard)
 
 st.subheader("📋 Spillerstall")
 if not teams.empty and not players.empty:
