@@ -14,6 +14,8 @@ from urllib.request import urlopen
 
 from supabase import Client
 
+from lib.live_events import record_score_events
+
 logger = logging.getLogger(__name__)
 
 ABORTED_NO_WRITE_MSG = "Existing scores were not modified."
@@ -798,6 +800,7 @@ def sync_live_scores(
             log_sync_event(client, "error", result.error or "No valid scores")
             return finalize_sync_result(client, result)
 
+        record_score_events(client, score_rows)
         client.table("scores").upsert(score_rows, on_conflict="player_id,round_no").execute()
 
         matched_player_ids = {row["player_id"] for row in score_rows}

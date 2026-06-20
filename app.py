@@ -11,6 +11,7 @@ from supabase import create_client
 
 from lib import datagolf_sync
 from lib.daily_report import TONES, generate_daily_report
+from lib.live_events import build_live_events_display, fetch_recent_score_events
 
 DEFAULT_FILE = Path(__file__).parent / "data" / "US Open 2026 - Resultater.xlsx"
 DAYS = ["Dag 1", "Dag 2", "Dag 3", "Dag 4"]
@@ -626,6 +627,39 @@ def collect_team_round_player_scores(
     ]
 
 
+def build_score_map(scores: pd.DataFrame) -> dict[tuple[int, int], int]:
+    if scores.empty:
+        return {}
+    return {
+        (int(row.player_id), int(row.round_no)): int(row.score)
+        for _, row in scores.iterrows()
+    }
+
+
+def render_live_events_section(
+    teams: pd.DataFrame,
+    players: pd.DataFrame,
+    links: pd.DataFrame,
+    scores: pd.DataFrame,
+) -> None:
+    st.subheader("Live hendelser på banen")
+    events = fetch_recent_score_events(sb, limit=50)
+    score_map = build_score_map(scores)
+    display = build_live_events_display(
+        events,
+        teams,
+        players,
+        links,
+        score_map,
+        get_team_player_ids=get_team_player_ids,
+        limit=20,
+    )
+    if display.empty:
+        st.info("Ingen nye scoreendringer siden siste oppdatering.")
+        return
+    st.dataframe(display, width="stretch", hide_index=True)
+
+
 def prepare_leaderboard_display(leaderboard: pd.DataFrame) -> pd.DataFrame:
     """Show only ranking columns and hide day columns with no registered scores."""
     if leaderboard.empty:
@@ -1101,6 +1135,8 @@ if leaderboard.empty:
     st.info("Ingen data ennå. Gå til Admin og importer fra Excel.")
 else:
     st.dataframe(prepare_leaderboard_display(leaderboard), width="stretch", hide_index=True)
+
+render_live_events_section(teams, players, links, scores)
 
 st.subheader("🔎 Tellende og droppede scorer")
 if details.empty:
