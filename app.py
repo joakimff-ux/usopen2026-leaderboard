@@ -639,16 +639,37 @@ def prepare_leaderboard_display(leaderboard: pd.DataFrame) -> pd.DataFrame:
     return leaderboard[columns]
 
 
-def ordered_round_days_with_scores(details: pd.DataFrame, team: str) -> list[tuple[int, str]]:
-    """Return rounds with scores for a team, newest round first."""
+def get_global_highest_scored_round(details: pd.DataFrame) -> int:
+    highest = 0
+    if details.empty:
+        return 0
+    for rnd, day in zip(ROUNDS, DAYS):
+        if not details[details["Dag"] == day].dropna(subset=["Score"]).empty:
+            highest = rnd
+    return highest
+
+
+def team_scored_rounds(details: pd.DataFrame, team: str) -> set[int]:
     team_details = details[details["Lag"] == team]
-    present = [
-        (rnd, day)
-        for rnd, day in zip(ROUNDS, DAYS)
-        if not team_details[team_details["Dag"] == day].empty
-    ]
-    present.reverse()
-    return present
+    scored_rounds: set[int] = set()
+    for rnd, day in zip(ROUNDS, DAYS):
+        if not team_details[team_details["Dag"] == day].dropna(subset=["Score"]).empty:
+            scored_rounds.add(rnd)
+    return scored_rounds
+
+
+def ordered_round_days_with_scores(details: pd.DataFrame, team: str) -> list[tuple[int, str]]:
+    """Show next active round first, then prior rounds with scores (newest first)."""
+    global_highest = get_global_highest_scored_round(details)
+    next_active = min(global_highest + 1, 4)
+    scored_rounds = team_scored_rounds(details, team)
+
+    ordered: list[tuple[int, str]] = [(next_active, DAYS[next_active - 1])]
+    for rnd in range(global_highest, 0, -1):
+        if rnd == next_active or rnd not in scored_rounds:
+            continue
+        ordered.append((rnd, DAYS[rnd - 1]))
+    return ordered
 
 
 def build_model(teams: pd.DataFrame, players: pd.DataFrame, links: pd.DataFrame, scores: pd.DataFrame):

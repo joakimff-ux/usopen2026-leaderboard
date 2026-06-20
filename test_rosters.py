@@ -82,15 +82,36 @@ def describe_post_cut_swaps(original_ids: set[int], post_cut_ids: set[int], play
     return len(out_ids), out_names, in_names
 
 
-def ordered_round_days_with_scores(details: pd.DataFrame, team: str) -> list[tuple[int, str]]:
+def get_global_highest_scored_round(details: pd.DataFrame) -> int:
+    highest = 0
+    if details.empty:
+        return 0
+    for rnd, day in zip(ROUNDS, DAYS):
+        if not details[details["Dag"] == day].dropna(subset=["Score"]).empty:
+            highest = rnd
+    return highest
+
+
+def team_scored_rounds(details: pd.DataFrame, team: str) -> set[int]:
     team_details = details[details["Lag"] == team]
-    present = [
-        (rnd, day)
-        for rnd, day in zip(ROUNDS, DAYS)
-        if not team_details[team_details["Dag"] == day].empty
-    ]
-    present.reverse()
-    return present
+    scored_rounds: set[int] = set()
+    for rnd, day in zip(ROUNDS, DAYS):
+        if not team_details[team_details["Dag"] == day].dropna(subset=["Score"]).empty:
+            scored_rounds.add(rnd)
+    return scored_rounds
+
+
+def ordered_round_days_with_scores(details: pd.DataFrame, team: str) -> list[tuple[int, str]]:
+    global_highest = get_global_highest_scored_round(details)
+    next_active = min(global_highest + 1, 4)
+    scored_rounds = team_scored_rounds(details, team)
+
+    ordered: list[tuple[int, str]] = [(next_active, DAYS[next_active - 1])]
+    for rnd in range(global_highest, 0, -1):
+        if rnd == next_active or rnd not in scored_rounds:
+            continue
+        ordered.append((rnd, DAYS[rnd - 1]))
+    return ordered
 
 
 def score_round_for_team(team_name, round_no, day, player_scores, roster_label):
@@ -229,9 +250,10 @@ def main() -> int:
 
     detail_rows = pd.DataFrame(
         [
-            {"Lag": "Testlag", "Dag": "Dag 1"},
-            {"Lag": "Testlag", "Dag": "Dag 2"},
-            {"Lag": "Testlag", "Dag": "Dag 3"},
+            {"Lag": "Testlag", "Dag": "Dag 1", "Score": 1},
+            {"Lag": "Testlag", "Dag": "Dag 2", "Score": 2},
+            {"Lag": "Annen", "Dag": "Dag 1", "Score": 0},
+            {"Lag": "Annen", "Dag": "Dag 2", "Score": 1},
         ]
     )
     assert ordered_round_days_with_scores(detail_rows, "Testlag") == [
@@ -239,10 +261,36 @@ def main() -> int:
         (2, "Dag 2"),
         (1, "Dag 1"),
     ]
-    assert ordered_round_days_with_scores(detail_rows[detail_rows["Dag"] == "Dag 1"], "Testlag") == [
+    assert ordered_round_days_with_scores(detail_rows, "Annen") == [
+        (3, "Dag 3"),
+        (2, "Dag 2"),
         (1, "Dag 1"),
     ]
-    assert ordered_round_days_with_scores(detail_rows, "Mangler") == []
+
+    only_day1 = pd.DataFrame(
+        [
+            {"Lag": "Testlag", "Dag": "Dag 1", "Score": 1},
+            {"Lag": "Annen", "Dag": "Dag 1", "Score": 0},
+        ]
+    )
+    assert ordered_round_days_with_scores(only_day1, "Testlag") == [(2, "Dag 2"), (1, "Dag 1")]
+
+    day3_scored = pd.DataFrame(
+        [
+            {"Lag": "Testlag", "Dag": "Dag 1", "Score": 1},
+            {"Lag": "Testlag", "Dag": "Dag 2", "Score": 2},
+            {"Lag": "Testlag", "Dag": "Dag 3", "Score": 0},
+            {"Lag": "Annen", "Dag": "Dag 1", "Score": 0},
+        ]
+    )
+    assert ordered_round_days_with_scores(day3_scored, "Testlag") == [
+        (4, "Dag 4"),
+        (3, "Dag 3"),
+        (2, "Dag 2"),
+        (1, "Dag 1"),
+    ]
+
+    assert ordered_round_days_with_scores(pd.DataFrame(), "Testlag") == [(1, "Dag 1")]
 
     joakim_round_2 = [
         {"Spiller": "Collin Morikawa", "Score": -5},
@@ -286,6 +334,7 @@ def main() -> int:
     print("PASS: Dag 3-4 use post-cut roster")
     print("PASS: 3 swaps counted correctly")
     print("PASS: newest scored round shown first")
+    print("PASS: next active round ordering in score details")
     print("PASS: Joakim Dag 2 team score uses 5 best rounds")
     print("PASS: post-cut seeding only runs for teams without Dag 3-4 roster")
     print("PASS: post-cut swap out/in names derived correctly")
