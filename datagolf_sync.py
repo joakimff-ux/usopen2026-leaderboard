@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Any
 
 try:
     import tomllib
@@ -15,7 +16,10 @@ from supabase import create_client
 
 from lib.datagolf_sync import (
     DataGolfRateLimitError,
+    VERIFY_SAMPLE_PLAYERS,
+    clear_all_scores,
     execute_sync,
+    fetch_player_scores_from_db,
     get_api_key_from_mapping,
     preview_sync_scores,
     run_auto_sync_interval_test,
@@ -23,6 +27,7 @@ from lib.datagolf_sync import (
     run_field_import_test,
     run_name_matching_test,
     run_rate_limit_test,
+    verify_round_score_mapping,
 )
 
 SECRETS_PATH = Path(".streamlit/secrets.toml")
@@ -44,6 +49,52 @@ def get_supabase_key(secrets: dict[str, str]) -> str:
     return ""
 
 
+def fmt_round_value(value: Any) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, str):
+        cleaned = value.strip().upper()
+        if not cleaned or cleaned == "-":
+            return "-"
+        if cleaned in {"E", "EVEN"}:
+            return "E"
+        return value
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if numeric == 0:
+        return "E"
+    return f"{numeric:+d}" if numeric > 0 else str(numeric)
+
+
+def print_player_mapping(players: list[dict[str, Any]], title: str) -> None:
+    print(title)
+    for row in players:
+        print(f"\n{row['target_name']}:")
+        if not row.get("found"):
+            print("  Not found in DataGolf response")
+            continue
+        print(f"  DataGolf name: {row['datagolf_name']}")
+        raw = row.get("raw_rounds", {})
+        print(
+            "  DataGolf rounds: "
+            f"R1={fmt_round_value(raw.get('R1'))}, "
+            f"R2={fmt_round_value(raw.get('R2'))}, "
+            f"R3={fmt_round_value(raw.get('R3'))}, "
+            f"R4={fmt_round_value(raw.get('R4'))}"
+        )
+        writes = row.get("supabase_writes", {})
+        if writes:
+            written = ", ".join(
+                f"round_no {round_no}={fmt_round_value(score)}"
+                for round_no, score in sorted(writes.items())
+            )
+            print(f"  Supabase writes: {written}")
+        else:
+            print("  Supabase writes: none")
+
+
 def run_test(secrets: dict[str, str]) -> int:
     print("DataGolf sync test")
     print("=" * 40)
@@ -62,15 +113,15 @@ def run_test(secrets: dict[str, str]) -> int:
     print("Name matching test passed.")
 
     cumulative = run_cumulative_delta_test()
-    print("\nCumulative-to-delta tests:")
+    print("\nRound score mapping tests:")
     for check in cumulative["checks"]:
         status = "PASS" if check["passed"] else "FAIL"
         print(f"  [{status}] {check['name']}")
         print(f"         expected={check['expected']} actual={check['actual']}")
     if not cumulative["passed"]:
-        print("Cumulative-to-delta tests failed.")
+        print("Round score mapping tests failed.")
         return 1
-    print("Cumulative-to-delta tests passed.")
+    print("Round score mapping tests passed.")
 
     field_import = run_field_import_test()
     print("\nField import tests:")
@@ -111,6 +162,16 @@ def run_test(secrets: dict[str, str]) -> int:
         return 0
 
     try:
+        verification = verify_round_score_mapping(api_key=api_key, use_backoff=False)
+    except DataGolfRateLimitError as exc:
+        print("\nLive mapping verification skipped: DataGolf HTTP 429.")
+        print(f"  {exc}")
+        return 0
+
+    print(f"\nLive mapping verification ({verification['event_name']}):")
+    print_player_mapping(verification["players"], "Sample players:")
+
+    try:
         preview = preview_sync_scores(api_key=api_key, use_backoff=False)
     except DataGolfRateLimitError as exc:
         print("\nLive score preview skipped: DataGolf HTTP 429.")
@@ -128,7 +189,7 @@ def run_test(secrets: dict[str, str]) -> int:
     return 0
 
 
-def run_sync(secrets: dict[str, str]) -> int:
+def run_sync(secrets: dict[str, str], clear_first: bool = False) -> int:
     url = secrets.get("SUPABASE_URL", "").strip()
     key = get_supabase_key(secrets)
     if not get_api_key_from_mapping(secrets):
@@ -139,6 +200,19 @@ def run_sync(secrets: dict[str, str]) -> int:
         return 1
 
     client = create_client(url, key)
+
+    api_key = get_api_key_from_mapping(secrets)
+    try:
+        verification = verify_round_score_mapping(api_key=api_key, use_backoff=True)
+        print("Mapping verification before sync:")
+        print_player_mapping(verification["players"], "Sample players:")
+    except DataGolfRateLimitError as exc:
+        print(f"Warning: could not verify mapping before sync: {exc}")
+
+    if clear_first:
+        removed = clear_all_scores(client)
+        print(f"\nCleared {removed} existing score rows from Supabase.")
+
     result = execute_sync(client, secrets)
 
     print(f"Success: {result.success}")
@@ -179,6 +253,20 @@ def run_sync(secrets: dict[str, str]) -> int:
     if result.error:
         print(f"\nError: {result.error}")
         return 1
+
+    if result.success:
+        db_scores = fetch_player_scores_from_db(client, VERIFY_SAMPLE_PLAYERS)
+        print("\nSupabase scores after sync:")
+        for player_name in VERIFY_SAMPLE_PLAYERS:
+            scores = db_scores.get(player_name, {})
+            if not scores:
+                print(f"  {player_name}: no scores stored")
+                continue
+            written = ", ".join(
+                f"round_no {round_no}={fmt_round_value(score)}"
+                for round_no, score in sorted(scores.items())
+            )
+            print(f"  {player_name}: {written}")
     return 0
 
 
@@ -186,6 +274,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="DataGolf live scoring sync")
     parser.add_argument("--test", action="store_true", help="Run matching and score preview tests")
     parser.add_argument("--sync", action="store_true", help="Sync live scores into Supabase")
+    parser.add_argument(
+        "--clear-first",
+        action="store_true",
+        help="Clear all existing scores before syncing",
+    )
     args = parser.parse_args()
 
     if not args.test and not args.sync:
@@ -194,7 +287,7 @@ def main() -> int:
     secrets = load_secrets(SECRETS_PATH)
     if args.test:
         return run_test(secrets)
-    return run_sync(secrets)
+    return run_sync(secrets, clear_first=args.clear_first)
 
 
 if __name__ == "__main__":

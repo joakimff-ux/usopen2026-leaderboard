@@ -35,6 +35,9 @@ IN_PLAY_ENDPOINT = f"{BASE_URL}/preds/in-play"
 DEFAULT_TOUR = "pga"
 MIN_RELATIVE_SCORE = -30
 MAX_RELATIVE_SCORE = 30
+DEFAULT_ROUND_PAR = 70
+MIN_STROKE_TOTAL = 50
+MAX_STROKE_TOTAL = 100
 
 # DataGolf name (normalized) -> database player name (normalized)
 NAME_ALIASES: dict[str, str] = {
@@ -316,14 +319,6 @@ def extract_current_round(payload: dict[str, Any]) -> int | None:
     return None
 
 
-def is_stroke_total(value: Any) -> bool:
-    try:
-        numeric = int(float(value))
-    except (TypeError, ValueError):
-        return False
-    return numeric > MAX_RELATIVE_SCORE or numeric < MIN_RELATIVE_SCORE
-
-
 def parse_relative_to_par(value: Any) -> int | None:
     """Parse golf score relative to par. E -> 0, +4 -> 4, -3 -> -3."""
     if value is None:
@@ -360,84 +355,36 @@ def is_valid_relative_score(value: int) -> bool:
     return MIN_RELATIVE_SCORE <= value <= MAX_RELATIVE_SCORE
 
 
-def parse_cumulative_relative(value: Any) -> int | None:
-    """Parse a DataGolf R1-R4 cumulative value relative to par."""
-    return parse_relative_to_par(value)
+def parse_round_field_value(value: Any, round_par: int = DEFAULT_ROUND_PAR) -> int | None:
+    """Parse a DataGolf R-field as a per-round score relative to par."""
+    relative = parse_relative_to_par(value)
+    if relative is not None and is_valid_relative_score(relative):
+        return relative
 
+    try:
+        strokes = int(float(value))
+    except (TypeError, ValueError):
+        return None
 
-def build_cumulative_totals(
-    record: dict[str, Any],
-    event_current_round: int | None = None,
-) -> dict[int, int]:
-    """Collect cumulative relative-to-par totals from DataGolf R1-R4 fields."""
-    cumulative: dict[int, int] = {}
-
-    for round_num in range(1, 5):
-        raw_value = record.get(f"R{round_num}")
-        if raw_value is None:
-            continue
-        parsed = parse_cumulative_relative(raw_value)
-        if parsed is not None:
-            cumulative[round_num] = parsed
-
-    if cumulative:
-        return cumulative
-
-    # Fallback when R fields hold stroke totals: derive from current_score and today.
-    player_round = record.get("round")
-    if not isinstance(player_round, int):
-        player_round = event_current_round
-
-    today = parse_relative_to_par(record.get("today"))
-    current_total = parse_relative_to_par(record.get("current_score"))
-
-    if not isinstance(player_round, int) or current_total is None:
-        return cumulative
-
-    cumulative[player_round] = current_total
-    if player_round > 1 and today is not None:
-        prior_total = current_total - today
-        if is_valid_relative_score(prior_total):
-            cumulative[player_round - 1] = prior_total
-
-    return cumulative
-
-
-def cumulative_to_round_deltas(cumulative: dict[int, int]) -> dict[int, int]:
-    """
-    Convert cumulative relative totals to per-round deltas.
-
-    Round 1 = R1
-    Round 2 = R2 - R1
-    Round 3 = R3 - R2
-    Round 4 = R4 - R3
-    """
-    deltas: dict[int, int] = {}
-
-    for round_num in sorted(cumulative):
-        if round_num == 1:
-            if is_valid_relative_score(cumulative[1]):
-                deltas[1] = cumulative[1]
-            continue
-
-        previous_round = round_num - 1
-        if previous_round not in cumulative:
-            continue
-
-        delta = cumulative[round_num] - cumulative[previous_round]
-        if is_valid_relative_score(delta):
-            deltas[round_num] = delta
-
-    return deltas
+    if MIN_STROKE_TOTAL <= strokes <= MAX_STROKE_TOTAL:
+        relative = strokes - round_par
+        if is_valid_relative_score(relative):
+            return relative
+    return None
 
 
 def extract_round_scores(
     record: dict[str, Any],
     event_current_round: int | None = None,
 ) -> dict[int, int]:
-    """Build per-round scores relative to par from cumulative DataGolf values."""
-    cumulative = build_cumulative_totals(record, event_current_round=event_current_round)
-    return cumulative_to_round_deltas(cumulative)
+    """Read per-round scores directly from DataGolf R1-R4 fields."""
+    del event_current_round
+    round_scores: dict[int, int] = {}
+    for round_num in range(1, 5):
+        parsed = parse_round_field_value(record.get(f"R{round_num}"))
+        if parsed is not None:
+            round_scores[round_num] = parsed
+    return round_scores
 
 
 def extract_player_name(record: dict[str, Any]) -> str | None:
@@ -605,6 +552,108 @@ def match_database_player(
 def count_scores(client: Client) -> int:
     response = client.table("scores").select("id", count="exact").execute()
     return int(response.count or 0)
+
+
+def clear_all_scores(client: Client) -> int:
+    """Delete all rows from scores. Returns number of rows removed."""
+    before = count_scores(client)
+    client.table("scores").delete().neq("id", 0).execute()
+    return before
+
+
+VERIFY_SAMPLE_PLAYERS = [
+    "Viktor Hovland",
+    "Scottie Scheffler",
+    "Collin Morikawa",
+    "Brooks Koepka",
+    "Tommy Fleetwood",
+]
+
+
+def find_player_record(
+    records: list[dict[str, Any]],
+    target_name: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    target_norm = normalize_name(target_name)
+    for record in records:
+        datagolf_name = extract_player_name(record)
+        if not datagolf_name:
+            continue
+        candidates = [datagolf_name, datagolf_name_to_standard(datagolf_name)]
+        if any(normalize_name(candidate) == target_norm for candidate in candidates):
+            return record, datagolf_name
+    return None, None
+
+
+def verify_round_score_mapping(
+    api_key: str,
+    player_names: list[str] | None = None,
+    tour: str = DEFAULT_TOUR,
+    use_backoff: bool = False,
+) -> dict[str, Any]:
+    payload = fetch_live_tournament_data(api_key=api_key, tour=tour, use_backoff=use_backoff)
+    records = extract_player_records(payload)
+    names = player_names or VERIFY_SAMPLE_PLAYERS
+    players: list[dict[str, Any]] = []
+
+    for target_name in names:
+        record, datagolf_name = find_player_record(records, target_name)
+        if record is None:
+            players.append(
+                {
+                    "target_name": target_name,
+                    "found": False,
+                    "datagolf_name": None,
+                    "raw_rounds": {},
+                    "supabase_writes": {},
+                }
+            )
+            continue
+
+        raw_rounds = {f"R{round_num}": record.get(f"R{round_num}") for round_num in range(1, 5)}
+        supabase_writes = extract_round_scores(record)
+        players.append(
+            {
+                "target_name": target_name,
+                "found": True,
+                "datagolf_name": datagolf_name,
+                "raw_rounds": raw_rounds,
+                "supabase_writes": supabase_writes,
+            }
+        )
+
+    return {
+        "event_name": extract_event_name(payload),
+        "records_found": len(records),
+        "players": players,
+    }
+
+
+def fetch_player_scores_from_db(
+    client: Client,
+    player_names: list[str],
+) -> dict[str, dict[int, int]]:
+    db_players = fetch_players(client)
+    lookup = {normalize_name(player["name"]): player for player in db_players}
+    scores_by_player: dict[str, dict[int, int]] = {}
+
+    for target_name in player_names:
+        player = lookup.get(normalize_name(target_name))
+        if player is None:
+            scores_by_player[target_name] = {}
+            continue
+        response = (
+            client.table("scores")
+            .select("round_no, score")
+            .eq("player_id", int(player["id"]))
+            .order("round_no")
+            .execute()
+        )
+        scores_by_player[target_name] = {
+            int(row["round_no"]): int(row["score"]) for row in response.data or []
+        }
+
+    return scores_by_player
 
 
 def build_score_updates(
@@ -870,42 +919,56 @@ def execute_sync(
     return sync_live_scores(client, api_key=api_key, tour=tour, use_backoff=use_backoff)
 
 
-def run_cumulative_delta_test() -> dict[str, Any]:
+def run_round_score_test() -> dict[str, Any]:
     hovland_record = {"R1": 4, "R2": 5, "R3": None, "R4": None}
     hovland_scores = extract_round_scores(hovland_record)
-    hovland_passed = hovland_scores == {1: 4, 2: 1}
+    hovland_passed = hovland_scores == {1: 4, 2: 5}
 
     three_round_record = {"R1": -2, "R2": 1, "R3": 3, "R4": None}
     three_round_scores = extract_round_scores(three_round_record)
-    three_round_passed = three_round_scores == {1: -2, 2: 3, 3: 2}
+    three_round_passed = three_round_scores == {1: -2, 2: 1, 3: 3}
 
-    missing_prior_record = {"R1": None, "R2": 2, "R3": None, "R4": None}
-    missing_prior_scores = extract_round_scores(missing_prior_record)
-    missing_prior_passed = missing_prior_scores == {}
+    r2_only_record = {"R1": None, "R2": 2, "R3": None, "R4": None}
+    r2_only_scores = extract_round_scores(r2_only_record)
+    r2_only_passed = r2_only_scores == {2: 2}
+
+    stroke_record = {"R1": 72, "R2": 68, "R3": None, "R4": None}
+    stroke_scores = extract_round_scores(stroke_record)
+    stroke_passed = stroke_scores == {1: 2, 2: -2}
 
     return {
-        "passed": hovland_passed and three_round_passed and missing_prior_passed,
+        "passed": hovland_passed and three_round_passed and r2_only_passed and stroke_passed,
         "checks": [
             {
                 "name": "Viktor Hovland R1=+4 R2=+5",
-                "expected": {1: 4, 2: 1},
+                "expected": {1: 4, 2: 5},
                 "actual": hovland_scores,
                 "passed": hovland_passed,
             },
             {
-                "name": "Three cumulative rounds",
-                "expected": {1: -2, 2: 3, 3: 2},
+                "name": "Three direct round scores",
+                "expected": {1: -2, 2: 1, 3: 3},
                 "actual": three_round_scores,
                 "passed": three_round_passed,
             },
             {
-                "name": "Missing R1 should not write R2",
-                "expected": {},
-                "actual": missing_prior_scores,
-                "passed": missing_prior_passed,
+                "name": "R2 written directly when present",
+                "expected": {2: 2},
+                "actual": r2_only_scores,
+                "passed": r2_only_passed,
+            },
+            {
+                "name": "Stroke totals converted from R1/R2 directly",
+                "expected": {1: 2, 2: -2},
+                "actual": stroke_scores,
+                "passed": stroke_passed,
             },
         ],
     }
+
+
+def run_cumulative_delta_test() -> dict[str, Any]:
+    return run_round_score_test()
 
 
 def run_name_matching_test() -> dict[str, Any]:
