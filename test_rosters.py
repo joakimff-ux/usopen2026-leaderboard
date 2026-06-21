@@ -421,6 +421,75 @@ def main() -> int:
     assert out_names == ["Player 4", "Player 5", "Player 6"]
     assert set(in_names) == {"Player 8", "Player 9", "Player 10"}
 
+    # --- Dag 4 round start (mocked round_no=4 scores, no production data touched) ---
+    teams_d4 = pd.DataFrame([{"id": 1, "name": "Testlag"}])
+    players_d4 = pd.DataFrame([{"id": i, "name": f"Player {i}"} for i in range(1, 11)])
+    original_d4 = [1, 2, 3, 4, 5, 6, 7]
+    swapped_d4 = [1, 2, 3, 8, 9, 10, 7]
+    links_d4 = make_links(1, original_d4, swapped_d4)
+
+    round4_started_scores = pd.DataFrame([{"player_id": 1, "round_no": 4, "score": 0}])
+    partial_lb_r4 = pd.DataFrame(
+        [
+            {
+                "Plass": 1,
+                "Lag": "Testlag",
+                "Dag 1": 10,
+                "Dag 2": 20,
+                "Dag 3": 5,
+                "Dag 4": None,
+                "Totalt": 35,
+            }
+        ]
+    )
+    displayed_r4 = prepare_leaderboard_display(partial_lb_r4, round4_started_scores)
+    assert "Dag 4" in displayed_r4.columns, displayed_r4.columns.tolist()
+    assert pd.isna(displayed_r4.iloc[0]["Dag 4"])
+
+    scores_d4: list[dict[str, int]] = []
+    for pid in original_d4:
+        scores_d4.append({"player_id": pid, "round_no": 1, "score": 0})
+        scores_d4.append({"player_id": pid, "round_no": 2, "score": 0})
+    for pid in swapped_d4:
+        scores_d4.append({"player_id": pid, "round_no": 3, "score": 0})
+    scores_d4.append({"player_id": 4, "round_no": 4, "score": -5})
+    for pid, score in [(1, 0), (2, 0), (3, 0), (8, 1), (9, 1)]:
+        scores_d4.append({"player_id": pid, "round_no": 4, "score": score})
+    scores_d4_df = pd.DataFrame(scores_d4)
+
+    leaderboard_d4, _ = build_model(teams_d4, players_d4, links_d4, scores_d4_df)
+    row_d4 = leaderboard_d4.iloc[0]
+    assert get_team_player_ids(links_d4, 1, 4) == set(swapped_d4)
+    assert 4 not in get_team_player_ids(links_d4, 1, 4)
+    assert row_d4["Dag 4"] == 2, row_d4["Dag 4"]
+    assert row_d4["Totalt"] == row_d4["Dag 1"] + row_d4["Dag 2"] + row_d4["Dag 3"] + row_d4["Dag 4"]
+
+    scores_few_r4 = scores_d4_df[~((scores_d4_df["round_no"] == 4) & scores_d4_df["player_id"].isin([1, 2, 3, 8, 9]))].copy()
+    for pid in [1, 2, 3, 8]:
+        scores_few_r4 = pd.concat(
+            [scores_few_r4, pd.DataFrame([{"player_id": pid, "round_no": 4, "score": 0}])],
+            ignore_index=True,
+        )
+    leaderboard_few_r4, _ = build_model(teams_d4, players_d4, links_d4, scores_few_r4)
+    assert leaderboard_few_r4.iloc[0]["Dag 4"] is None or pd.isna(leaderboard_few_r4.iloc[0]["Dag 4"])
+    lb_few_stub = partial_lb_r4.copy()
+    lb_few_stub["Dag 4"] = None
+    assert "Dag 4" in prepare_leaderboard_display(lb_few_stub, scores_few_r4).columns
+
+    detail_before_r4 = pd.DataFrame(
+        [
+            {"Lag": "Testlag", "Dag": "Dag 1", "Score": 0},
+            {"Lag": "Testlag", "Dag": "Dag 2", "Score": 0},
+            {"Lag": "Testlag", "Dag": "Dag 3", "Score": 0},
+        ]
+    )
+    assert ordered_round_days_with_scores(detail_before_r4, "Testlag", round4_started_scores) == [
+        (4, "Dag 4"),
+        (3, "Dag 3"),
+        (2, "Dag 2"),
+        (1, "Dag 1"),
+    ]
+
     print("PASS: Dag 1-2 use original roster")
     print("PASS: Dag 3-4 use post-cut roster")
     print("PASS: 3 swaps counted correctly")
@@ -431,6 +500,10 @@ def main() -> int:
     print("PASS: Philip Dag 3 team score is 0 with five even-par rounds")
     print("PASS: post-cut seeding only runs for teams without Dag 3-4 roster")
     print("PASS: post-cut swap out/in names derived correctly")
+    print("PASS: Dag 4 column visible when round 4 scores exist")
+    print("PASS: Dag 4 uses post-cut roster and sums 5 best scores")
+    print("PASS: Totalt includes Dag 4 when valid lagscore exists")
+    print("PASS: Dag 4 appears first in score details when round 4 started")
     print(f"Sample totals: Dag1={row['Dag 1']}, Dag2={row['Dag 2']}, Dag3={row['Dag 3']}, Dag4={row['Dag 4']}")
     return 0
 
