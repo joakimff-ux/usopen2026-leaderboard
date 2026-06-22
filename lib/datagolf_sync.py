@@ -500,8 +500,11 @@ def datagolf_name_to_standard(name: str) -> str:
     return cleaned
 
 
-def fetch_players(client: Client) -> list[dict[str, Any]]:
-    response = client.table("players").select("id,name").order("name").execute()
+def fetch_players(client: Client, tournament_id: int | None = None) -> list[dict[str, Any]]:
+    query = client.table("players").select("id,name")
+    if tournament_id is not None:
+        query = query.eq("tournament_id", tournament_id)
+    response = query.order("name").execute()
     return response.data or []
 
 
@@ -574,6 +577,7 @@ def import_missing_field_players(
     api_key: str,
     tour: str = DEFAULT_TOUR,
     extra_tier_label: str = "Ekstra",
+    tournament_id: int | None = None,
 ) -> FieldImportResult:
     """Import DataGolf field players that are not already in the players table."""
     if not api_key:
@@ -593,7 +597,7 @@ def import_missing_field_players(
             )
 
         field_names = extract_field_player_names(records)
-        db_players = fetch_players(client)
+        db_players = fetch_players(client, tournament_id=tournament_id)
         player_lookup = build_player_lookup(db_players)
         ambiguous_keys = find_ambiguous_normalized_names(db_players)
         existing_count, to_add, ambiguous_names = classify_field_players(
@@ -605,9 +609,10 @@ def import_missing_field_players(
         new_players: list[str] = []
         for name in to_add:
             try:
-                client.table("players").insert(
-                    {"name": name, "tier": extra_tier_label or None}
-                ).execute()
+                payload = {"name": name, "tier": extra_tier_label or None}
+                if tournament_id is not None:
+                    payload["tournament_id"] = int(tournament_id)
+                client.table("players").insert(payload).execute()
                 new_players.append(name)
                 player_lookup[normalize_name(name)] = {"name": name}
             except Exception as exc:
@@ -856,8 +861,12 @@ def sync_live_scores(
     api_key: str,
     tour: str = DEFAULT_TOUR,
     use_backoff: bool = True,
+    tournament_config: Any | None = None,
 ) -> SyncResult:
     synced_at = datetime.now(timezone.utc)
+    tournament_id = getattr(tournament_config, "id", None)
+    if tournament_config is not None and getattr(tournament_config, "datagolf_tour", None):
+        tour = str(tournament_config.datagolf_tour)
 
     try:
         payload = fetch_live_tournament_data(
@@ -868,6 +877,15 @@ def sync_live_scores(
         records = extract_player_records(payload)
         event_round = extract_current_round(payload)
         event_name = extract_event_name(payload)
+        event_warning: str | None = None
+        if tournament_config is not None:
+            from lib.tournament import event_name_matches
+
+            if not event_name_matches(tournament_config, event_name):
+                event_warning = (
+                    f"DataGolf event is '{event_name or 'ukjent'}', "
+                    f"forventet '{tournament_config.datagolf_event_name}'."
+                )
 
         if not records:
             result = SyncResult(
@@ -882,7 +900,7 @@ def sync_live_scores(
             log_sync_event(client, "error", result.error or "No player records")
             return finalize_sync_result(client, result)
 
-        db_players = fetch_players(client)
+        db_players = fetch_players(client, tournament_id=tournament_id)
         player_lookup = build_player_lookup(db_players)
         score_rows, matched_players, unmatched_players, player_round_scores = build_score_updates(
             records,
@@ -914,7 +932,10 @@ def sync_live_scores(
             log_sync_event(client, "error", result.error or "No valid scores")
             return finalize_sync_result(client, result)
 
-        record_result = record_live_events(client, score_rows, db_players, event_round)
+        if tournament_id is not None:
+            for row in score_rows:
+                row["tournament_id"] = int(tournament_id)
+        record_result = record_live_events(client, score_rows, db_players, event_round, tournament_id=tournament_id)
         if record_result.changes_detected:
             logger.info(
                 "Live events: detected=%s written=%s active_round=%s",
@@ -924,7 +945,13 @@ def sync_live_scores(
             )
         if record_result.error:
             logger.error("Live events insert failed: %s", record_result.error)
-        client.table("scores").upsert(score_rows, on_conflict="player_id,round_no").execute()
+        if tournament_id is not None:
+            client.table("scores").upsert(
+                score_rows,
+                on_conflict="tournament_id,player_id,round_no",
+            ).execute()
+        else:
+            client.table("scores").upsert(score_rows, on_conflict="player_id,round_no").execute()
 
         analysis = analyze_live_score_records(records, event_round)
         round_3_writes = count_round_writes(score_rows, 3)
@@ -960,6 +987,7 @@ def sync_live_scores(
             live_events_written=record_result.written,
             score_changes_detected=record_result.changes_detected,
             live_events_error=record_result.error,
+            warning=event_warning,
         )
         log_sync_event(
             client,
@@ -1024,6 +1052,7 @@ def execute_sync(
     secrets: dict[str, Any],
     tour: str = DEFAULT_TOUR,
     use_backoff: bool = True,
+    tournament_config: Any | None = None,
 ) -> SyncResult:
     synced_at = datetime.now(timezone.utc)
     api_key = get_api_key_from_mapping(secrets)
@@ -1058,7 +1087,13 @@ def execute_sync(
                 rate_limited=True,
             ),
         )
-    return sync_live_scores(client, api_key=api_key, tour=tour, use_backoff=use_backoff)
+    return sync_live_scores(
+        client,
+        api_key=api_key,
+        tour=tour,
+        use_backoff=use_backoff,
+        tournament_config=tournament_config,
+    )
 
 
 def run_live_round_test() -> dict[str, Any]:

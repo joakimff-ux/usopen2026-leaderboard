@@ -5,10 +5,12 @@ from __future__ import annotations
 import pandas as pd
 
 from lib.live_events import (
+    DISPLAY_EVENT_LIMIT,
     LiveEventsWriteResult,
     build_live_events_display,
     build_score_change_text,
     classify_score_change,
+    format_event_time,
     player_counting_status,
     record_live_events,
 )
@@ -93,12 +95,16 @@ def get_team_player_ids(links: pd.DataFrame, team_id: int, round_no: int) -> set
 
 
 def main() -> int:
-    assert classify_score_change(-1) == ("birdie", "🐦")
-    assert classify_score_change(-2) == ("stor forbedring", "🔥")
-    assert classify_score_change(1) == ("bogey", "😬")
-    assert classify_score_change(2) == ("dårlig utvikling", "⚠️")
-    assert "E til -1" in build_score_change_text(0, -1, -1)
-    assert "faller til +1" in build_score_change_text(0, 1, 1)
+    assert classify_score_change(-1) == ("Birdie", "🟢")
+    assert classify_score_change(-2) == ("Eagle", "🟢")
+    assert classify_score_change(0) == ("Par", "⚪")
+    assert classify_score_change(1) == ("Bogey", "🔴")
+    assert classify_score_change(2) == ("Double bogey+", "🔴")
+    assert build_score_change_text(0, -1, -1) == "🟢 Birdie – til -1"
+    assert build_score_change_text(-3, -4, -1) == "🟢 Birdie – til -4"
+    assert build_score_change_text(0, 1, 1) == "🔴 Bogey – faller til +1"
+    assert format_event_time("2026-06-19T14:05:00+00:00")  # smoke: returns HH:MM
+    assert DISPLAY_EVENT_LIMIT == 8
 
     team_scores = [
         (1, "A", -2),
@@ -131,7 +137,7 @@ def main() -> int:
     assert result.written == 1
     assert result.changes_detected == 1
     assert store["live_events"][0]["change"] == -1
-    assert "birdie" in store["live_events"][0]["event_text"]
+    assert "Birdie" in store["live_events"][0]["event_text"]
 
     teams = pd.DataFrame([{"id": 1, "name": "Joakim"}])
     players = pd.DataFrame(
@@ -156,6 +162,7 @@ def main() -> int:
                 "new_score": -1,
                 "change": -1,
                 "event_text": build_score_change_text(0, -1, -1),
+                "created_at": "2026-06-19T14:05:00+00:00",
             }
         ]
     )
@@ -170,7 +177,16 @@ def main() -> int:
         rostered_player_ids={10, 11},
     )
     assert not display.empty
+    assert list(display.columns) == [
+        "Tid",
+        "Spiller",
+        "Hendelse",
+        "Scoreendring",
+        "Påvirker lag",
+        "Teller/Droppes",
+    ]
     assert display.iloc[0]["Spiller"] == "Viktor Hovland"
+    assert display.iloc[0]["Hendelse"] == "🟢 Birdie – til -1"
     assert "Joakim" in display.iloc[0]["Påvirker lag"]
     assert "Teller" in display.iloc[0]["Teller/Droppes"]
 

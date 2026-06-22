@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 import pandas as pd
@@ -13,6 +14,7 @@ from supabase import Client
 logger = logging.getLogger(__name__)
 
 DEFAULT_EVENT_LIMIT = 20
+DISPLAY_EVENT_LIMIT = 8
 COUNTING_SCORES = 5
 
 
@@ -28,27 +30,38 @@ def format_relative_score(score: int) -> str:
 
 
 def classify_score_change(delta: int) -> tuple[str, str]:
-    """Return (label, icon) for a relative-to-par score change."""
+    """Return (label, marker) for a cumulative score change."""
     if delta <= -2:
-        return "stor forbedring", "🔥"
+        return "Eagle", "🟢"
     if delta == -1:
-        return "birdie", "🐦"
+        return "Birdie", "🟢"
+    if delta == 0:
+        return "Par", "⚪"
     if delta == 1:
-        return "bogey", "😬"
-    if delta >= 2:
-        return "dårlig utvikling", "⚠️"
-    return "scoreendring", "⛳"
+        return "Bogey", "🔴"
+    return "Double bogey+", "🔴"
 
 
 def build_score_change_text(old_score: int, new_score: int, delta: int) -> str:
-    label, icon = classify_score_change(delta)
+    label, marker = classify_score_change(delta)
+    new_fmt = format_relative_score(new_score)
     if delta < 0:
-        movement = f"går fra {format_relative_score(old_score)} til {format_relative_score(new_score)}"
-    elif delta > 0:
-        movement = f"faller til {format_relative_score(new_score)}"
+        return f"{marker} {label} – til {new_fmt}"
+    if delta > 0:
+        return f"{marker} {label} – faller til {new_fmt}"
+    return f"{marker} {label} – {new_fmt}"
+
+
+def format_event_time(value: str | datetime | None) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+    if isinstance(value, str):
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
     else:
-        movement = f"holder {format_relative_score(new_score)}"
-    return f"{icon} {label} – {movement}"
+        dt = value
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().strftime("%H:%M")
 
 
 def format_supabase_error(exc: Exception) -> str:
@@ -73,15 +86,21 @@ def roster_window_for_round(round_no: int) -> tuple[int, int]:
     return 3, 4
 
 
-def fetch_rostered_player_ids(client: Client, round_no: int) -> set[int]:
+def fetch_rostered_player_ids(
+    client: Client,
+    round_no: int,
+    tournament_id: int | None = None,
+) -> set[int]:
     active_from, active_to = roster_window_for_round(round_no)
-    response = (
+    query = (
         client.table("team_players")
         .select("player_id, active_from_round, active_to_round")
         .eq("active_from_round", active_from)
         .eq("active_to_round", active_to)
-        .execute()
     )
+    if tournament_id is not None:
+        query = query.eq("tournament_id", tournament_id)
+    response = query.execute()
     return {
         int(row["player_id"])
         for row in response.data or []
@@ -110,6 +129,7 @@ def record_live_events(
     score_rows: list[dict[str, Any]],
     db_players: list[dict[str, Any]],
     active_round: int | None,
+    tournament_id: int | None = None,
 ) -> LiveEventsWriteResult:
     """Compare incoming scores with DB before upsert and append live events."""
     result = LiveEventsWriteResult()
@@ -127,12 +147,14 @@ def record_live_events(
         active_round,
     )
     try:
-        response = (
+        query = (
             client.table("scores")
             .select("player_id, round_no, score")
             .in_("player_id", player_ids)
-            .execute()
         )
+        if tournament_id is not None:
+            query = query.eq("tournament_id", tournament_id)
+        response = query.execute()
         for row in response.data or []:
             existing[(int(row["player_id"]), int(row["round_no"]))] = int(row["score"])
     except Exception as exc:
@@ -151,7 +173,11 @@ def record_live_events(
             continue
 
         if round_no not in rostered_by_round:
-            rostered_by_round[round_no] = fetch_rostered_player_ids(client, round_no)
+            rostered_by_round[round_no] = fetch_rostered_player_ids(
+                client,
+                round_no,
+                tournament_id=tournament_id,
+            )
         if player_id not in rostered_by_round[round_no]:
             continue
 
@@ -171,6 +197,7 @@ def record_live_events(
                 "new_score": new_score,
                 "change": delta,
                 "event_text": build_score_change_text(old_score, new_score, delta),
+                **({"tournament_id": int(tournament_id)} if tournament_id is not None else {}),
             }
         )
 
@@ -193,30 +220,39 @@ def record_live_events(
     return result
 
 
-def count_live_events(client: Client | None) -> int:
+def count_live_events(client: Client | None, tournament_id: int | None = None) -> int:
     if client is None:
         return 0
     try:
-        response = client.table("live_events").select("id", count="exact").execute()
+        query = client.table("live_events").select("id", count="exact")
+        if tournament_id is not None:
+            query = query.eq("tournament_id", tournament_id)
+        response = query.execute()
         return int(response.count or 0)
     except Exception as exc:
         logger.warning("count_live_events failed: %s", format_supabase_error(exc))
         return 0
 
 
-def fetch_recent_live_events(client: Client | None, limit: int = DEFAULT_EVENT_LIMIT) -> pd.DataFrame:
+def fetch_recent_live_events(
+    client: Client | None,
+    limit: int = DEFAULT_EVENT_LIMIT,
+    tournament_id: int | None = None,
+) -> pd.DataFrame:
     if client is None:
         return pd.DataFrame()
     try:
-        response = (
+        query = (
             client.table("live_events")
             .select(
                 "id, player_id, player_name, round_no, old_score, new_score, change, event_text, created_at"
             )
             .order("created_at", desc=True)
             .limit(limit)
-            .execute()
         )
+        if tournament_id is not None:
+            query = query.eq("tournament_id", tournament_id)
+        response = query.execute()
         rows = response.data or []
     except Exception as exc:
         logger.error("fetch_recent_live_events failed: %s", format_supabase_error(exc), exc_info=True)
@@ -257,7 +293,7 @@ def build_live_events_display(
     *,
     get_team_player_ids: Callable[[pd.DataFrame, int, int], set[int]],
     rostered_player_ids: set[int] | None = None,
-    limit: int = DEFAULT_EVENT_LIMIT,
+    limit: int = DISPLAY_EVENT_LIMIT,
 ) -> pd.DataFrame:
     if events.empty:
         return pd.DataFrame()
@@ -273,6 +309,9 @@ def build_live_events_display(
 
     rows: list[dict[str, str]] = []
     for _, event in events.iterrows():
+        if len(rows) >= limit:
+            break
+
         player_id = int(event["player_id"])
         if player_id not in rostered_player_ids:
             continue
@@ -282,7 +321,7 @@ def build_live_events_display(
         old_score = int(event["old_score"])
         new_score = int(event["new_score"])
         delta = int(event.get("change", event.get("delta", new_score - old_score)))
-        hendelse = event.get("event_text") or build_score_change_text(old_score, new_score, delta)
+        hendelse = build_score_change_text(old_score, new_score, delta)
 
         affected_teams: list[str] = []
         status_parts: list[str] = []
@@ -309,6 +348,7 @@ def build_live_events_display(
 
         rows.append(
             {
+                "Tid": format_event_time(event.get("created_at")),
                 "Spiller": player_name,
                 "Hendelse": hendelse,
                 "Scoreendring": (
@@ -318,7 +358,5 @@ def build_live_events_display(
                 "Teller/Droppes": ", ".join(status_parts) if status_parts else "—",
             }
         )
-        if len(rows) >= limit:
-            break
 
     return pd.DataFrame(rows)

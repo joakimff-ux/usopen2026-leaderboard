@@ -13,31 +13,20 @@ from supabase import create_client
 from lib import app_settings, datagolf_sync
 from lib.daily_report import TONES, generate_daily_report
 from lib.live_events import (
+    DISPLAY_EVENT_LIMIT,
     build_live_events_display,
     count_live_events,
     fetch_recent_live_events,
 )
+from lib.tournament import TournamentConfig, load_active_tournament
+from lib.tournament_ui import render_tournament_setup
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("lib.app_settings").setLevel(logging.INFO)
 
-DEFAULT_FILE = Path(__file__).parent / "data" / "US Open 2026 - Resultater.xlsx"
-DAYS = ["Dag 1", "Dag 2", "Dag 3", "Dag 4"]
-ROUNDS = [1, 2, 3, 4]
-PLAYERS_PER_TEAM = 7
-COUNTING_SCORES = 5
-DROPPED_SCORES = PLAYERS_PER_TEAM - COUNTING_SCORES
-MAX_POST_CUT_SWAPS = 3
-PRE_CUT_FROM, PRE_CUT_TO = 1, 2
-POST_CUT_FROM, POST_CUT_TO = 3, 4
-ROSTER_LABELS = {
-    1: "Originalt lag",
-    2: "Originalt lag",
-    3: "Etter bytter",
-    4: "Etter bytter",
-}
+DATA_DIR = Path(__file__).parent / "data"
 
-st.set_page_config(page_title="US Open 2026 - kuppongen", page_icon="⛳", layout="wide")
+st.set_page_config(page_title="Fantasy Golf Kupongen", page_icon="⛳", layout="wide")
 
 st.markdown('''
 <style>
@@ -81,6 +70,20 @@ def supabase_client():
 sb = supabase_client()
 
 
+def get_cfg() -> TournamentConfig:
+    return st.session_state.get("tournament_config", TournamentConfig.legacy_defaults())
+
+
+def init_tournament_config() -> None:
+    st.session_state.tournament_config = load_active_tournament(sb)
+
+
+def default_excel_path() -> Path:
+    cfg = get_cfg()
+    filename = cfg.excel_default_path or "Resultater.xlsx"
+    return DATA_DIR / filename
+
+
 def require_db():
     if sb is None:
         st.error("Supabase er ikke konfigurert. Legg SUPABASE_URL og SUPABASE_ANON_KEY i .streamlit/secrets.toml.")
@@ -89,7 +92,17 @@ def require_db():
 
 def fetch_table(name: str) -> pd.DataFrame:
     require_db()
-    res = sb.table(name).select("*").execute()
+    cfg = get_cfg()
+    query = sb.table(name).select("*")
+    if cfg.uses_tournament_scope and cfg.id is not None and name in {
+        "teams",
+        "players",
+        "team_players",
+        "scores",
+        "daily_comments",
+    }:
+        query = query.eq("tournament_id", cfg.id)
+    res = query.execute()
     return pd.DataFrame(res.data or [])
 
 
@@ -110,9 +123,7 @@ def links_have_round_ranges(links: pd.DataFrame) -> bool:
 
 
 def roster_period_for_round(round_no: int) -> tuple[int, int]:
-    if round_no <= 2:
-        return PRE_CUT_FROM, PRE_CUT_TO
-    return POST_CUT_FROM, POST_CUT_TO
+    return get_cfg().roster_period_for_round(round_no)
 
 
 def filter_team_roster(
@@ -208,7 +219,7 @@ def swap_rows_to_dataframe(swap_rows: list[dict[str, Any]]) -> pd.DataFrame:
                 "Lag": row["Lag"],
                 "Ut": ", ".join(row["out_names"]),
                 "Inn": ", ".join(row["in_names"]),
-                "Antall bytter": f"{row['swap_count']}/{MAX_POST_CUT_SWAPS}",
+                "Antall bytter": f"{row['swap_count']}/{get_cfg().max_swaps}",
             }
             for row in swap_rows
         ]
@@ -270,16 +281,17 @@ def teams_missing_post_cut_roster(links: pd.DataFrame) -> set[int]:
     if not links_have_round_ranges(links) or links.empty:
         return set()
 
+    cfg = get_cfg()
     pre_cut_teams = set(
         links[
-            (links.active_from_round.astype(int) == PRE_CUT_FROM)
-            & (links.active_to_round.astype(int) == PRE_CUT_TO)
+            (links.active_from_round.astype(int) == cfg.pre_cut_from)
+            & (links.active_to_round.astype(int) == cfg.pre_cut_to)
         ].team_id.astype(int).tolist()
     )
     post_cut_teams = set(
         links[
-            (links.active_from_round.astype(int) == POST_CUT_FROM)
-            & (links.active_to_round.astype(int) == POST_CUT_TO)
+            (links.active_from_round.astype(int) == cfg.post_cut_from)
+            & (links.active_to_round.astype(int) == cfg.post_cut_to)
         ].team_id.astype(int).tolist()
     )
     return pre_cut_teams - post_cut_teams
@@ -294,16 +306,18 @@ def build_post_cut_seed_rows(links: pd.DataFrame) -> list[dict[str, int]]:
     if not missing_teams:
         return []
 
+    cfg = get_cfg()
     pre_cut = links[
-        (links.active_from_round.astype(int) == PRE_CUT_FROM)
-        & (links.active_to_round.astype(int) == PRE_CUT_TO)
+        (links.active_from_round.astype(int) == cfg.pre_cut_from)
+        & (links.active_to_round.astype(int) == cfg.pre_cut_to)
     ]
     return [
         {
             "team_id": int(row.team_id),
             "player_id": int(row.player_id),
-            "active_from_round": POST_CUT_FROM,
-            "active_to_round": POST_CUT_TO,
+            "active_from_round": cfg.post_cut_from,
+            "active_to_round": cfg.post_cut_to,
+            **({"tournament_id": cfg.id} if cfg.id is not None else {}),
         }
         for _, row in pre_cut.iterrows()
         if int(row.team_id) in missing_teams
@@ -333,17 +347,18 @@ def save_team_roster(
         "active_from_round", active_from_round
     ).eq("active_to_round", active_to_round).execute()
     if player_ids:
-        sb.table("team_players").insert(
-            [
-                {
-                    "team_id": team_id,
-                    "player_id": pid,
-                    "active_from_round": active_from_round,
-                    "active_to_round": active_to_round,
-                }
-                for pid in player_ids
-            ]
-        ).execute()
+        cfg = get_cfg()
+        rows = [
+            {
+                "team_id": team_id,
+                "player_id": pid,
+                "active_from_round": active_from_round,
+                "active_to_round": active_to_round,
+                **({"tournament_id": cfg.id} if cfg.id is not None else {}),
+            }
+            for pid in player_ids
+        ]
+        sb.table("team_players").insert(rows).execute()
 
 
 def clear_cache():
@@ -451,7 +466,12 @@ def format_sync_timestamp(value: datetime | None) -> str:
 
 
 def perform_live_sync(use_backoff: bool = True) -> datagolf_sync.SyncResult:
-    result = datagolf_sync.execute_sync(sb, get_sync_secrets(), use_backoff=use_backoff)
+    result = datagolf_sync.execute_sync(
+        sb,
+        get_sync_secrets(),
+        use_backoff=use_backoff,
+        tournament_config=get_cfg(),
+    )
     st.session_state.datagolf_sync_status = result
     st.session_state.last_datagolf_sync_attempt_at = result.synced_at
     return result
@@ -497,7 +517,7 @@ def render_datagolf_sync_status(result: datagolf_sync.SyncResult | None) -> None
     st.metric("Sist vellykket synk", format_sync_timestamp(last_success))
 
     if result is None:
-        st.info("Ingen synkronisering kjørt ennå. Klikk knappen over for å hente U.S. Open-scorer fra DataGolf.")
+        st.info("Ingen synkronisering kjørt ennå. Klikk knappen over for å hente scorer fra DataGolf.")
         if auto_sync_suspended:
             st.warning(
                 "Auto-sync er midlertidig deaktivert etter 3 påfølgende HTTP 429-svar fra DataGolf."
@@ -567,7 +587,7 @@ def render_field_import_result(result: datagolf_sync.FieldImportResult) -> None:
                 st.write(name)
 
 def parse_excel(file_bytes: bytes | None = None) -> tuple[pd.DataFrame, list[str]]:
-    source = io.BytesIO(file_bytes) if file_bytes else DEFAULT_FILE
+    source = io.BytesIO(file_bytes) if file_bytes else default_excel_path()
     raw = pd.read_excel(source, sheet_name=0, header=None, engine="openpyxl")
     header_row = 2
     teams = [str(x).strip() for x in raw.iloc[header_row, 6:].tolist() if pd.notna(x) and str(x).strip()]
@@ -591,11 +611,22 @@ def parse_excel(file_bytes: bytes | None = None) -> tuple[pd.DataFrame, list[str
 
 def import_excel_to_supabase(file_bytes: bytes | None = None):
     require_db()
+    cfg = get_cfg()
     players_df, teams = parse_excel(file_bytes)
     for team in teams:
-        sb.table("teams").upsert({"name": team}, on_conflict="name").execute()
+        payload = {"name": team}
+        if cfg.id is not None:
+            payload["tournament_id"] = int(cfg.id)
+            sb.table("teams").upsert(payload, on_conflict="tournament_id,name").execute()
+        else:
+            sb.table("teams").upsert(payload, on_conflict="name").execute()
     for _, row in players_df.iterrows():
-        sb.table("players").upsert({"name": row["name"], "tier": row.get("tier")}, on_conflict="name").execute()
+        payload = {"name": row["name"], "tier": row.get("tier")}
+        if cfg.id is not None:
+            payload["tournament_id"] = int(cfg.id)
+            sb.table("players").upsert(payload, on_conflict="tournament_id,name").execute()
+        else:
+            sb.table("players").upsert(payload, on_conflict="name").execute()
     teams_db = fetch_table("teams")
     players_db = fetch_table("players")
     team_id = dict(zip(teams_db["name"], teams_db["id"])) if not teams_db.empty else {}
@@ -606,20 +637,21 @@ def import_excel_to_supabase(file_bytes: bytes | None = None):
             if bool(row.get(team)) and team in team_id and row["name"] in player_id:
                 pid = int(player_id[row["name"]])
                 tid = int(team_id[team])
+                base = {"team_id": tid, "player_id": pid}
+                if cfg.id is not None:
+                    base["tournament_id"] = int(cfg.id)
                 links.append(
                     {
-                        "team_id": tid,
-                        "player_id": pid,
-                        "active_from_round": PRE_CUT_FROM,
-                        "active_to_round": PRE_CUT_TO,
+                        **base,
+                        "active_from_round": cfg.pre_cut_from,
+                        "active_to_round": cfg.pre_cut_to,
                     }
                 )
                 links.append(
                     {
-                        "team_id": tid,
-                        "player_id": pid,
-                        "active_from_round": POST_CUT_FROM,
-                        "active_to_round": POST_CUT_TO,
+                        **base,
+                        "active_from_round": cfg.post_cut_from,
+                        "active_to_round": cfg.post_cut_to,
                     }
                 )
     if links:
@@ -639,12 +671,14 @@ def score_round_for_team(
     player_scores: list[dict[str, Any]],
     roster_label: str,
 ) -> tuple[int | None, list[dict[str, Any]]]:
-    """Pick the 5 lowest round scores when at least 5 roster players have scores."""
+    """Pick the lowest counting round scores when enough roster players have scores."""
+    cfg = get_cfg()
+    counting_scores = cfg.counting_scores_per_day
     frame = pd.DataFrame(player_scores)
     scored = frame.dropna(subset=["Score"]).sort_values("Score", ascending=True)
-    counting = scored.head(COUNTING_SCORES)
-    dropped = scored.iloc[COUNTING_SCORES:]
-    enough_scores = len(scored) >= COUNTING_SCORES
+    counting = scored.head(counting_scores)
+    dropped = scored.iloc[counting_scores:]
+    enough_scores = len(scored) >= counting_scores
     team_score = int(counting["Score"].sum()) if enough_scores and not counting.empty else None
 
     detail_rows: list[dict[str, Any]] = []
@@ -727,8 +761,7 @@ def render_live_events_section(
     scores: pd.DataFrame,
 ) -> None:
     st.subheader("Live hendelser på banen")
-    total_events = count_live_events(sb)
-    events = fetch_recent_live_events(sb, limit=50)
+    events = fetch_recent_live_events(sb, limit=DISPLAY_EVENT_LIMIT, tournament_id=get_cfg().id)
     score_map = build_score_map(scores)
     display = build_live_events_display(
         events,
@@ -737,15 +770,10 @@ def render_live_events_section(
         links,
         score_map,
         get_team_player_ids=get_team_player_ids,
-        limit=20,
+        limit=DISPLAY_EVENT_LIMIT,
     )
     if display.empty:
-        if total_events > 0:
-            st.warning(
-                "Hendelser finnes i databasen, men ingen av de siste er for spillere på et aktivt lag."
-            )
-        else:
-            st.info("Ingen scoreendringer registrert ennå. Hendelser opprettes automatisk ved DataGolf-sync.")
+        st.info("Ingen nye scoreendringer siden siste oppdatering.")
         return
     st.dataframe(display, width="stretch", hide_index=True)
 
@@ -772,7 +800,7 @@ def describe_leaderboard_round_detection(
     completed_round = get_highest_scored_round_from_details(details)
     next_active = get_next_active_round(scores, details)
     visible = prepare_leaderboard_display(leaderboard, scores)
-    visible_days = [column for column in visible.columns if column in DAYS]
+    visible_days = [column for column in visible.columns if column in get_cfg().days_list]
     teams_with_day_totals = {
         day: int(leaderboard[day].notna().sum())
         for day in visible_days
@@ -823,9 +851,9 @@ def render_score_round_debug(
 
     st.divider()
     st.markdown("**Debug: live_events**")
-    live_count = count_live_events(sb)
+    live_count = count_live_events(sb, tournament_id=get_cfg().id)
     st.write(f"- Antall live_events i databasen: {live_count}")
-    recent_events = fetch_recent_live_events(sb, limit=5)
+    recent_events = fetch_recent_live_events(sb, limit=5, tournament_id=get_cfg().id)
     if recent_events.empty:
         st.write("- Siste 5 hendelser: ingen")
     else:
@@ -857,9 +885,10 @@ def prepare_leaderboard_display(leaderboard: pd.DataFrame, scores: pd.DataFrame)
         return leaderboard
 
     started_rounds = rounds_with_scores(scores)
+    cfg = get_cfg()
     visible_days = [
         day
-        for rnd, day in zip(ROUNDS, DAYS)
+        for rnd, day in zip(cfg.rounds_list, cfg.days_list)
         if day in leaderboard.columns
         and (rnd in started_rounds or leaderboard[day].notna().any())
     ]
@@ -871,7 +900,8 @@ def get_highest_scored_round_from_details(details: pd.DataFrame) -> int:
     highest = 0
     if details.empty:
         return highest
-    for rnd, day in zip(ROUNDS, DAYS):
+    cfg = get_cfg()
+    for rnd, day in zip(cfg.rounds_list, cfg.days_list):
         if not details[details["Dag"] == day].dropna(subset=["Score"]).empty:
             highest = rnd
     return highest
@@ -886,7 +916,7 @@ def get_next_active_round(scores: pd.DataFrame, details: pd.DataFrame) -> int:
     started = rounds_with_scores(scores)
     if started and max(started) > completed:
         return max(started)
-    return min(completed + 1, 4)
+    return min(completed + 1, get_cfg().rounds)
 
 
 def team_scored_rounds(details: pd.DataFrame, team: str) -> set[int]:
@@ -894,7 +924,8 @@ def team_scored_rounds(details: pd.DataFrame, team: str) -> set[int]:
         return set()
     team_details = details[details["Lag"] == team]
     scored_rounds: set[int] = set()
-    for rnd, day in zip(ROUNDS, DAYS):
+    cfg = get_cfg()
+    for rnd, day in zip(cfg.rounds_list, cfg.days_list):
         if not team_details[team_details["Dag"] == day].dropna(subset=["Score"]).empty:
             scored_rounds.add(rnd)
     return scored_rounds
@@ -910,11 +941,11 @@ def ordered_round_days_with_scores(
     scored_rounds = team_scored_rounds(details, team)
     completed_global = get_highest_scored_round_from_details(details)
 
-    ordered: list[tuple[int, str]] = [(next_active, DAYS[next_active - 1])]
+    ordered: list[tuple[int, str]] = [(next_active, get_cfg().days_list[next_active - 1])]
     for rnd in range(completed_global, 0, -1):
         if rnd == next_active or rnd not in scored_rounds:
             continue
-        ordered.append((rnd, DAYS[rnd - 1]))
+        ordered.append((rnd, get_cfg().days_list[rnd - 1]))
     return ordered
 
 
@@ -932,7 +963,8 @@ def build_model(teams: pd.DataFrame, players: pd.DataFrame, links: pd.DataFrame,
         team_name = t["name"]
         total = 0
         row = {"Lag": team_name}
-        for rnd, day in zip(ROUNDS, DAYS):
+        cfg = get_cfg()
+        for rnd, day in zip(cfg.rounds_list, cfg.days_list):
             player_scores = collect_team_round_player_scores(
                 team_id, rnd, players, links, score_map
             )
@@ -941,7 +973,7 @@ def build_model(teams: pd.DataFrame, players: pd.DataFrame, links: pd.DataFrame,
                 rnd,
                 day,
                 player_scores,
-                ROSTER_LABELS[rnd],
+                cfg.roster_labels[rnd],
             )
             row[day] = day_sum
             if day_sum is not None:
@@ -959,13 +991,11 @@ def build_model(teams: pd.DataFrame, players: pd.DataFrame, links: pd.DataFrame,
 
 def fetch_latest_daily_comment() -> dict | None:
     try:
-        response = (
-            sb.table("daily_comments")
-            .select("*")
-            .order("updated_at", desc=True)
-            .limit(1)
-            .execute()
-        )
+        cfg = get_cfg()
+        query = sb.table("daily_comments").select("*")
+        if cfg.uses_tournament_scope and cfg.id is not None:
+            query = query.eq("tournament_id", cfg.id)
+        response = query.order("updated_at", desc=True).limit(1).execute()
         return response.data[0] if response.data else None
     except Exception:
         return None
@@ -973,13 +1003,18 @@ def fetch_latest_daily_comment() -> dict | None:
 
 def save_daily_comment(round_no: int, title: str, body: str) -> None:
     now = datetime.now(timezone.utc).isoformat()
+    cfg = get_cfg()
     payload = {
         "round_no": int(round_no),
         "title": title.strip(),
         "body": body.strip(),
         "updated_at": now,
     }
-    sb.table("daily_comments").upsert(payload, on_conflict="round_no").execute()
+    if cfg.id is not None:
+        payload["tournament_id"] = int(cfg.id)
+        sb.table("daily_comments").upsert(payload, on_conflict="tournament_id,round_no").execute()
+    else:
+        sb.table("daily_comments").upsert(payload, on_conflict="round_no").execute()
 
 
 def copy_text_to_clipboard(text: str) -> None:
@@ -1007,20 +1042,39 @@ def admin_login():
     return ok
 
 
-st.markdown(f'''
+def render_hero() -> None:
+    cfg = get_cfg()
+    pills = "".join(f'<span class="pill">{text}</span>' for text in cfg.rule_pills())
+    subtitle = "Fantasy golf med live leaderboard."
+    if cfg.course_name and cfg.month_label:
+        subtitle = f"{cfg.course_name} · {cfg.month_label} · {subtitle}"
+    elif cfg.course_name:
+        subtitle = f"{cfg.course_name} · {subtitle}"
+    st.markdown(
+        f'''
 <div class="hero">
-  <h1>⛳ US Open 2026 Kupongen</h1>
-  <p>Fantasy golf med live leaderboard.</p>
-  <span class="pill">🥇 1. plass: 4.000 kr</span><span class="pill">7 spillere per lag</span><span class="pill">5 laveste scorer teller</span><span class="pill">2 dårligste droppes hver dag</span><span class="pill">Lavest totalscore vinner</span>
+  <h1>⛳ {cfg.display_title}</h1>
+  <p>{subtitle}</p>
+  {pills}
 </div>
-''', unsafe_allow_html=True)
+''',
+        unsafe_allow_html=True,
+    )
 
+
+render_hero()
+
+init_tournament_config()
 init_sync_state()
 setup_auto_refresh()
 
 with st.sidebar:
     mode = st.radio("Modus", ["Deltakervisning", "Admin"])
-    st.caption("Regel: 7 spillere totalt, 5 laveste scorer teller per dag.")
+    cfg_sidebar = get_cfg()
+    st.caption(
+        f"Regel: {cfg_sidebar.number_of_players_per_team} spillere totalt, "
+        f"{cfg_sidebar.counting_scores_per_day} laveste scorer teller per dag."
+    )
     if sb is None:
         st.error("Supabase mangler. Sjekk .streamlit/secrets.toml")
     else:
@@ -1032,15 +1086,32 @@ teams, players, links, scores = fetch_all()
 leaderboard, details = build_model(teams, players, links, scores)
 
 if mode == "Admin" and is_admin:
-    tabs = st.tabs(["Importer", "Scorer", "Lag", "Spillere", "Laguttak", "Dagsrapport"])
+    tabs = st.tabs(["Turnering", "Importer", "Scorer", "Lag", "Spillere", "Laguttak", "Dagsrapport"])
     with tabs[0]:
+        def _import_field() -> None:
+            result = datagolf_sync.import_missing_field_players(
+                sb,
+                datagolf_sync.get_api_key_from_mapping(get_sync_secrets()),
+                tour=get_cfg().datagolf_tour,
+                tournament_id=get_cfg().id,
+            )
+            render_field_import_result(result)
+
+        render_tournament_setup(
+            sb,
+            DATA_DIR,
+            import_excel_callback=import_excel_to_supabase,
+            import_field_callback=_import_field,
+            clear_cache_callback=clear_cache,
+        )
+    with tabs[1]:
         st.subheader("Importer fra Excel")
         uploaded = st.file_uploader("Last opp Excel-oppsett", type=["xlsx"])
         if st.button("Importer lag, spillere og valg fra Excel"):
             import_excel_to_supabase(uploaded.getvalue() if uploaded else None)
             st.success("Import fullført. Last siden på nytt om dataene ikke vises med én gang.")
             st.rerun()
-    with tabs[1]:
+    with tabs[2]:
         st.subheader("Live scoring from DataGolf")
 
         if st.button(
@@ -1048,7 +1119,7 @@ if mode == "Admin" and is_admin:
             type="primary",
             key="sync_all_scores_datagolf",
         ):
-            with st.spinner("Henter U.S. Open-scorer fra DataGolf..."):
+            with st.spinner(f"Henter {get_cfg().tournament_name}-scorer fra DataGolf..."):
                 result = perform_live_sync(use_backoff=True)
             if result.success:
                 clear_cache()
@@ -1090,20 +1161,32 @@ if mode == "Admin" and is_admin:
             p_name = st.selectbox("Spiller", players.sort_values("name")["name"].tolist())
             p_id = int(players.loc[players.name == p_name, "id"].iloc[0])
             c1, c2 = st.columns(2)
-            rnd = c1.selectbox("Runde", ROUNDS, format_func=lambda r: f"Dag {r}")
+            rnd = c1.selectbox("Runde", get_cfg().rounds_list, format_func=lambda r: f"Dag {r}")
             score = c2.number_input("Score", min_value=-20, max_value=30, value=0, step=1)
             if st.button("Lagre score"):
-                sb.table("scores").upsert({"player_id": p_id, "round_no": int(rnd), "score": int(score)}, on_conflict="player_id,round_no").execute()
+                payload = {"player_id": p_id, "round_no": int(rnd), "score": int(score)}
+                cfg = get_cfg()
+                if cfg.id is not None:
+                    payload["tournament_id"] = int(cfg.id)
+                    sb.table("scores").upsert(payload, on_conflict="tournament_id,player_id,round_no").execute()
+                else:
+                    sb.table("scores").upsert(payload, on_conflict="player_id,round_no").execute()
                 clear_cache()
                 st.success("Score lagret.")
                 st.rerun()
             st.dataframe(scores.merge(players[["id","name"]], left_on="player_id", right_on="id", how="left")[["name","round_no","score"]].sort_values(["round_no","name"]) if not scores.empty else pd.DataFrame(), width="stretch", hide_index=True)
         render_score_round_debug(scores, leaderboard, details)
-    with tabs[2]:
+    with tabs[3]:
         st.subheader("Legg til / fjern lag")
         new_team = st.text_input("Nytt lagnavn")
         if st.button("Legg til lag") and new_team.strip():
-            sb.table("teams").upsert({"name": new_team.strip()}, on_conflict="name").execute()
+            payload = {"name": new_team.strip()}
+            cfg = get_cfg()
+            if cfg.id is not None:
+                payload["tournament_id"] = int(cfg.id)
+                sb.table("teams").upsert(payload, on_conflict="tournament_id,name").execute()
+            else:
+                sb.table("teams").upsert(payload, on_conflict="name").execute()
             st.rerun()
         if not teams.empty:
             del_team = st.selectbox("Fjern lag", teams.sort_values("name")["name"].tolist())
@@ -1111,19 +1194,25 @@ if mode == "Admin" and is_admin:
                 tid = int(teams.loc[teams.name == del_team, "id"].iloc[0])
                 sb.table("teams").delete().eq("id", tid).execute()
                 st.rerun()
-    with tabs[3]:
+    with tabs[4]:
         st.subheader("Legg til / fjern spiller")
         c1, c2 = st.columns(2)
         new_player = c1.text_input("Spillernavn")
         tier = c2.text_input("Tier", placeholder="f.eks. Tier 1")
         if st.button("Legg til spiller") and new_player.strip():
-            sb.table("players").upsert({"name": new_player.strip(), "tier": tier.strip() or None}, on_conflict="name").execute()
+            payload = {"name": new_player.strip(), "tier": tier.strip() or None}
+            cfg = get_cfg()
+            if cfg.id is not None:
+                payload["tournament_id"] = int(cfg.id)
+                sb.table("players").upsert(payload, on_conflict="tournament_id,name").execute()
+            else:
+                sb.table("players").upsert(payload, on_conflict="name").execute()
             st.rerun()
 
         st.divider()
         st.subheader("DataGolf startliste")
         st.caption(
-            "Henter hele U.S. Open-feltet fra DataGolf og legger kun til spillere som ikke finnes fra før. "
+            f"Henter hele {get_cfg().tournament_name}-feltet fra DataGolf og legger kun til spillere som ikke finnes fra før. "
             "Eksisterende lag og rosters endres ikke."
         )
         if st.button("Hent hele startlisten fra DataGolf", key="import_datagolf_field"):
@@ -1131,6 +1220,8 @@ if mode == "Admin" and is_admin:
                 field_result = datagolf_sync.import_missing_field_players(
                     sb,
                     datagolf_sync.get_api_key_from_mapping(get_sync_secrets()),
+                    tour=get_cfg().datagolf_tour,
+                    tournament_id=get_cfg().id,
                 )
             render_field_import_result(field_result)
             if field_result.success and field_result.added_count:
@@ -1146,8 +1237,9 @@ if mode == "Admin" and is_admin:
                 pid = int(players.loc[players.name == del_player, "id"].iloc[0])
                 sb.table("players").delete().eq("id", pid).execute()
                 st.rerun()
-    with tabs[4]:
-        st.subheader("Originalt lag (Dag 1–2)")
+    with tabs[5]:
+        cfg = get_cfg()
+        st.subheader(f"Originalt lag (Dag {cfg.pre_cut_from}–{cfg.pre_cut_to})")
         if teams.empty or players.empty:
             st.info("Legg til lag og spillere først.")
         elif not links_have_round_ranges(links):
@@ -1170,7 +1262,7 @@ if mode == "Admin" and is_admin:
             st.caption(
                 f"Debug: team_id={tid}, team={t_name}, original roster={current_names}, post-cut roster={current_names}"
             )
-            st.caption(f"Valgt: {len(selected)} av {PLAYERS_PER_TEAM}")
+            st.caption(f"Valgt: {len(selected)} av {cfg.number_of_players_per_team}")
             if st.button("Lagre laguttak"):
                 sb.table("team_players").delete().eq("team_id", tid).execute()
                 new_ids = players[players.name.isin(selected)].id.astype(int).tolist()
@@ -1183,7 +1275,7 @@ if mode == "Admin" and is_admin:
         else:
             t_name = st.selectbox("Lag", teams.sort_values("name")["name"].tolist(), key="assign_team")
             tid = int(teams.loc[teams.name == t_name, "id"].iloc[0])
-            pre_cut_links = filter_team_roster(links, tid, PRE_CUT_FROM, PRE_CUT_TO)
+            pre_cut_links = filter_team_roster(links, tid, cfg.pre_cut_from, cfg.pre_cut_to)
             current_ids = pre_cut_links.player_id.astype(int).tolist() if not pre_cut_links.empty else []
             player_options = players.sort_values("name")["name"].tolist()
             current_names = players[players.id.astype(int).isin(current_ids)].sort_values("name")["name"].tolist()
@@ -1191,7 +1283,7 @@ if mode == "Admin" and is_admin:
             original_ids = get_team_player_ids(links, tid, 1)
             original_names = players[players.id.astype(int).isin(original_ids)].sort_values("name")["name"].tolist()
 
-            post_cut_links = filter_team_roster(links, tid, POST_CUT_FROM, POST_CUT_TO)
+            post_cut_links = filter_team_roster(links, tid, cfg.post_cut_from, cfg.post_cut_to)
             post_cut_ids = (
                 set(post_cut_links.player_id.astype(int).tolist())
                 if not post_cut_links.empty
@@ -1214,67 +1306,74 @@ if mode == "Admin" and is_admin:
             )
 
             selected = st.multiselect(
-                "Velg 7 spillere for Dag 1–2",
+                f"Velg {cfg.number_of_players_per_team} spillere for Dag {cfg.pre_cut_from}–{cfg.pre_cut_to}",
                 player_options,
                 key=pre_key,
             )
-            st.caption(f"Valgt: {len(selected)} av {PLAYERS_PER_TEAM}")
+            st.caption(f"Valgt: {len(selected)} av {cfg.number_of_players_per_team}")
             if st.button("Lagre originalt lag"):
-                if len(selected) != PLAYERS_PER_TEAM:
-                    st.error(f"Originalt lag må ha nøyaktig {PLAYERS_PER_TEAM} spillere.")
+                if len(selected) != cfg.number_of_players_per_team:
+                    st.error(f"Originalt lag må ha nøyaktig {cfg.number_of_players_per_team} spillere.")
                 else:
                     new_ids = players[players.name.isin(selected)].id.astype(int).tolist()
-                    save_team_roster(tid, new_ids, PRE_CUT_FROM, PRE_CUT_TO)
+                    save_team_roster(tid, new_ids, cfg.pre_cut_from, cfg.pre_cut_to)
                     clear_cache()
                     st.success("Originalt lag lagret for Dag 1–2.")
                     st.rerun()
 
             st.divider()
-            st.subheader("Bytter etter dag 2")
-            st.caption("Dag 3–4 bruker oppdatert lag. Maks 3 bytter per lag.")
+            st.subheader(f"Bytter etter dag {cfg.pre_cut_to}")
+            st.caption(
+                f"Dag {cfg.post_cut_from}–{cfg.post_cut_to} bruker oppdatert lag. "
+                f"Maks {cfg.max_swaps} bytter per lag."
+            )
 
-            st.write("**Originalt lag (Dag 1–2):**", ", ".join(original_names) if original_names else "Ingen spillere")
+            st.write(
+                f"**Originalt lag (Dag {cfg.pre_cut_from}–{cfg.pre_cut_to}):**",
+                ", ".join(original_names) if original_names else "Ingen spillere",
+            )
 
             post_cut_selected = st.multiselect(
-                "Velg 7 spillere for Dag 3–4",
+                f"Velg {cfg.number_of_players_per_team} spillere for Dag {cfg.post_cut_from}–{cfg.post_cut_to}",
                 player_options,
                 key=post_key,
             )
             post_cut_new_ids_list = players[players.name.isin(post_cut_selected)].id.astype(int).tolist()
             post_cut_new_ids = set(post_cut_new_ids_list)
             swaps_used = count_post_cut_swaps(original_ids, post_cut_new_ids)
-            st.caption(f"Bytter brukt: {swaps_used}/{MAX_POST_CUT_SWAPS}")
+            st.caption(f"Bytter brukt: {swaps_used}/{cfg.max_swaps}")
 
             if st.button("Lagre lag etter bytter"):
-                if len(post_cut_selected) != PLAYERS_PER_TEAM:
-                    st.error(f"Lag etter bytter må ha nøyaktig {PLAYERS_PER_TEAM} spillere.")
-                elif len(post_cut_new_ids) != PLAYERS_PER_TEAM:
+                if len(post_cut_selected) != cfg.number_of_players_per_team:
+                    st.error(f"Lag etter bytter må ha nøyaktig {cfg.number_of_players_per_team} spillere.")
+                elif len(post_cut_new_ids) != cfg.number_of_players_per_team:
                     st.error(
-                        f"Post-cut roster må inneholde nøyaktig {PLAYERS_PER_TEAM} unike spillere. "
+                        f"Post-cut roster må inneholde nøyaktig {cfg.number_of_players_per_team} unike spillere. "
                         f"Fant {len(post_cut_new_ids)}."
                     )
-                elif swaps_used > MAX_POST_CUT_SWAPS:
-                    st.error(f"Maks {MAX_POST_CUT_SWAPS} bytter er tillatt etter dag 2.")
+                elif swaps_used > cfg.max_swaps:
+                    st.error(f"Maks {cfg.max_swaps} bytter er tillatt etter dag {cfg.pre_cut_to}.")
                 else:
                     save_team_roster(
                         tid,
                         list(post_cut_new_ids),
-                        POST_CUT_FROM,
-                        POST_CUT_TO,
+                        cfg.post_cut_from,
+                        cfg.post_cut_to,
                     )
                     clear_cache()
                     st.session_state.laguttak_force_reload_team_id = tid
                     st.success("Lag for Dag 3–4 er lagret.")
                     st.rerun()
-    with tabs[5]:
+    with tabs[6]:
+        cfg = get_cfg()
         st.subheader("Dagsrapport")
         st.caption("Generer en norsk fantasy-kompis-rapport basert på leaderboard og tellende scorer.")
 
         c1, c2 = st.columns(2)
         report_round = c1.selectbox(
             "Runde / dag",
-            ROUNDS,
-            format_func=lambda r: DAYS[r - 1],
+            cfg.rounds_list,
+            format_func=lambda r: cfg.days_list[r - 1],
             key="daily_report_round",
         )
         report_tone = c2.selectbox("Tone", list(TONES), index=1, key="daily_report_tone")
@@ -1293,7 +1392,7 @@ if mode == "Admin" and is_admin:
 
         report_title = st.text_input(
             "Tittel",
-            value=st.session_state.get("daily_report_title", f"{DAYS[int(report_round) - 1]} – dagsrapport"),
+            value=st.session_state.get("daily_report_title", f"{cfg.days_list[int(report_round) - 1]} – dagsrapport"),
         )
         report_body = st.text_area(
             "Dagsrapport (rediger før publisering)",
@@ -1315,7 +1414,7 @@ if mode == "Admin" and is_admin:
                 try:
                     save_daily_comment(
                         int(report_round),
-                        report_title or f"{DAYS[int(report_round) - 1]} – dagsrapport",
+                        report_title or f"{cfg.days_list[int(report_round) - 1]} – dagsrapport",
                         report_body,
                     )
                     clear_cache()
@@ -1374,7 +1473,7 @@ else:
     team_details = details[details["Lag"] == team]
     for idx, (rnd, day) in enumerate(ordered_round_days_with_scores(details, team, scores)):
         day_df = team_details[team_details["Dag"] == day].copy()
-        roster_label = ROSTER_LABELS[rnd]
+        roster_label = get_cfg().roster_labels[rnd]
         status_order = {"counted": 0, "dropped": 1, "missing": 2}
         day_df["status_order"] = day_df["Status"].map(status_order)
         day_df = day_df.sort_values(
@@ -1385,7 +1484,7 @@ else:
         scored_count = int(day_df["Score"].notna().sum())
         counted_sum = (
             int(day_df[day_df["Status"] == "counted"]["Score"].sum())
-            if scored_count >= COUNTING_SCORES
+            if scored_count >= get_cfg().counting_scores_per_day
             else None
         )
         display_df = day_df.copy()
@@ -1428,7 +1527,7 @@ if not teams.empty and not players.empty:
                 "Lag": t["name"],
                 "Dag 1–2": ", ".join(pre_names),
                 "Dag 3–4": ", ".join(post_names),
-                "Bytter": f"{swaps}/{MAX_POST_CUT_SWAPS}" if links_have_round_ranges(links) else "-",
+                "Bytter": f"{swaps}/{get_cfg().max_swaps}" if links_have_round_ranges(links) else "-",
             }
         )
     st.dataframe(pd.DataFrame(roster_rows), width="stretch", hide_index=True)

@@ -490,6 +490,65 @@ def main() -> int:
         (1, "Dag 1"),
     ]
 
+    # Mirror of Dag 3 fix: active round follows max started round in scores table.
+    details_through_d2 = pd.DataFrame(
+        [
+            {"Lag": "Testlag", "Dag": "Dag 1", "Score": 0},
+            {"Lag": "Testlag", "Dag": "Dag 2", "Score": 0},
+        ]
+    )
+    scores_through_r3 = pd.DataFrame(
+        [
+            {"player_id": 1, "round_no": 1, "score": 0},
+            {"player_id": 1, "round_no": 2, "score": 0},
+            {"player_id": 1, "round_no": 3, "score": 0},
+        ]
+    )
+    assert get_next_active_round(scores_through_r3, details_through_d2) == 3
+    assert ordered_round_days_with_scores(details_through_d2, "Testlag", scores_through_r3)[0] == (
+        3,
+        "Dag 3",
+    )
+
+    scores_with_first_r4 = pd.concat(
+        [
+            scores_through_r3,
+            pd.DataFrame([{"player_id": 1, "round_no": 4, "score": 1}]),
+        ],
+        ignore_index=True,
+    )
+    details_through_d3 = pd.concat(
+        [
+            details_through_d2,
+            pd.DataFrame([{"Lag": "Testlag", "Dag": "Dag 3", "Score": 0}]),
+        ],
+        ignore_index=True,
+    )
+    assert get_next_active_round(scores_with_first_r4, details_through_d3) == 4
+
+    lb_transition = pd.DataFrame(
+        [
+            {
+                "Plass": 1,
+                "Lag": "Testlag",
+                "Dag 1": 0,
+                "Dag 2": 0,
+                "Dag 3": None,
+                "Dag 4": None,
+                "Totalt": 0,
+            }
+        ]
+    )
+    cols_before_r4 = prepare_leaderboard_display(lb_transition, scores_through_r3).columns.tolist()
+    cols_after_r4 = prepare_leaderboard_display(lb_transition, scores_with_first_r4).columns.tolist()
+    assert "Dag 3" in cols_before_r4
+    assert "Dag 4" not in cols_before_r4
+    assert "Dag 4" in cols_after_r4
+    assert ordered_round_days_with_scores(details_through_d3, "Testlag", scores_with_first_r4)[0] == (
+        4,
+        "Dag 4",
+    )
+
     print("PASS: Dag 1-2 use original roster")
     print("PASS: Dag 3-4 use post-cut roster")
     print("PASS: 3 swaps counted correctly")
@@ -504,6 +563,7 @@ def main() -> int:
     print("PASS: Dag 4 uses post-cut roster and sums 5 best scores")
     print("PASS: Totalt includes Dag 4 when valid lagscore exists")
     print("PASS: Dag 4 appears first in score details when round 4 started")
+    print("PASS: active round switches from Dag 3 to Dag 4 when round_no=4 appears in scores")
     print(f"Sample totals: Dag1={row['Dag 1']}, Dag2={row['Dag 2']}, Dag3={row['Dag 3']}, Dag4={row['Dag 4']}")
     return 0
 
