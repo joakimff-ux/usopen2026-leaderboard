@@ -1,5 +1,5 @@
-streamlit>=1.36
-streamlit-autorefresh>=1.0.1
-pandas>=2.2
-openpyxl>=3.1
-supabase>=2.5
+streamlit>=1.37.0
+supabase>=2.4.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+tomli>=2.0.0; python_version < "3.11"

@@ -1,53 +1,61 @@
-"""DataGolf live scoring sync for golf_konk Supabase schema."""
+"""DataGolf live scoring sync."""
 
 from __future__ import annotations
 
 import logging
 import re
-import time
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+import unicodedata
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
 from supabase import Client
 
-from lib.live_events import record_live_events
+from lib.db import (
+    event_name_matches,
+    fetch_live_player_states,
+    fetch_player_status_events,
+    fetch_players,
+    fetch_team_players,
+    get_active_tournament,
+    get_supabase_client_from_config,
+    tournament_display_title,
+)
+from lib import live_feed
 
 logger = logging.getLogger(__name__)
 
 ABORTED_NO_WRITE_MSG = "Existing scores were not modified."
-RATE_LIMIT_BACKOFF_SECONDS = [30, 60, 120]
-MAX_CONSECUTIVE_RATE_LIMITS = 3
-SYNC_LOG_STATUSES = ("success", "error", "rate_limited")
 
 
 class DataGolfRateLimitError(RuntimeError):
     """Raised when DataGolf returns HTTP 429."""
 
-    def __init__(self, message: str, retry_count: int = 0) -> None:
-        super().__init__(message)
-        self.retry_count = retry_count
-
 
 BASE_URL = "https://feeds.datagolf.com"
 IN_PLAY_ENDPOINT = f"{BASE_URL}/preds/in-play"
 DEFAULT_TOUR = "pga"
-MIN_RELATIVE_SCORE = -30
-MAX_RELATIVE_SCORE = 30
-DEFAULT_ROUND_PAR = 70
-MIN_STROKE_TOTAL = 50
-MAX_STROKE_TOTAL = 100
-
-# DataGolf name (normalized) -> database player name (normalized)
-NAME_ALIASES: dict[str, str] = {
-    "maverick mcnealy": "mav mcnealy",
-    "aaron rai": "rai rai",
-    "si woo kim": "si woo kim",
-    "ludvig aberg": "ludvig aberg",
+ROUND_FIELD_NAMES = {
+    1: ("R1", "r1", "round_1", "round1", "score_1", "score1"),
+    2: ("R2", "r2", "round_2", "round2", "score_2", "score2"),
+    3: ("R3", "r3", "round_3", "round3", "score_3", "score3"),
+    4: ("R4", "r4", "round_4", "round4", "score_4", "score4"),
 }
+NAME_TRANSLATION = str.maketrans(
+    {
+        "ø": "o",
+        "Ø": "O",
+        "æ": "ae",
+        "Æ": "AE",
+        "œ": "oe",
+        "Œ": "OE",
+        "ł": "l",
+        "Ł": "L",
+    }
+)
 
 
 @dataclass
@@ -56,38 +64,52 @@ class SyncResult:
     synced_at: datetime
     players_updated: int = 0
     scores_written: int = 0
+    statuses_written: int = 0
+    live_events_written: int = 0
     matched_players: list[str] = field(default_factory=list)
     unmatched_players: list[str] = field(default_factory=list)
-    sample_writes: list[dict[str, Any]] = field(default_factory=list)
     event_name: str | None = None
+    expected_event_name: str | None = None
     error: str | None = None
     warning: str | None = None
-    rate_limited: bool = False
-    last_successful_sync: datetime | None = None
-    auto_sync_suspended: bool = False
-    retry_count: int = 0
-    live_events_written: int = 0
-    score_changes_detected: int = 0
-    live_events_error: str | None = None
 
 
 @dataclass
-class FieldImportResult:
-    success: bool
-    existing_count: int = 0
-    added_count: int = 0
-    field_count: int = 0
-    new_players: list[str] = field(default_factory=list)
-    ambiguous_names: list[str] = field(default_factory=list)
-    event_name: str | None = None
+class DataGolfDiagnosticResult:
+    """Read-only DataGolf feed check. Never writes to Supabase."""
+
+    checked_at: datetime
+    tournament_id: str
+    tournament_name: str
+    display_title: str
+    expected_event_name: str | None
+    datagolf_event_name: str | None
+    event_found: bool
+    players_received: int
+    players_with_scores: int
+    db_players_count: int
+    matched_count: int
+    unmatched_count: int
+    matched_players: list[str] = field(default_factory=list)
+    unmatched_players: list[str] = field(default_factory=list)
+    current_round: int | None = None
     error: str | None = None
+    warning: str | None = None
 
 
 def normalize_name(name: str) -> str:
-    cleaned = name.strip().lower()
-    cleaned = cleaned.replace(".", " ").replace("-", " ")
+    """Normalize local names and DataGolf's documented `Last, First` format."""
+    cleaned = unicodedata.normalize("NFKD", name.translate(NAME_TRANSLATION)).casefold().strip()
+    cleaned = "".join(character for character in cleaned if not unicodedata.combining(character))
+
+    if "," in cleaned:
+        family_name, given_name = cleaned.split(",", 1)
+        if family_name.strip() and given_name.strip():
+            cleaned = f"{given_name} {family_name}"
+
+    cleaned = re.sub(r"[.\-'’]", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned
+    return cleaned.strip()
 
 
 def get_api_key_from_mapping(config: dict[str, Any]) -> str:
@@ -107,42 +129,10 @@ def build_in_play_url(api_key: str, tour: str = DEFAULT_TOUR) -> str:
     return f"{IN_PLAY_ENDPOINT}?{query}"
 
 
-def fetch_live_tournament_data(
-    api_key: str,
-    tour: str = DEFAULT_TOUR,
-    use_backoff: bool = True,
-    sleep_fn: Callable[[float], None] | None = None,
-) -> dict[str, Any]:
+def fetch_live_tournament_data(api_key: str, tour: str = DEFAULT_TOUR) -> dict[str, Any]:
     if not api_key:
         raise ValueError("DATA_GOLF_API_KEY is not configured.")
 
-    sleeper = sleep_fn or time.sleep
-    retry_count = 0
-    max_attempts = len(RATE_LIMIT_BACKOFF_SECONDS) + 1 if use_backoff else 1
-
-    for attempt in range(max_attempts):
-        try:
-            return _fetch_live_tournament_data_once(api_key=api_key, tour=tour)
-        except DataGolfRateLimitError as exc:
-            retry_count = attempt + 1
-            if use_backoff and attempt < len(RATE_LIMIT_BACKOFF_SECONDS):
-                logger.warning(
-                    "DataGolf HTTP 429 on attempt %s, retrying in %ss",
-                    retry_count,
-                    RATE_LIMIT_BACKOFF_SECONDS[attempt],
-                )
-                sleeper(RATE_LIMIT_BACKOFF_SECONDS[attempt])
-                continue
-            raise DataGolfRateLimitError(
-                f"DataGolf API rate limited (HTTP 429) after {retry_count} attempt(s). "
-                f"{ABORTED_NO_WRITE_MSG}",
-                retry_count=retry_count,
-            ) from exc
-
-    raise RuntimeError("DataGolf fetch failed unexpectedly.")
-
-
-def _fetch_live_tournament_data_once(api_key: str, tour: str = DEFAULT_TOUR) -> dict[str, Any]:
     url = build_in_play_url(api_key, tour=tour)
     try:
         with urlopen(url, timeout=30) as response:
@@ -150,8 +140,7 @@ def _fetch_live_tournament_data_once(api_key: str, tour: str = DEFAULT_TOUR) -> 
     except HTTPError as exc:
         if exc.code == 429:
             raise DataGolfRateLimitError(
-                f"DataGolf API rate limited (HTTP 429). {ABORTED_NO_WRITE_MSG}",
-                retry_count=0,
+                f"DataGolf API rate limited (HTTP 429). {ABORTED_NO_WRITE_MSG}"
             ) from exc
         raise RuntimeError(
             f"DataGolf API request failed with HTTP {exc.code}. {ABORTED_NO_WRITE_MSG}"
@@ -165,126 +154,6 @@ def _fetch_live_tournament_data_once(api_key: str, tour: str = DEFAULT_TOUR) -> 
         return json.loads(payload)
     except json.JSONDecodeError as exc:
         raise RuntimeError("DataGolf API returned invalid JSON.") from exc
-
-
-def parse_sync_timestamp(value: Any) -> datetime | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    if isinstance(value, str):
-        cleaned = value.replace("Z", "+00:00")
-        try:
-            parsed = datetime.fromisoformat(cleaned)
-        except ValueError:
-            return None
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-    return None
-
-
-def log_sync_event(
-    client: Client | None,
-    status: str,
-    message: str,
-    http_status: int | None = None,
-    scores_written: int = 0,
-    retry_count: int = 0,
-) -> None:
-    if client is None or status not in SYNC_LOG_STATUSES:
-        return
-    try:
-        client.table("sync_log").insert(
-            {
-                "status": status,
-                "http_status": http_status,
-                "message": message,
-                "scores_written": scores_written,
-                "retry_count": retry_count,
-            }
-        ).execute()
-    except Exception as exc:
-        logger.warning("Could not write sync_log: %s", exc)
-
-
-AUTO_SYNC_INTERVAL = timedelta(minutes=5)
-
-
-def get_last_successful_sync(client: Client | None) -> datetime | None:
-    if client is None:
-        return None
-    try:
-        response = (
-            client.table("sync_log")
-            .select("created_at")
-            .eq("status", "success")
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        if response.data:
-            return parse_sync_timestamp(response.data[0]["created_at"])
-    except Exception as exc:
-        logger.warning("Could not read last successful sync: %s", exc)
-    return None
-
-
-def get_last_sync_attempt(client: Client | None) -> datetime | None:
-    if client is None:
-        return None
-    try:
-        response = (
-            client.table("sync_log")
-            .select("created_at")
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        if response.data:
-            return parse_sync_timestamp(response.data[0]["created_at"])
-    except Exception as exc:
-        logger.warning("Could not read last sync attempt: %s", exc)
-    return None
-
-
-def is_auto_sync_due(
-    client: Client | None,
-    last_attempt: datetime | None = None,
-    now: datetime | None = None,
-) -> bool:
-    reference = last_attempt if last_attempt is not None else get_last_sync_attempt(client)
-    if reference is None:
-        return True
-    current = now or datetime.now(timezone.utc)
-    if reference.tzinfo is None:
-        reference = reference.replace(tzinfo=timezone.utc)
-    return current - reference >= AUTO_SYNC_INTERVAL
-
-
-def count_consecutive_rate_limits(client: Client | None) -> int:
-    if client is None:
-        return 0
-    try:
-        response = (
-            client.table("sync_log")
-            .select("status")
-            .order("created_at", desc=True)
-            .limit(10)
-            .execute()
-        )
-        count = 0
-        for row in response.data or []:
-            if row.get("status") == "rate_limited":
-                count += 1
-            else:
-                break
-        return count
-    except Exception as exc:
-        logger.warning("Could not read sync_log for rate limits: %s", exc)
-        return 0
-
-
-def is_auto_sync_suspended(client: Client | None) -> bool:
-    return count_consecutive_rate_limits(client) >= MAX_CONSECUTIVE_RATE_LIMITS
 
 
 def extract_player_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -315,172 +184,53 @@ def extract_event_name(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def extract_current_round(payload: dict[str, Any]) -> int | None:
-    info = payload.get("info")
-    if isinstance(info, dict):
-        for field in ("current_round", "round", "live_round"):
-            current_round = info.get(field)
-            if isinstance(current_round, int) and 1 <= current_round <= 4:
-                return current_round
-            try:
-                numeric = int(float(current_round))
-                if 1 <= numeric <= 4:
-                    return numeric
-            except (TypeError, ValueError):
-                continue
-    return None
-
-
-def extract_player_current_round(record: dict[str, Any]) -> int | None:
-    for field in ("round", "current_round", "live_round"):
-        value = record.get(field)
-        if isinstance(value, int) and 1 <= value <= 4:
-            return value
-        try:
-            numeric = int(float(value))
-            if 1 <= numeric <= 4:
-                return numeric
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
-def extract_live_today_score(record: dict[str, Any]) -> int | None:
-    """Parse live round score from fields used before R# is finalized."""
-    for field in ("today", "round_score", "score_today", "current_round_score"):
-        if field not in record:
-            continue
-        parsed = parse_relative_to_par(record.get(field))
-        if parsed is not None:
-            return parsed
-    return None
-
-
-def parse_relative_to_par(value: Any) -> int | None:
-    """Parse golf score relative to par. E -> 0, +4 -> 4, -3 -> -3."""
+def parse_round_value(value: Any) -> int | None:
     if value is None:
         return None
-
     if isinstance(value, str):
-        cleaned = value.strip().upper()
-        if not cleaned or cleaned == "-":
+        cleaned = value.strip()
+        if not cleaned or cleaned.upper() in {"-", "E", "EVEN"}:
             return None
-        if cleaned in {"E", "EVEN"}:
-            return 0
-        if cleaned.startswith("+"):
-            try:
-                numeric = int(cleaned[1:])
-            except ValueError:
-                return None
-        else:
-            try:
-                numeric = int(cleaned)
-            except ValueError:
-                return None
-    else:
-        try:
-            numeric = int(float(value))
-        except (TypeError, ValueError):
+        if cleaned.startswith(("+", "E")):
             return None
-
-    if numeric > MAX_RELATIVE_SCORE or numeric < MIN_RELATIVE_SCORE:
-        return None
-    return numeric
-
-
-def is_valid_relative_score(value: int) -> bool:
-    return MIN_RELATIVE_SCORE <= value <= MAX_RELATIVE_SCORE
-
-
-def parse_round_field_value(value: Any, round_par: int = DEFAULT_ROUND_PAR) -> int | None:
-    """Parse a DataGolf R-field as a per-round score relative to par."""
-    relative = parse_relative_to_par(value)
-    if relative is not None and is_valid_relative_score(relative):
-        return relative
-
     try:
         strokes = int(float(value))
     except (TypeError, ValueError):
         return None
+    if strokes < 50 or strokes > 100:
+        return None
+    return strokes
 
-    if MIN_STROKE_TOTAL <= strokes <= MAX_STROKE_TOTAL:
-        relative = strokes - round_par
-        if is_valid_relative_score(relative):
-            return relative
+
+def extract_current_round(payload: dict[str, Any]) -> int | None:
+    info = payload.get("info")
+    if isinstance(info, dict):
+        current_round = info.get("current_round")
+        if isinstance(current_round, int) and 1 <= current_round <= 4:
+            return current_round
     return None
 
 
-def extract_round_scores(
-    record: dict[str, Any],
-    event_current_round: int | None = None,
-) -> dict[int, int]:
-    """Read per-round scores from R1-R4; fill active round from live today/round fields."""
-    round_scores: dict[int, int] = {}
-    for round_num in range(1, 5):
-        parsed = parse_round_field_value(record.get(f"R{round_num}"))
-        if parsed is not None:
-            round_scores[round_num] = parsed
+def extract_round_scores(record: dict[str, Any], current_round: int | None = None) -> dict[int, int]:
+    scores: dict[int, int] = {}
+    for round_num, field_names in ROUND_FIELD_NAMES.items():
+        for field_name in field_names:
+            if field_name not in record:
+                continue
+            parsed = parse_round_value(record.get(field_name))
+            if parsed is not None:
+                scores[round_num] = parsed
+                break
 
-    player_round = extract_player_current_round(record)
-    if player_round is None:
-        player_round = event_current_round
-    if player_round is not None and player_round not in round_scores:
-        if parse_round_field_value(record.get(f"R{player_round}")) is None:
-            live_score = extract_live_today_score(record)
-            if live_score is not None:
-                round_scores[player_round] = live_score
+    if current_round is not None:
+        for field_name in ("today", "current_round_score", "round_score"):
+            if field_name in record:
+                parsed = parse_round_value(record.get(field_name))
+                if parsed is not None:
+                    scores[current_round] = parsed
+                break
 
-    return round_scores
-
-
-def analyze_live_score_records(
-    records: list[dict[str, Any]],
-    event_current_round: int | None,
-) -> dict[str, Any]:
-    """Debug summary for live round detection."""
-    with_r3_field = 0
-    with_live_today = 0
-    with_round_no_3 = 0
-    sample_players: list[dict[str, Any]] = []
-
-    for record in records:
-        if parse_round_field_value(record.get("R3")) is not None:
-            with_r3_field += 1
-        if extract_live_today_score(record) is not None:
-            with_live_today += 1
-        parsed = extract_round_scores(record, event_current_round)
-        if 3 in parsed:
-            with_round_no_3 += 1
-
-    for record in records[:10]:
-        datagolf_name = extract_player_name(record) or "?"
-        sample_players.append(
-            {
-                "player_name": datagolf_name,
-                "R1": record.get("R1"),
-                "R2": record.get("R2"),
-                "R3": record.get("R3"),
-                "R4": record.get("R4"),
-                "today": record.get("today"),
-                "current_score": record.get("current_score"),
-                "thru": record.get("thru"),
-                "tee_time": record.get("tee_time"),
-                "round": record.get("round"),
-                "parsed_rounds": extract_round_scores(record, event_current_round),
-            }
-        )
-
-    return {
-        "record_count": len(records),
-        "with_r3_field": with_r3_field,
-        "with_live_today": with_live_today,
-        "with_round_no_3_parsed": with_round_no_3,
-        "sample_players": sample_players,
-    }
-
-
-def count_round_writes(score_rows: list[dict[str, Any]], round_no: int) -> int:
-    return sum(1 for row in score_rows if int(row["round_no"]) == round_no)
+    return scores
 
 
 def extract_player_name(record: dict[str, Any]) -> str | None:
@@ -491,736 +241,551 @@ def extract_player_name(record: dict[str, Any]) -> str | None:
     return None
 
 
-def datagolf_name_to_standard(name: str) -> str:
-    cleaned = name.strip()
-    if "," in cleaned:
-        last, first = [part.strip() for part in cleaned.split(",", 1)]
-        if first and last:
-            return f"{first} {last}"
-    return cleaned
+def extract_player_status(record: dict[str, Any]) -> str | None:
+    """Return only explicit terminal statuses; absence never implies a status."""
+    for field_name in ("status", "current_pos", "position", "pos"):
+        value = record.get(field_name)
+        if not isinstance(value, str):
+            continue
+        normalized = value.strip().upper()
+        if normalized in {"CUT", "WD", "DQ"}:
+            return normalized
+    return None
 
 
-def fetch_players(client: Client, tournament_id: int | None = None) -> list[dict[str, Any]]:
-    query = client.table("players").select("id,name")
-    if tournament_id is not None:
-        query = query.eq("tournament_id", tournament_id)
-    response = query.order("name").execute()
-    return response.data or []
+def extract_live_snapshot(
+    record: dict[str, Any],
+    db_player: dict[str, Any],
+    current_round: int | None,
+    source_updated_at: str | None,
+) -> live_feed.LiveSnapshot | None:
+    """Extract only documented in-play fields needed for transition detection."""
+    round_value = record.get("round", current_round)
+    try:
+        round_num = int(round_value)
+    except (TypeError, ValueError):
+        round_num = current_round
+    if round_num is None or not 1 <= round_num <= 4:
+        return None
+
+    hole, is_finished = live_feed.parse_hole(record.get("thru"))
+    try:
+        end_hole = int(record.get("end_hole"))
+    except (TypeError, ValueError):
+        end_hole = None
+    if end_hole is not None and not 1 <= end_hole <= 18:
+        end_hole = None
+
+    return live_feed.LiveSnapshot(
+        player_id=str(db_player["id"]),
+        player_name=str(db_player["name"]),
+        round=round_num,
+        hole=hole,
+        is_finished=is_finished,
+        round_score=live_feed.parse_relative_score(record.get("today")),
+        status=extract_player_status(record),
+        end_hole=end_hole,
+        source_updated_at=source_updated_at,
+    )
+
+
+def extract_source_updated_at(payload: dict[str, Any]) -> str | None:
+    info = payload.get("info")
+    if isinstance(info, dict):
+        for field_name in ("last_update", "last_updated"):
+            value = info.get(field_name)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    for field_name in ("last_update", "last_updated"):
+        value = payload.get(field_name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _row_to_live_snapshot(row: dict[str, Any], player_name: str = "") -> live_feed.LiveSnapshot:
+    return live_feed.LiveSnapshot(
+        player_id=str(row["player_id"]),
+        player_name=player_name,
+        round=int(row["round"]),
+        hole=int(row["hole"]) if row.get("hole") is not None else None,
+        is_finished=bool(row.get("is_finished")),
+        round_score=int(row["round_score"]) if row.get("round_score") is not None else None,
+        status=str(row.get("status") or "ACTIVE"),
+        source_updated_at=row.get("source_updated_at"),
+    )
+
+
+def persist_live_feed_transitions(
+    client: Client,
+    tournament_id: str,
+    snapshots: list[live_feed.LiveSnapshot],
+) -> int:
+    """Persist baseline/state and new events; deterministic keys make retries safe."""
+    if not snapshots:
+        return 0
+
+    previous_rows = fetch_live_player_states(client, tournament_id)
+    previous_by_key = {
+        (str(row["player_id"]), int(row["round"])): _row_to_live_snapshot(row)
+        for row in previous_rows
+    }
+    event_rows: list[dict[str, Any]] = []
+    state_rows: list[dict[str, Any]] = []
+
+    for snapshot in snapshots:
+        key = (snapshot.player_id, snapshot.round)
+        previous = previous_by_key.get(key)
+        if snapshot.status is None and previous is not None:
+            snapshot = replace(snapshot, status=previous.status)
+        event_rows.extend(live_feed.build_events(tournament_id, previous, snapshot))
+        state_rows.append(live_feed.state_row(tournament_id, snapshot))
+
+    if event_rows:
+        client.table("live_feed_events").upsert(
+            event_rows,
+            on_conflict="dedupe_key",
+            ignore_duplicates=True,
+        ).execute()
+    client.table("live_player_states").upsert(
+        state_rows,
+        on_conflict="tournament_id,player_id,round",
+    ).execute()
+    return len(event_rows)
 
 
 def build_player_lookup(players: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     lookup: dict[str, dict[str, Any]] = {}
     for player in players:
-        lookup[normalize_name(player["name"])] = player
+        normalized = normalize_name(player["name"])
+        lookup[normalized] = player
     return lookup
-
-
-def find_ambiguous_normalized_names(players: list[dict[str, Any]]) -> set[str]:
-    """Return normalized names that map to multiple database players."""
-    seen: dict[str, str] = {}
-    ambiguous: set[str] = set()
-    for player in players:
-        key = normalize_name(player["name"])
-        if key in seen and seen[key] != player["name"]:
-            ambiguous.add(key)
-        seen[key] = player["name"]
-    return ambiguous
-
-
-def extract_field_player_names(records: list[dict[str, Any]]) -> list[str]:
-    """Collect unique DataGolf field names using standard First Last formatting."""
-    names: list[str] = []
-    seen: set[str] = set()
-    for record in records:
-        datagolf_name = extract_player_name(record)
-        if not datagolf_name:
-            continue
-        standard_name = datagolf_name_to_standard(datagolf_name).strip()
-        normalized = normalize_name(standard_name)
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        names.append(standard_name)
-    return sorted(names)
-
-
-def classify_field_players(
-    field_names: list[str],
-    player_lookup: dict[str, dict[str, Any]],
-    ambiguous_keys: set[str],
-) -> tuple[int, list[str], list[str]]:
-    """
-    Split DataGolf field names into existing matches, new inserts, and ambiguous rows.
-    """
-    existing_count = 0
-    to_add: list[str] = []
-    ambiguous_names: list[str] = []
-
-    for standard_name in field_names:
-        datagolf_name = standard_name
-        normalized = normalize_name(standard_name)
-        if normalized in ambiguous_keys:
-            ambiguous_names.append(standard_name)
-            continue
-
-        if match_database_player(datagolf_name, player_lookup) is not None:
-            existing_count += 1
-            continue
-
-        to_add.append(standard_name)
-
-    return existing_count, to_add, sorted(set(ambiguous_names))
-
-
-def import_missing_field_players(
-    client: Client,
-    api_key: str,
-    tour: str = DEFAULT_TOUR,
-    extra_tier_label: str = "Ekstra",
-    tournament_id: int | None = None,
-) -> FieldImportResult:
-    """Import DataGolf field players that are not already in the players table."""
-    if not api_key:
-        return FieldImportResult(success=False, error="DATA_GOLF_API_KEY is not configured.")
-    if client is None:
-        return FieldImportResult(success=False, error="Supabase client is not configured.")
-
-    try:
-        payload = fetch_live_tournament_data(api_key=api_key, tour=tour)
-        records = extract_player_records(payload)
-        event_name = extract_event_name(payload)
-        if not records:
-            return FieldImportResult(
-                success=False,
-                event_name=event_name,
-                error="DataGolf response did not contain any player records.",
-            )
-
-        field_names = extract_field_player_names(records)
-        db_players = fetch_players(client, tournament_id=tournament_id)
-        player_lookup = build_player_lookup(db_players)
-        ambiguous_keys = find_ambiguous_normalized_names(db_players)
-        existing_count, to_add, ambiguous_names = classify_field_players(
-            field_names,
-            player_lookup,
-            ambiguous_keys,
-        )
-
-        new_players: list[str] = []
-        for name in to_add:
-            try:
-                payload = {"name": name, "tier": extra_tier_label or None}
-                if tournament_id is not None:
-                    payload["tournament_id"] = int(tournament_id)
-                client.table("players").insert(payload).execute()
-                new_players.append(name)
-                player_lookup[normalize_name(name)] = {"name": name}
-            except Exception as exc:
-                logger.warning("Could not insert field player %s: %s", name, exc)
-                ambiguous_names.append(name)
-
-        return FieldImportResult(
-            success=True,
-            existing_count=existing_count,
-            added_count=len(new_players),
-            field_count=len(field_names),
-            new_players=sorted(new_players),
-            ambiguous_names=sorted(set(ambiguous_names)),
-            event_name=event_name,
-        )
-    except DataGolfRateLimitError as exc:
-        return FieldImportResult(success=False, error=str(exc))
-    except Exception as exc:
-        logger.exception("DataGolf field import failed")
-        return FieldImportResult(success=False, error=str(exc))
 
 
 def match_database_player(
     datagolf_name: str,
     player_lookup: dict[str, dict[str, Any]],
 ) -> dict[str, Any] | None:
-    candidates = [datagolf_name, datagolf_name_to_standard(datagolf_name)]
-    for candidate in candidates:
-        normalized = normalize_name(candidate)
-        if normalized in player_lookup:
-            return player_lookup[normalized]
-        alias_target = NAME_ALIASES.get(normalized)
-        if alias_target and alias_target in player_lookup:
-            return player_lookup[alias_target]
+    return player_lookup.get(normalize_name(datagolf_name))
+
+
+def validate_event_name(expected_event_name: str | None, event_name: str | None) -> str | None:
+    """Return an error unless the configured and received DataGolf events match."""
+    if not expected_event_name:
+        return (
+            "The active tournament has no datagolf_event_name configured. "
+            "Cannot verify the DataGolf feed."
+        )
+    if not event_name:
+        return (
+            "DataGolf response did not include an event name. "
+            "Cannot verify the live feed."
+        )
+    if not event_name_matches(expected_event_name, event_name):
+        return (
+            "DataGolf live feed does not match the active tournament. "
+            f"Expected event name: '{expected_event_name}'. "
+            f"Received event name: '{event_name}'."
+        )
     return None
 
 
-def count_scores(client: Client) -> int:
-    response = client.table("scores").select("id", count="exact").execute()
-    return int(response.count or 0)
-
-
-def clear_all_scores(client: Client) -> int:
-    """Delete all rows from scores. Returns number of rows removed."""
-    before = count_scores(client)
-    client.table("scores").delete().neq("id", 0).execute()
-    return before
-
-
-VERIFY_SAMPLE_PLAYERS = [
-    "Viktor Hovland",
-    "Scottie Scheffler",
-    "Collin Morikawa",
-    "Brooks Koepka",
-    "Tommy Fleetwood",
-]
-
-
-def find_player_record(
-    records: list[dict[str, Any]],
-    target_name: str,
-) -> tuple[dict[str, Any] | None, str | None]:
-    target_norm = normalize_name(target_name)
-    for record in records:
-        datagolf_name = extract_player_name(record)
-        if not datagolf_name:
-            continue
-        candidates = [datagolf_name, datagolf_name_to_standard(datagolf_name)]
-        if any(normalize_name(candidate) == target_norm for candidate in candidates):
-            return record, datagolf_name
-    return None, None
-
-
-def verify_round_score_mapping(
-    api_key: str,
-    player_names: list[str] | None = None,
-    tour: str = DEFAULT_TOUR,
-    use_backoff: bool = False,
-) -> dict[str, Any]:
-    payload = fetch_live_tournament_data(api_key=api_key, tour=tour, use_backoff=use_backoff)
-    records = extract_player_records(payload)
-    names = player_names or VERIFY_SAMPLE_PLAYERS
-    players: list[dict[str, Any]] = []
-
-    for target_name in names:
-        record, datagolf_name = find_player_record(records, target_name)
-        if record is None:
-            players.append(
-                {
-                    "target_name": target_name,
-                    "found": False,
-                    "datagolf_name": None,
-                    "raw_rounds": {},
-                    "supabase_writes": {},
-                }
-            )
-            continue
-
-        raw_rounds = {
-            f"R{round_num}": record.get(f"R{round_num}") for round_num in range(1, 5)
-        }
-        raw_rounds.update(
-            {
-                "today": record.get("today"),
-                "current_score": record.get("current_score"),
-                "thru": record.get("thru"),
-                "tee_time": record.get("tee_time"),
-                "round": record.get("round"),
-            }
-        )
-        supabase_writes = extract_round_scores(record, event_current_round=extract_current_round(payload))
-        players.append(
-            {
-                "target_name": target_name,
-                "found": True,
-                "datagolf_name": datagolf_name,
-                "raw_rounds": raw_rounds,
-                "supabase_writes": supabase_writes,
-            }
-        )
-
-    return {
-        "event_name": extract_event_name(payload),
-        "records_found": len(records),
-        "players": players,
-    }
-
-
-def fetch_player_scores_from_db(
+def run_datagolf_diagnostic(
     client: Client,
-    player_names: list[str],
-) -> dict[str, dict[int, int]]:
-    db_players = fetch_players(client)
-    lookup = {normalize_name(player["name"]): player for player in db_players}
-    scores_by_player: dict[str, dict[int, int]] = {}
+    tournament: dict[str, Any],
+    api_key: str,
+    tour: str = DEFAULT_TOUR,
+) -> DataGolfDiagnosticResult:
+    """Fetch DataGolf in-play feed and compare to DB. No writes."""
+    checked_at = datetime.now(timezone.utc)
+    tournament_id = str(tournament["id"])
+    expected_event_name = tournament.get("datagolf_event_name")
+    display_title = tournament_display_title(tournament)
 
-    for target_name in player_names:
-        player = lookup.get(normalize_name(target_name))
-        if player is None:
-            scores_by_player[target_name] = {}
-            continue
-        response = (
-            client.table("scores")
-            .select("round_no, score")
-            .eq("player_id", int(player["id"]))
-            .order("round_no")
-            .execute()
-        )
-        scores_by_player[target_name] = {
-            int(row["round_no"]): int(row["score"]) for row in response.data or []
-        }
+    base = DataGolfDiagnosticResult(
+        checked_at=checked_at,
+        tournament_id=tournament_id,
+        tournament_name=str(tournament.get("name") or ""),
+        display_title=display_title,
+        expected_event_name=expected_event_name,
+        datagolf_event_name=None,
+        event_found=False,
+        players_received=0,
+        players_with_scores=0,
+        db_players_count=0,
+        matched_count=0,
+        unmatched_count=0,
+    )
 
-    return scores_by_player
+    if not api_key:
+        base.error = "DATA_GOLF_API_KEY is not configured."
+        return base
 
+    try:
+        payload = fetch_live_tournament_data(api_key=api_key, tour=tour)
+    except DataGolfRateLimitError as exc:
+        base.error = str(exc)
+        return base
+    except Exception as exc:
+        base.error = str(exc)
+        return base
 
-def build_score_updates(
-    records: list[dict[str, Any]],
-    player_lookup: dict[str, dict[str, Any]],
-    event_round: int | None,
-) -> tuple[list[dict[str, Any]], list[str], list[str], dict[str, dict[int, int]]]:
-    """Match players and build upsert rows without touching the database."""
-    matched_players: list[str] = []
-    unmatched_players: list[str] = []
-    score_rows: list[dict[str, Any]] = []
-    player_round_scores: dict[str, dict[int, int]] = {}
+    records = extract_player_records(payload)
+    current_round = extract_current_round(payload)
+    event_name = extract_event_name(payload)
 
+    base.datagolf_event_name = event_name
+    base.players_received = len(records)
+    base.current_round = current_round
+    base.players_with_scores = sum(
+        1
+        for record in records
+        if extract_round_scores(record, current_round=current_round)
+    )
+
+    event_error = validate_event_name(expected_event_name, event_name)
+    if event_error:
+        base.error = event_error
+        return base
+
+    base.event_found = True
+
+    if not records:
+        base.warning = "Event name matches, but the feed contains no player records."
+        return base
+
+    db_players = fetch_players(client, tournament_id)
+    base.db_players_count = len(db_players)
+    player_lookup = build_player_lookup(db_players)
+
+    matched: list[str] = []
+    unmatched: list[str] = []
     for record in records:
         datagolf_name = extract_player_name(record)
         if not datagolf_name:
             continue
-
-        round_scores = extract_round_scores(record, event_current_round=event_round)
-        if not round_scores:
-            continue
-
         db_player = match_database_player(datagolf_name, player_lookup)
         if db_player is None:
-            unmatched_players.append(datagolf_name)
-            logger.warning("Unmatched DataGolf player: %s", datagolf_name)
-            continue
+            unmatched.append(datagolf_name)
+        else:
+            matched.append(db_player["name"])
 
-        player_name = db_player["name"]
-        matched_players.append(player_name)
-        player_round_scores[player_name] = round_scores
+    base.matched_players = sorted(set(matched))
+    base.unmatched_players = sorted(set(unmatched))
+    base.matched_count = len(base.matched_players)
+    base.unmatched_count = len(base.unmatched_players)
 
-        for round_num, relative_score in round_scores.items():
-            if not is_valid_relative_score(relative_score):
-                logger.warning(
-                    "Skipped invalid relative score for %s R%s: %s",
-                    player_name,
-                    round_num,
-                    relative_score,
-                )
-                continue
-            score_rows.append(
-                {
-                    "player_id": int(db_player["id"]),
-                    "round_no": round_num,
-                    "score": relative_score,
-                }
-            )
-
-    return score_rows, matched_players, unmatched_players, player_round_scores
-
-
-def preview_sync_scores(
-    api_key: str,
-    tour: str = DEFAULT_TOUR,
-    use_backoff: bool = False,
-) -> dict[str, Any]:
-    payload = fetch_live_tournament_data(api_key=api_key, tour=tour, use_backoff=use_backoff)
-    records = extract_player_records(payload)
-    event_round = extract_current_round(payload)
-    sample_players = []
-
-    for record in records:
-        datagolf_name = extract_player_name(record)
-        if not datagolf_name:
-            continue
-        round_scores = extract_round_scores(record, event_current_round=event_round)
-        if not round_scores:
-            continue
-        sample_players.append(
-            {
-                "datagolf_name": datagolf_name,
-                "db_name": datagolf_name_to_standard(datagolf_name),
-                "round_scores": round_scores,
-            }
+    if base.db_players_count == 0:
+        base.warning = (
+            "No players in the database for the active tournament yet. "
+            "All DataGolf field players appear as unmatched until roster import."
         )
-        if len(sample_players) >= 10:
-            break
 
-    parsed_count = sum(
-        1 for record in records if extract_round_scores(record, event_current_round=event_round)
+    return base
+
+
+def execute_datagolf_diagnostic(secrets: dict[str, Any], tour: str = DEFAULT_TOUR) -> DataGolfDiagnosticResult:
+    checked_at = datetime.now(timezone.utc)
+    api_key = get_api_key_from_mapping(secrets)
+    supabase_url = str(secrets.get("SUPABASE_URL", "")).strip()
+    supabase_key = str(secrets.get("SUPABASE_ANON_KEY", "")).strip()
+
+    if not api_key:
+        return DataGolfDiagnosticResult(
+            checked_at=checked_at,
+            tournament_id="",
+            tournament_name="",
+            display_title="",
+            expected_event_name=None,
+            datagolf_event_name=None,
+            event_found=False,
+            players_received=0,
+            players_with_scores=0,
+            db_players_count=0,
+            matched_count=0,
+            unmatched_count=0,
+            error="DATA_GOLF_API_KEY is not configured.",
+        )
+
+    if not supabase_url or not supabase_key:
+        return DataGolfDiagnosticResult(
+            checked_at=checked_at,
+            tournament_id="",
+            tournament_name="",
+            display_title="",
+            expected_event_name=None,
+            datagolf_event_name=None,
+            event_found=False,
+            players_received=0,
+            players_with_scores=0,
+            db_players_count=0,
+            matched_count=0,
+            unmatched_count=0,
+            error="SUPABASE_URL and SUPABASE_ANON_KEY are required for diagnostics.",
+        )
+
+    client = get_supabase_client_from_config(supabase_url, supabase_key)
+    tournament = get_active_tournament(client)
+    if tournament is None:
+        return DataGolfDiagnosticResult(
+            checked_at=checked_at,
+            tournament_id="",
+            tournament_name="",
+            display_title="",
+            expected_event_name=None,
+            datagolf_event_name=None,
+            event_found=False,
+            players_received=0,
+            players_with_scores=0,
+            db_players_count=0,
+            matched_count=0,
+            unmatched_count=0,
+            error="No active tournament found in tournaments table.",
+        )
+
+    return run_datagolf_diagnostic(client, tournament, api_key=api_key, tour=tour)
+
+
+def execute_sync(secrets: dict[str, Any], tour: str = DEFAULT_TOUR) -> SyncResult:
+    """Run the same sync routine used by datagolf_sync.py --sync."""
+    synced_at = datetime.now(timezone.utc)
+    api_key = get_api_key_from_mapping(secrets)
+    supabase_url = str(secrets.get("SUPABASE_URL", "")).strip()
+    supabase_key = str(secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")).strip()
+
+    if not api_key:
+        return SyncResult(
+            success=False,
+            synced_at=synced_at,
+            error="DATA_GOLF_API_KEY is not configured.",
+        )
+    if not supabase_url or not supabase_key:
+        return SyncResult(
+            success=False,
+            synced_at=synced_at,
+            error="SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for score sync.",
+        )
+
+    client = get_supabase_client_from_config(supabase_url, supabase_key)
+    tournament = get_active_tournament(client)
+    if tournament is None:
+        return SyncResult(
+            success=False,
+            synced_at=synced_at,
+            error="No active tournament found in tournaments table.",
+        )
+    return sync_live_scores(
+        client,
+        tournament,
+        api_key=api_key,
+        tour=tour,
     )
-    return {
-        "event_name": extract_event_name(payload),
-        "records_found": len(records),
-        "parsed_score_count": parsed_count,
-        "sample_players": sample_players,
-    }
 
 
 def sync_live_scores(
     client: Client,
+    tournament: dict[str, Any],
     api_key: str,
     tour: str = DEFAULT_TOUR,
-    use_backoff: bool = True,
-    tournament_config: Any | None = None,
 ) -> SyncResult:
     synced_at = datetime.now(timezone.utc)
-    tournament_id = getattr(tournament_config, "id", None)
-    if tournament_config is not None and getattr(tournament_config, "datagolf_tour", None):
-        tour = str(tournament_config.datagolf_tour)
+    tournament_id = str(tournament["id"])
+    expected_event_name = tournament.get("datagolf_event_name")
 
     try:
-        payload = fetch_live_tournament_data(
-            api_key=api_key,
-            tour=tour,
-            use_backoff=use_backoff,
-        )
+        payload = fetch_live_tournament_data(api_key=api_key, tour=tour)
         records = extract_player_records(payload)
-        event_round = extract_current_round(payload)
+        current_round = extract_current_round(payload)
         event_name = extract_event_name(payload)
-        event_warning: str | None = None
-        if tournament_config is not None:
-            from lib.tournament import event_name_matches
-
-            if not event_name_matches(tournament_config, event_name):
-                event_warning = (
-                    f"DataGolf event is '{event_name or 'ukjent'}', "
-                    f"forventet '{tournament_config.datagolf_event_name}'."
-                )
-
-        if not records:
-            result = SyncResult(
+        source_updated_at = extract_source_updated_at(payload)
+        event_error = validate_event_name(expected_event_name, event_name)
+        if event_error:
+            logger.warning("DataGolf sync blocked: %s", event_error)
+            return SyncResult(
                 success=False,
                 synced_at=synced_at,
                 event_name=event_name,
+                expected_event_name=expected_event_name,
+                error=f"{event_error} {ABORTED_NO_WRITE_MSG}",
+            )
+        if not records:
+            return SyncResult(
+                success=False,
+                synced_at=synced_at,
                 error=(
                     "DataGolf response did not contain any player records. "
                     f"{ABORTED_NO_WRITE_MSG}"
                 ),
             )
-            log_sync_event(client, "error", result.error or "No player records")
-            return finalize_sync_result(client, result)
 
-        db_players = fetch_players(client, tournament_id=tournament_id)
+        db_players = fetch_players(client, tournament_id)
+        selected_player_ids = {
+            str(row["player_id"])
+            for row in fetch_team_players(client, tournament_id)
+        }
         player_lookup = build_player_lookup(db_players)
-        score_rows, matched_players, unmatched_players, player_round_scores = build_score_updates(
-            records,
-            player_lookup,
-            event_round,
-        )
+        matched_player_ids: set[str] = set()
+        matched_players: list[str] = []
+        unmatched_players: list[str] = []
+        score_rows: list[dict[str, Any]] = []
+        status_candidates: list[dict[str, Any]] = []
+        live_snapshots: list[live_feed.LiveSnapshot] = []
 
-        if not score_rows:
-            analysis = analyze_live_score_records(records, event_round)
-            result = SyncResult(
+        for record in records:
+            datagolf_name = extract_player_name(record)
+            if not datagolf_name:
+                continue
+
+            db_player = match_database_player(datagolf_name, player_lookup)
+            if db_player is None:
+                unmatched_players.append(datagolf_name)
+                logger.warning("Unmatched DataGolf player: %s", datagolf_name)
+                continue
+
+            matched_player_ids.add(db_player["id"])
+            matched_players.append(db_player["name"])
+            if str(db_player["id"]) in selected_player_ids:
+                snapshot = extract_live_snapshot(
+                    record,
+                    db_player,
+                    current_round=current_round,
+                    source_updated_at=source_updated_at,
+                )
+                if snapshot is not None:
+                    live_snapshots.append(snapshot)
+            round_scores = extract_round_scores(record, current_round=current_round)
+            for round_num, strokes in round_scores.items():
+                score_rows.append(
+                    {
+                        "player_id": db_player["id"],
+                        "round": round_num,
+                        "strokes": strokes,
+                        "source": "DATAGOLF",
+                        "is_official": True,
+                        "updated_at": synced_at.isoformat(),
+                    }
+                )
+
+            status = extract_player_status(record)
+            effective_round = 3 if status == "CUT" else current_round
+            if status and effective_round is not None:
+                status_candidates.append(
+                    {
+                        "player_id": db_player["id"],
+                        "effective_round": effective_round,
+                        "status": status,
+                        "source": "DATAGOLF",
+                        "note": f"Explicit DataGolf status during verified event {event_name}",
+                    }
+                )
+
+        if not score_rows and not status_candidates and not live_snapshots:
+            return SyncResult(
                 success=False,
                 synced_at=synced_at,
                 matched_players=sorted(set(matched_players)),
                 unmatched_players=sorted(set(unmatched_players)),
                 event_name=event_name,
+                expected_event_name=expected_event_name,
                 error=(
-                    "No valid relative-to-par round scores were available to sync from DataGolf. "
+                    "No round scores were available to sync from DataGolf. "
                     f"{ABORTED_NO_WRITE_MSG}"
                 ),
             )
-            logger.error(
-                "Sync aborted: no score rows. event=%s records=%s r3_field=%s live_today=%s parsed_r3=%s",
-                event_name,
-                analysis["record_count"],
-                analysis["with_r3_field"],
-                analysis["with_live_today"],
-                analysis["with_round_no_3_parsed"],
+
+        if score_rows:
+            client.table("scores").upsert(score_rows, on_conflict="player_id,round").execute()
+
+        status_rows: list[dict[str, Any]] = []
+        if status_candidates:
+            existing_events = fetch_player_status_events(client, tournament_id)
+            latest_by_player: dict[str, tuple[str, int]] = {}
+            for event in existing_events:
+                latest_by_player[event["player_id"]] = (
+                    str(event["status"]).upper(),
+                    int(event["effective_round"]),
+                )
+            for candidate in status_candidates:
+                signature = (candidate["status"], int(candidate["effective_round"]))
+                if latest_by_player.get(candidate["player_id"]) != signature:
+                    status_rows.append(candidate)
+                    latest_by_player[candidate["player_id"]] = signature
+            if status_rows:
+                client.table("player_status_events").insert(status_rows).execute()
+
+        live_events_written = 0
+        live_feed_warning = None
+        try:
+            live_events_written = persist_live_feed_transitions(
+                client,
+                tournament_id,
+                live_snapshots,
             )
-            log_sync_event(client, "error", result.error or "No valid scores")
-            return finalize_sync_result(client, result)
-
-        if tournament_id is not None:
-            for row in score_rows:
-                row["tournament_id"] = int(tournament_id)
-        record_result = record_live_events(client, score_rows, db_players, event_round, tournament_id=tournament_id)
-        if record_result.changes_detected:
-            logger.info(
-                "Live events: detected=%s written=%s active_round=%s",
-                record_result.changes_detected,
-                record_result.written,
-                event_round,
+        except Exception as exc:
+            # Keep the established score sync operational while the additive
+            # live-feed migration is waiting to be installed.
+            logger.warning("Live feed persistence unavailable: %s", exc)
+            live_feed_warning = (
+                "Scores were synchronized, but the live-feed tables are not available yet. "
+                "Run migrations/003_live_feed.sql in Supabase."
             )
-        if record_result.error:
-            logger.error("Live events insert failed: %s", record_result.error)
-        if tournament_id is not None:
-            client.table("scores").upsert(
-                score_rows,
-                on_conflict="tournament_id,player_id,round_no",
-            ).execute()
-        else:
-            client.table("scores").upsert(score_rows, on_conflict="player_id,round_no").execute()
 
-        analysis = analyze_live_score_records(records, event_round)
-        round_3_writes = count_round_writes(score_rows, 3)
-        logger.info(
-            "DataGolf sync: event=%s records=%s r3_field=%s live_today=%s parsed_r3=%s written_r3=%s total_writes=%s",
-            event_name,
-            analysis["record_count"],
-            analysis["with_r3_field"],
-            analysis["with_live_today"],
-            analysis["with_round_no_3_parsed"],
-            round_3_writes,
-            len(score_rows),
-        )
-
-        matched_player_ids = {row["player_id"] for row in score_rows}
-        sample_writes = [
-            {
-                "player_name": player_name,
-                "round_scores": player_round_scores[player_name],
-            }
-            for player_name in sorted(player_round_scores.keys())[:10]
-        ]
-
-        result = SyncResult(
+        return SyncResult(
             success=True,
             synced_at=synced_at,
             players_updated=len(matched_player_ids),
             scores_written=len(score_rows),
+            statuses_written=len(status_rows),
+            live_events_written=live_events_written,
             matched_players=sorted(set(matched_players)),
             unmatched_players=sorted(set(unmatched_players)),
-            sample_writes=sample_writes,
             event_name=event_name,
-            live_events_written=record_result.written,
-            score_changes_detected=record_result.changes_detected,
-            live_events_error=record_result.error,
-            warning=event_warning,
+            expected_event_name=expected_event_name,
+            warning=live_feed_warning,
         )
-        log_sync_event(
-            client,
-            "success",
-            f"Synced {len(score_rows)} scores for {len(matched_player_ids)} players.",
-            scores_written=len(score_rows),
-        )
-        result.last_successful_sync = synced_at
-        return finalize_sync_result(client, result)
     except DataGolfRateLimitError as exc:
         logger.warning("DataGolf sync aborted due to rate limit")
-        warning = (
-            f"DataGolf API rate limited (HTTP 429). {ABORTED_NO_WRITE_MSG} "
-            f"Prøvde {exc.retry_count} gang(er)"
-            + (
-                f" med backoff ({', '.join(str(s) for s in RATE_LIMIT_BACKOFF_SECONDS)} sek)."
-                if use_backoff
-                else "."
-            )
-        )
-        result = SyncResult(
+        return SyncResult(
             success=False,
             synced_at=synced_at,
-            warning=warning,
-            rate_limited=True,
-            retry_count=exc.retry_count,
+            error=str(exc),
         )
-        log_sync_event(
-            client,
-            "rate_limited",
-            warning,
-            http_status=429,
-            retry_count=exc.retry_count,
-        )
-        return finalize_sync_result(client, result)
     except Exception as exc:
         logger.exception("DataGolf sync failed")
         message = str(exc)
         if ABORTED_NO_WRITE_MSG not in message:
             message = f"{message} {ABORTED_NO_WRITE_MSG}"
-        result = SyncResult(
+        return SyncResult(
             success=False,
             synced_at=synced_at,
             error=message,
         )
-        log_sync_event(client, "error", message)
-        return finalize_sync_result(client, result)
-
-
-def finalize_sync_result(client: Client | None, result: SyncResult) -> SyncResult:
-    if result.success:
-        if result.last_successful_sync is None:
-            result.last_successful_sync = result.synced_at
-    else:
-        result.last_successful_sync = get_last_successful_sync(client)
-    result.auto_sync_suspended = is_auto_sync_suspended(client)
-    return result
-
-
-def execute_sync(
-    client: Client,
-    secrets: dict[str, Any],
-    tour: str = DEFAULT_TOUR,
-    use_backoff: bool = True,
-    tournament_config: Any | None = None,
-) -> SyncResult:
-    synced_at = datetime.now(timezone.utc)
-    api_key = get_api_key_from_mapping(secrets)
-    if not api_key:
-        return finalize_sync_result(
-            client,
-            SyncResult(
-                success=False,
-                synced_at=synced_at,
-                error="DATA_GOLF_API_KEY is not configured.",
-            ),
-        )
-    if client is None:
-        return finalize_sync_result(
-            client,
-            SyncResult(
-                success=False,
-                synced_at=synced_at,
-                error="Supabase client is not configured.",
-            ),
-        )
-    if use_backoff is False and is_auto_sync_suspended(client):
-        return finalize_sync_result(
-            client,
-            SyncResult(
-                success=False,
-                synced_at=synced_at,
-                warning=(
-                    "Auto-sync er midlertidig deaktivert etter 3 påfølgende HTTP 429-svar fra DataGolf. "
-                    f"{ABORTED_NO_WRITE_MSG}"
-                ),
-                rate_limited=True,
-            ),
-        )
-    return sync_live_scores(
-        client,
-        api_key=api_key,
-        tour=tour,
-        use_backoff=use_backoff,
-        tournament_config=tournament_config,
-    )
-
-
-def run_live_round_test() -> dict[str, Any]:
-    """Round 3 in progress: R3 empty, today field supplies live score."""
-    live_record = {
-        "R1": 72,
-        "R2": 71,
-        "R3": None,
-        "R4": None,
-        "today": 1,
-        "thru": 4,
-        "round": 3,
-        "current_score": 3,
-    }
-    parsed = extract_round_scores(live_record, event_current_round=3)
-    passed = parsed == {1: 2, 2: 1, 3: 1}
-
-    completed_r3 = {"R1": -2, "R2": 1, "R3": 3, "R4": None, "today": 0, "round": 3}
-    completed_parsed = extract_round_scores(completed_r3, event_current_round=4)
-    r3_direct = completed_parsed == {1: -2, 2: 1, 3: 3}
-
-    return {
-        "passed": passed and r3_direct,
-        "checks": [
-            {
-                "name": "Live round 3 from today when R3 empty",
-                "expected": {1: 2, 2: 1, 3: 1},
-                "actual": parsed,
-                "passed": passed,
-            },
-            {
-                "name": "Completed R3 used directly when populated",
-                "expected": {1: -2, 2: 1, 3: 3},
-                "actual": completed_parsed,
-                "passed": r3_direct,
-            },
-        ],
-    }
-
-
-def run_round_score_test() -> dict[str, Any]:
-    hovland_record = {"R1": 4, "R2": 5, "R3": None, "R4": None}
-    hovland_scores = extract_round_scores(hovland_record)
-    hovland_passed = hovland_scores == {1: 4, 2: 5}
-
-    three_round_record = {"R1": -2, "R2": 1, "R3": 3, "R4": None}
-    three_round_scores = extract_round_scores(three_round_record)
-    three_round_passed = three_round_scores == {1: -2, 2: 1, 3: 3}
-
-    r2_only_record = {"R1": None, "R2": 2, "R3": None, "R4": None}
-    r2_only_scores = extract_round_scores(r2_only_record)
-    r2_only_passed = r2_only_scores == {2: 2}
-
-    stroke_record = {"R1": 72, "R2": 68, "R3": None, "R4": None}
-    stroke_scores = extract_round_scores(stroke_record)
-    stroke_passed = stroke_scores == {1: 2, 2: -2}
-
-    return {
-        "passed": hovland_passed and three_round_passed and r2_only_passed and stroke_passed,
-        "checks": [
-            {
-                "name": "Viktor Hovland R1=+4 R2=+5",
-                "expected": {1: 4, 2: 5},
-                "actual": hovland_scores,
-                "passed": hovland_passed,
-            },
-            {
-                "name": "Three direct round scores",
-                "expected": {1: -2, 2: 1, 3: 3},
-                "actual": three_round_scores,
-                "passed": three_round_passed,
-            },
-            {
-                "name": "R2 written directly when present",
-                "expected": {2: 2},
-                "actual": r2_only_scores,
-                "passed": r2_only_passed,
-            },
-            {
-                "name": "Stroke totals converted from R1/R2 directly",
-                "expected": {1: 2, 2: -2},
-                "actual": stroke_scores,
-                "passed": stroke_passed,
-            },
-        ],
-    }
-
-
-def run_cumulative_delta_test() -> dict[str, Any]:
-    round_test = run_round_score_test()
-    live_test = run_live_round_test()
-    return {
-        "passed": round_test["passed"] and live_test["passed"],
-        "checks": round_test["checks"] + live_test["checks"],
-    }
 
 
 def run_name_matching_test() -> dict[str, Any]:
     sample_players = [
-        {"id": 1, "name": "Scottie Scheffler"},
-        {"id": 2, "name": "Si woo Kim"},
-        {"id": 3, "name": "Adam scott"},
-        {"id": 4, "name": "Mav McNealy"},
-        {"id": 5, "name": "Rai Rai"},
+        {"id": "1", "name": "Scottie Scheffler", "tier": 1},
+        {"id": "2", "name": "Si woo Kim", "tier": 3},
+        {"id": "3", "name": "Adam scott", "tier": 6},
+        {"id": "4", "name": "Justin Rose ", "tier": 4},
     ]
     lookup = build_player_lookup(sample_players)
     checks = [
-        ("Scheffler, Scottie", "Scottie Scheffler", True),
-        ("Kim, Si Woo", "Si woo Kim", True),
-        ("Scott, Adam", "Adam scott", True),
-        ("McNealy, Maverick", "Mav McNealy", True),
-        ("Rai, Aaron", "Rai Rai", True),
-        ("Rahm, Jon", None, False),
+        ("Scheffler, Scottie", True),
+        ("Kim, Si-Woo", True),
+        ("Scott, Adam", True),
+        ("Rose, Justin", True),
+        ("Rahm, Jon", False),
     ]
     results = []
-    for datagolf_name, expected_name, should_match in checks:
-        matched = match_database_player(datagolf_name, lookup)
-        matched_name = matched["name"] if matched else None
-        passed = (matched is not None) == should_match
-        if should_match and matched_name != expected_name:
-            passed = False
+    for datagolf_name, should_match in checks:
+        matched = match_database_player(datagolf_name, lookup) is not None
         results.append(
             {
                 "datagolf_name": datagolf_name,
                 "expected_match": should_match,
-                "matched_name": matched_name,
-                "passed": passed,
+                "actual_match": matched,
+                "passed": matched == should_match,
             }
         )
     return {
@@ -1229,168 +794,19 @@ def run_name_matching_test() -> dict[str, Any]:
     }
 
 
-def run_rate_limit_test() -> dict[str, Any]:
-    global _fetch_live_tournament_data_once
-
-    sleeps: list[float] = []
-
-    def fake_sleep(seconds: float) -> None:
-        sleeps.append(seconds)
-
-    def always_429(api_key: str, tour: str = DEFAULT_TOUR) -> dict[str, Any]:
-        raise DataGolfRateLimitError("HTTP 429", retry_count=0)
-
-    original_fetch = _fetch_live_tournament_data_once
-    _fetch_live_tournament_data_once = always_429
-    raised = False
-    retry_count = 0
-    try:
-        try:
-            fetch_live_tournament_data("test-key", use_backoff=True, sleep_fn=fake_sleep)
-        except DataGolfRateLimitError as exc:
-            raised = True
-            retry_count = exc.retry_count
-    finally:
-        _fetch_live_tournament_data_once = original_fetch
-
-    checks = [
-        {
-            "name": "Backoff sleeps 30, 60, 120",
-            "expected": [30.0, 60.0, 120.0],
-            "actual": sleeps,
-            "passed": sleeps == [30.0, 60.0, 120.0],
-        },
-        {
-            "name": "Raises after final 429",
-            "expected": True,
-            "actual": raised,
-            "passed": raised,
-        },
-        {
-            "name": "Retry count after 4 attempts",
-            "expected": 4,
-            "actual": retry_count,
-            "passed": raised and retry_count == 4,
-        },
-        {
-            "name": "Consecutive rate limit counter",
-            "expected": 3,
-            "actual": _count_consecutive_from_rows(
-                [
-                    {"status": "rate_limited"},
-                    {"status": "rate_limited"},
-                    {"status": "rate_limited"},
-                    {"status": "success"},
-                ]
-            ),
-            "passed": _count_consecutive_from_rows(
-                [
-                    {"status": "rate_limited"},
-                    {"status": "rate_limited"},
-                    {"status": "rate_limited"},
-                    {"status": "success"},
-                ]
-            )
-            == 3,
-        },
-    ]
-    return {
-        "passed": all(item["passed"] for item in checks),
-        "checks": checks,
-    }
-
-
-def _count_consecutive_from_rows(rows: list[dict[str, str]]) -> int:
-    count = 0
-    for row in rows:
-        if row.get("status") == "rate_limited":
-            count += 1
-        else:
-            break
-    return count
-
-
-def run_field_import_test() -> dict[str, Any]:
-    sample_players = [
-        {"id": 1, "name": "Scottie Scheffler"},
-        {"id": 2, "name": "Mav McNealy"},
-        {"id": 3, "name": "Rai Rai"},
-    ]
-    lookup = build_player_lookup(sample_players)
-    ambiguous_keys = find_ambiguous_normalized_names(sample_players)
-    field_names = extract_field_player_names(
-        [
-            {"player_name": "Scheffler, Scottie"},
-            {"player_name": "McNealy, Maverick"},
-            {"player_name": "Rai, Aaron"},
-            {"player_name": "Rahm, Jon"},
-            {"player_name": "Rahm, Jon"},
-            {"player_name": ""},
-        ]
+def run_api_test(api_key: str, tour: str = DEFAULT_TOUR) -> dict[str, Any]:
+    payload = fetch_live_tournament_data(api_key=api_key, tour=tour)
+    records = extract_player_records(payload)
+    sample = records[0] if records else {}
+    players_with_scores = sum(
+        1 for record in records if extract_round_scores(record, current_round=extract_current_round(payload))
     )
-    existing_count, to_add, ambiguous_names = classify_field_players(
-        field_names,
-        lookup,
-        ambiguous_keys,
-    )
-    checks = [
-        {
-            "name": "Unique field names extracted",
-            "expected": ["Aaron Rai", "Jon Rahm", "Maverick McNealy", "Scottie Scheffler"],
-            "actual": field_names,
-            "passed": field_names
-            == ["Aaron Rai", "Jon Rahm", "Maverick McNealy", "Scottie Scheffler"],
-        },
-        {
-            "name": "Existing players counted",
-            "expected": 3,
-            "actual": existing_count,
-            "passed": existing_count == 3,
-        },
-        {
-            "name": "Only missing players queued",
-            "expected": ["Jon Rahm"],
-            "actual": to_add,
-            "passed": to_add == ["Jon Rahm"],
-        },
-        {
-            "name": "No ambiguous names in clean sample",
-            "expected": [],
-            "actual": ambiguous_names,
-            "passed": ambiguous_names == [],
-        },
-    ]
     return {
-        "passed": all(item["passed"] for item in checks),
-        "checks": checks,
-    }
-
-
-def run_auto_sync_interval_test() -> dict[str, Any]:
-    now = datetime(2026, 6, 19, 12, 0, tzinfo=timezone.utc)
-    recent = now - timedelta(minutes=2)
-    due = now - timedelta(minutes=6)
-    checks = [
-        {
-            "name": "Sync due when no prior attempt",
-            "expected": True,
-            "actual": is_auto_sync_due(None, last_attempt=None, now=now),
-            "passed": is_auto_sync_due(None, last_attempt=None, now=now),
-        },
-        {
-            "name": "Sync not due within 5 minutes",
-            "expected": False,
-            "actual": is_auto_sync_due(None, last_attempt=recent, now=now),
-            "passed": not is_auto_sync_due(None, last_attempt=recent, now=now),
-        },
-        {
-            "name": "Sync due after 5 minutes",
-            "expected": True,
-            "actual": is_auto_sync_due(None, last_attempt=due, now=now),
-            "passed": is_auto_sync_due(None, last_attempt=due, now=now),
-        },
-    ]
-    return {
-        "passed": all(item["passed"] for item in checks),
-        "checks": checks,
+        "event_name": extract_event_name(payload),
+        "records_found": len(records),
+        "players_with_round_scores": players_with_scores,
+        "sample_fields": sorted(sample.keys()) if sample else [],
+        "sample_round_scores": extract_round_scores(sample, current_round=extract_current_round(payload))
+        if sample
+        else {},
     }

@@ -1,104 +1,101 @@
-# Fantasy Golf Kupongen – Supabase golfapp
+# The Open 2026 Fantasy Golf
 
-Regel: Hvert lag har 7 spillere. De 5 laveste scorene per lag per dag teller. De 2 dårligste droppes hver dag. Lavest totalscore leder.
+Streamlit app for The Open 2026 at Royal Birkdale. Each team selects seven golfers; the five lowest scores count in each of four rounds.
 
-Appen støtter flere turneringer (US Open, The Open, Masters, PGA Championship) via turneringskonfigurasjon i databasen.
+## New Supabase project
 
-## Kjør lokalt
+This production baseline is intentionally built for a new, empty Supabase project. Old US Open data and the SQL files under `migrations/` are not required and must not be run on the new database.
 
-1. Opprett tabeller i Supabase med `schema.sql` (ny installasjon) **eller** kjør migreringer (se under).
-2. Kopier `.streamlit/secrets.toml.example` til `.streamlit/secrets.toml`.
-3. Legg inn `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `ADMIN_PASSWORD` og `DATA_GOLF_API_KEY`.
-4. Kjør:
+Run exactly one SQL file in Supabase SQL Editor:
 
-```bash
-py -m pip install -r requirements.txt
-py -m streamlit run app.py
+1. `schema.sql`
+
+The script creates and seeds the active The Open 2026 tournament, creates rounds 1–4, enables row-level security, permits public reads, and blocks public writes.
+
+## Secrets and key separation
+
+Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and set:
+
+```toml
+SUPABASE_URL = "https://your-project.supabase.co"
+SUPABASE_ANON_KEY = "your-anon-key"
+SUPABASE_SERVICE_ROLE_KEY = "your-service-role-key"
+ADMIN_PASSWORD = "a-long-unique-password"
+DATA_GOLF_API_KEY = "your-datagolf-key"
 ```
 
-## Migreringer (eksisterende database)
+- `SUPABASE_ANON_KEY` is used for leaderboard, team detail, tournament lookup, and read-only DataGolf diagnostics. RLS limits it to `SELECT`.
+- `SUPABASE_SERVICE_ROLE_KEY` is necessary because RLS intentionally blocks anonymous writes. It is used only after admin login or by the server-side sync/import routines: Excel import/reset, team/player/roster administration, manual scores, player status overrides, penalty freezing/overrides, active tournament writes, and DataGolf score/status sync.
+- The service role key must exist only in local or deployed Streamlit secrets. The app never renders, logs, or sends it to browser code. Never commit `.streamlit/secrets.toml`.
 
-Kjør i Supabase SQL editor, i rekkefølge:
+## Missing-score rule
 
-1. `migrations/001_round_based_rosters.sql` – lagbytter etter cut
-2. `migrations/002_daily_comments.sql` – dagsrapport
-3. `migrations/003_sync_log.sql` – DataGolf sync-logg
-4. `migrations/005_app_settings.sql` + `006_app_settings_rls.sql` – persistent auto-sync
-5. `migrations/007_live_events.sql` – live hendelser på banen
-6. **`migrations/008_tournaments.sql`** – multi-turnering (bevarer eksisterende US Open-data)
+Each round has a configurable penalty: the highest official completed round score in the entire field plus `tournaments.missing_score_penalty` (default 2).
 
-## How to set up a new tournament
+- An admin freezes the penalty only when the round is finished and the official completed scores are final.
+- A frozen penalty is persisted in `tournament_rounds` and does not move with later feed changes.
+- A penalty requires an explicit `CUT`, `WD`, or `DQ`; missing or delayed DataGolf data alone never triggers it.
+- CUT preserves rounds 1–2 and applies from round 3.
+- WD/DQ preserves any official completed score. A missing score in the effective or later round can use the frozen penalty.
+- If fewer than five real scores exist, only the required counting places are filled. Four real scores use one penalty; three use two.
+- Team detail labels a penalty as `Straff (CUT)`, `Straff (WD)`, or `Straff (DQ)`.
+- Admin status and penalty overrides are append-only/audited in `admin_audit_log` and visible on the admin page.
 
-1. **Kjør migrering 008** hvis du ikke har `tournaments`-tabellen ennå. Eksisterende lag, spillere og scorer knyttes automatisk til `us-open-2026`.
+## Excel import
 
-2. **Opprett turnering** (hvis den ikke finnes fra mal):
-   - Gå til **Admin → Turnering**
-   - Velg mal (f.eks. `the-open-2026`) og klikk **Opprett turnering fra mal**
+The importer expects `data/The Open 2026 - Resultater.xlsx`, sheet `Ark1`:
 
-3. **Bytt aktiv turnering**:
-   - Velg turnering i nedtrekkslisten (f.eks. *The Open 2026 Kupongen*)
-   - Klikk **Bytt aktiv turnering**
+- the current The Open template: participant names on the first tier row from column C;
+- the legacy result layout is also accepted: rounds in B–E and team names on row 3 from G;
+- column A: `Tier N` headers and player names;
+- `X` in team columns marks selections;
+- every team must have exactly seven golfers.
 
-4. **Rediger innstillinger** (valgfritt):
-   - Visningstittel, DataGolf event name, bane, måned, premietekst
-   - Spillere per lag, teller/droppes per dag, post-cut runde, maks bytter
-   - Klikk **Lagre turneringsinnstillinger**
+Validate without a database connection or write:
 
-5. **Importer roster**:
-   - Legg Excel-fil i `data/` (f.eks. `The Open 2026 - Resultater.xlsx`) **eller** last opp fil
-   - Klikk **Importer Excel-roster for aktiv turnering**
-
-6. **Importer DataGolf-felt** (valgfritt):
-   - Klikk **Importer fullt DataGolf-felt for aktiv turnering**
-   - Sjekk at DataGolf event name matcher (f.eks. `The Open Championship`)
-
-7. **Sett opp laguttak** under **Admin → Laguttak** etter import.
-
-8. **Test sync** under **Admin → Scorer** med «Sync all scores from DataGolf now».
-
-### The Open 2026 (Royal Birkdale, July)
-
-Malen `the-open-2026` er forhåndsutfylt med:
-
-- Tittel: **The Open 2026 Kupongen**
-- DataGolf event: **The Open Championship**
-- Bane: **Royal Birkdale**
-- Samme regler som US Open (7 spillere, 5 teller, 2 droppes, 3 bytter etter cut)
-
-### Sikker tilbakestilling
-
-Under **Admin → Turnering** kan du tilbakestille **kun aktiv turnering** (andre turneringer i databasen påvirkes ikke):
-
-- **Reset scores only** – sletter scorer og live_events
-- **Reset rosters only** – sletter laguttak (`team_players`)
-- **Reset whole tournament** – sletter lag, spillere, scorer, kommentarer for aktiv turnering
-
-Skriv `BEKREFT` i bekreftelsesfeltet før du trykker reset.
-
-## Første import (legacy)
-
-Gå til Admin → Importer fra Excel og trykk importknappen. Appen leser standard Excel-fil for aktiv turnering i `data/` eller en opplastet fil.
-
-## Lagbytter etter dag 2
-
-Etter migrering 001 kan admin under **Laguttak**:
-
-- redigere originalt lag for Dag 1–2
-- bytte inntil 3 spillere for Dag 3–4 etter cut
-
-Leaderboard bruker originalt lag for Dag 1–2 og oppdatert lag for Dag 3–4.
-
-## Dagsrapport
-
-Admin → **Dagsrapport** genererer norsk fantasy-kompis-rapport (uten OpenAI) med valgbar tone: Saklig, Morsom, Frekk eller Brutal. Lagrede kommentarer vises som **Dagens kommentar** over leaderboard.
-
-## Tester
-
-```bash
-python test_rosters.py
-python test_live_events.py
-python test_tournament.py
-python test_app_settings.py
+```powershell
+python sample_data_loader.py --dry-run
 ```
 
-Test mot Supabase: `python test_app_settings_db.py`
+Import only after the production database and secrets are approved:
+
+```powershell
+python sample_data_loader.py
+```
+
+## Local start and tests
+
+```powershell
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+streamlit run app.py
+```
+
+DataGolf read-only test and write sync:
+
+```powershell
+python datagolf_sync.py --test
+python datagolf_sync.py --sync
+```
+
+The sync first requires an exact normalized match between the active tournament's `datagolf_event_name` and the event in the DataGolf response. A missing or different event aborts before any write. Player names support DataGolf's documented `Last, First` representation without fuzzy matching.
+
+## Live feed
+
+Fresh databases created from the current `schema.sql` already contain the live-feed tables. For the existing The Open production database created before this feature was added, run exactly one additive script in Supabase SQL Editor:
+
+1. `migrations/003_live_feed.sql`
+
+This migration does not change or delete tournaments, teams, players, rosters, or scores. The service-role sync stores a baseline for selected players, then creates an event only when `thru`, `today`, completion, or an explicit CUT/WD/DQ status changes. Repeated syncs are deduplicated by a database-enforced deterministic key. The public client can read the event list but cannot read sync state or write events.
+
+The leaderboard refreshes the latest 15 stored events every 30 seconds without a full page reload. DataGolf's in-play feed does not expose an official player hole-by-hole log, so the app only attributes a hole result when the player advances exactly one hole between consecutive snapshots. If a sync skips multiple holes, no individual-hole event is invented.
+
+For inline leaderboard team previews with live hole/status information, run this additive policy migration after `003_live_feed.sql`:
+
+1. `migrations/004_public_live_state.sql`
+
+It grants anon/authenticated users read-only access to the live snapshot table. Insert, update, and delete remain blocked; DataGolf continues to write with the server-only service role key.
+
+## Deployment
+
+Deploy the repository as a Streamlit app with `app.py` as the entry point. Add all five secrets in the host's secret manager. Do not place the service role key in source control, frontend configuration, screenshots, or logs.

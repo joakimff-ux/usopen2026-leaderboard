@@ -1,1117 +1,762 @@
+"""Fantasy golf competition app."""
+
 from __future__ import annotations
 
-import io
-import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from threading import Lock
 
 import pandas as pd
 import streamlit as st
-from supabase import create_client
 
-from lib import app_settings, datagolf_sync
-from lib.daily_report import TONES, generate_daily_report
-from lib.live_events import (
-    DISPLAY_EVENT_LIMIT,
-    build_live_events_display,
-    count_live_events,
-    fetch_recent_live_events,
+from supabase import Client
+
+from lib import (
+    auth,
+    datagolf_sync,
+    db,
+    excel_import,
+    leaderboard_preview,
+    live_feed,
+    participant_admin,
+    scoring,
+    styles,
 )
-from lib.tournament import TournamentConfig, load_active_tournament
-from lib.tournament_ui import render_tournament_setup
 
-logging.basicConfig(level=logging.INFO)
-logging.getLogger("lib.app_settings").setLevel(logging.INFO)
-
-DATA_DIR = Path(__file__).parent / "data"
-
-st.set_page_config(page_title="Fantasy Golf Kupongen", page_icon="⛳", layout="wide")
-
-st.markdown('''
-<style>
-.stApp {background: radial-gradient(circle at top left, rgba(183,242,100,.22), transparent 25rem), linear-gradient(135deg,#f8f6e8,#e9f4df 50%,#d5ead3);}
-.hero {padding:2rem 2.2rem;border-radius:28px;background:linear-gradient(120deg,#0b3d2e,#0f6b3d);color:white;box-shadow:0 18px 45px rgba(11,61,46,.22);margin-bottom:1.3rem;}
-.hero h1 {font-size:clamp(2.2rem,5vw,4.2rem);margin:0;letter-spacing:-.05em;}
-.hero p {font-size:1.05rem;color:#eafbd4;margin:.5rem 0 0 0;}
-.pill {display:inline-block;margin:.9rem .5rem 0 0;padding:.45rem .75rem;border-radius:999px;background:rgba(183,242,100,.16);border:1px solid rgba(183,242,100,.38);font-weight:800;}
-.card {padding:1rem 1.2rem;border-radius:22px;background:rgba(255,255,255,.74);border:1px solid rgba(11,61,46,.11);box-shadow:0 14px 35px rgba(20,70,40,.08);margin-bottom:1rem;}
-[data-testid="stMetric"] {background:rgba(255,255,255,.78);border:1px solid rgba(11,61,46,.11);padding:1rem;border-radius:18px;}
-.stButton button {border-radius:999px;background:linear-gradient(90deg,#0b3d2e,#0f6b3d)!important;color:white!important;font-weight:800;border:0;}
-</style>
-''', unsafe_allow_html=True)
+st.set_page_config(
+    page_title="The Open 2026 Kupongen",
+    page_icon="⛳",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 
-def get_secret(name: str, default: str = "") -> str:
-    """Read Streamlit secrets robustly. Accepts exact key names only."""
-    try:
-        value = st.secrets.get(name, default)
-        return str(value).strip() if value is not None else default
-    except Exception:
-        return default
-
-def get_any_secret(names: list[str], default: str = "") -> str:
-    for name in names:
-        value = get_secret(name, "")
-        if value:
-            return value
-    return default
+def default_excel_path(tournament: dict) -> Path:
+    return Path("data") / f"{tournament['name']} - Resultater.xlsx"
 
 
-@st.cache_resource(show_spinner=False)
-def supabase_client():
-    url = get_secret("SUPABASE_URL")
-    key = get_any_secret(["SUPABASE_ANON_KEY", "SUPABASE_KEY", "sb_publishable_key"])
-    if not url or not key:
-        return None
-    return create_client(url, key)
-
-
-sb = supabase_client()
-
-
-def get_cfg() -> TournamentConfig:
-    return st.session_state.get("tournament_config", TournamentConfig.legacy_defaults())
-
-
-def init_tournament_config() -> None:
-    st.session_state.tournament_config = load_active_tournament(sb)
-
-
-def default_excel_path() -> Path:
-    cfg = get_cfg()
-    filename = cfg.excel_default_path or "Resultater.xlsx"
-    return DATA_DIR / filename
-
-
-def require_db():
-    if sb is None:
-        st.error("Supabase er ikke konfigurert. Legg SUPABASE_URL og SUPABASE_ANON_KEY i .streamlit/secrets.toml.")
-        st.stop()
-
-
-def fetch_table(name: str) -> pd.DataFrame:
-    require_db()
-    cfg = get_cfg()
-    query = sb.table(name).select("*")
-    if cfg.uses_tournament_scope and cfg.id is not None and name in {
-        "teams",
-        "players",
-        "team_players",
-        "scores",
-        "daily_comments",
-    }:
-        query = query.eq("tournament_id", cfg.id)
-    res = query.execute()
-    return pd.DataFrame(res.data or [])
-
-
-def fetch_all() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    teams = fetch_table("teams")
-    players = fetch_table("players")
-    links = ensure_post_cut_rosters(fetch_table("team_players"))
-    scores = fetch_table("scores")
-    return teams, players, links, scores
-
-
-def links_have_round_ranges(links: pd.DataFrame) -> bool:
-    return (
-        not links.empty
-        and "active_from_round" in links.columns
-        and "active_to_round" in links.columns
+def render_active_tournament_info(tournament: dict) -> None:
+    st.markdown("### Active tournament")
+    st.write(f"**Name:** {tournament.get('name')}")
+    st.write(f"**Display title:** {db.tournament_display_title(tournament)}")
+    st.write(f"**DataGolf event:** {tournament.get('datagolf_event_name') or '—'}")
+    st.write(f"**Course:** {tournament.get('course_name') or '—'}")
+    if tournament.get("start_date") and tournament.get("end_date"):
+        st.write(f"**Dates:** {tournament['start_date']} – {tournament['end_date']}")
+    st.write(
+        f"**Rules:** {tournament.get('num_rounds', 4)} rounds, "
+        f"{tournament.get('counting_scores', 5)} counting, "
+        f"{tournament.get('dropped_scores', 2)} dropped per round"
     )
 
 
-def roster_period_for_round(round_no: int) -> tuple[int, int]:
-    return get_cfg().roster_period_for_round(round_no)
-
-
-def filter_team_roster(
-    links: pd.DataFrame,
-    team_id: int,
-    active_from_round: int,
-    active_to_round: int,
-) -> pd.DataFrame:
-    if links.empty:
-        return links
-    if links_have_round_ranges(links):
-        return links[
-            (links.team_id.astype(int) == team_id)
-            & (links.active_from_round.astype(int) == active_from_round)
-            & (links.active_to_round.astype(int) == active_to_round)
-        ]
-    return links[links.team_id.astype(int) == team_id]
-
-
-def get_team_player_ids(
-    links: pd.DataFrame,
-    team_id: int,
-    round_no: int,
-) -> set[int]:
-    active_from, active_to = roster_period_for_round(round_no)
-    team_links = filter_team_roster(links, team_id, active_from, active_to)
-    if team_links.empty:
-        return set()
-    return set(team_links.player_id.astype(int).tolist())
-
-
-def count_post_cut_swaps(original_ids: set[int], post_cut_ids: set[int]) -> int:
-    return len(original_ids - post_cut_ids)
-
-
-def describe_post_cut_swaps(
-    original_ids: set[int],
-    post_cut_ids: set[int],
-    players: pd.DataFrame,
-) -> tuple[int, list[str], list[str]]:
-    out_ids = original_ids - post_cut_ids
-    in_ids = post_cut_ids - original_ids
-    out_names = players[players.id.astype(int).isin(out_ids)].sort_values("name")["name"].tolist()
-    in_names = players[players.id.astype(int).isin(in_ids)].sort_values("name")["name"].tolist()
-    return len(out_ids), out_names, in_names
-
-
-def build_post_cut_swaps_display(
-    teams: pd.DataFrame,
-    players: pd.DataFrame,
-    links: pd.DataFrame,
-    leaderboard: pd.DataFrame,
-) -> list[dict[str, Any]]:
-    """Build swap summary rows sorted by leaderboard position."""
-    if not links_have_round_ranges(links) or teams.empty or players.empty:
-        return []
-
-    ranking = {
-        row["Lag"]: int(row["Plass"])
-        for _, row in leaderboard.iterrows()
-    } if not leaderboard.empty else {}
-
-    rows: list[dict[str, Any]] = []
-    for _, team in teams.iterrows():
-        team_id = int(team.id)
-        team_name = team["name"]
-        original_ids = get_team_player_ids(links, team_id, 1)
-        post_cut_ids = get_team_player_ids(links, team_id, 3)
-        swap_count, out_names, in_names = describe_post_cut_swaps(
-            original_ids,
-            post_cut_ids,
-            players,
-        )
-        if swap_count == 0:
-            continue
+def render_tournament_catalog(client: Client, active: dict | None) -> None:
+    tournaments = db.list_tournaments(client)
+    if not tournaments:
+        st.info("No tournaments found in the database.")
+        return
+    rows = []
+    for item in tournaments:
+        is_active = active is not None and item["id"] == active["id"]
         rows.append(
             {
-                "Plass": ranking.get(team_name, 9999),
-                "Lag": team_name,
-                "out_names": out_names,
-                "in_names": in_names,
-                "swap_count": swap_count,
+                "Active": "Yes" if is_active else "No",
+                "Name": item.get("name"),
+                "Year": item.get("year"),
+                "DataGolf event": item.get("datagolf_event_name") or "—",
+                "Course": item.get("course_name") or "—",
             }
         )
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    return sorted(rows, key=lambda row: row["Plass"])
+
+def format_score(value: int | None) -> str:
+    return "—" if value is None else str(value)
 
 
-def swap_rows_to_dataframe(swap_rows: list[dict[str, Any]]) -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {
-                "Lag": row["Lag"],
-                "Ut": ", ".join(row["out_names"]),
-                "Inn": ", ".join(row["in_names"]),
-                "Antall bytter": f"{row['swap_count']}/{get_cfg().max_swaps}",
-            }
-            for row in swap_rows
-        ]
+@st.cache_data(ttl=30, show_spinner=False)
+def load_competition_data(tournament_id: str, tournament_rules: dict):
+    client = db.get_supabase_client()
+    if client is None:
+        return None
+
+    teams = db.fetch_teams(client, tournament_id)
+    players = db.fetch_players(client, tournament_id)
+    team_players = db.fetch_team_players(client, tournament_id)
+    scores = db.fetch_scores(client, tournament_id)
+    status_events = db.fetch_player_status_events(client, tournament_id)
+    tournament_rounds = db.fetch_tournament_rounds(client, tournament_id)
+    try:
+        live_states = db.fetch_live_player_states(client, tournament_id)
+    except Exception:
+        live_states = []
+    standings = scoring.build_team_standings(
+        teams=teams,
+        players=players,
+        team_players=team_players,
+        scores=scores,
+        num_rounds=tournament_rules.get("num_rounds", 4),
+        counting_scores=tournament_rules.get("counting_scores", 5),
+        dropped_scores=tournament_rules.get("dropped_scores", 2),
+        player_status_events=status_events,
+        tournament_rounds=tournament_rounds,
     )
+    return {
+        "teams": teams,
+        "players": players,
+        "team_players": team_players,
+        "scores": scores,
+        "status_events": status_events,
+        "tournament_rounds": tournament_rounds,
+        "live_states": live_states,
+        "standings": standings,
+    }
 
 
-def render_post_cut_swaps_section(
-    teams: pd.DataFrame,
-    players: pd.DataFrame,
-    links: pd.DataFrame,
-    leaderboard: pd.DataFrame,
-) -> None:
-    st.subheader("Bytter etter dag 2")
-    swap_rows = build_post_cut_swaps_display(teams, players, links, leaderboard)
-    if not swap_rows:
-        st.info("Ingen lag har gjort bytter ennå.")
-        return
-
-    st.dataframe(
-        swap_rows_to_dataframe(swap_rows),
-        width="stretch",
-        hide_index=True,
-    )
-
-
-def prepare_laguttak_roster_state(
-    team_id: int,
-    original_names: list[str],
-    post_cut_names: list[str],
-    *,
-    force_reload: bool = False,
-) -> tuple[str, str]:
-    """Initialize roster widget state before multiselect widgets are created."""
-    prev_team_id = st.session_state.get("laguttak_team_id")
-    pre_key = f"original_roster_{team_id}"
-    post_key = f"post_cut_roster_{team_id}"
-    team_changed = prev_team_id != team_id
-
-    if team_changed:
-        if prev_team_id is not None:
-            for stale_key in (
-                f"original_roster_{prev_team_id}",
-                f"post_cut_roster_{prev_team_id}",
-                f"legacy_roster_{prev_team_id}",
-            ):
-                st.session_state.pop(stale_key, None)
-        st.session_state.laguttak_team_id = team_id
-
-    if team_changed or force_reload or pre_key not in st.session_state:
-        st.session_state[pre_key] = original_names
-    if team_changed or force_reload or post_key not in st.session_state:
-        st.session_state[post_key] = post_cut_names
-
-    return pre_key, post_key
-
-
-def teams_missing_post_cut_roster(links: pd.DataFrame) -> set[int]:
-    """Teams that have a pre-cut roster but no Dag 3-4 roster yet."""
-    if not links_have_round_ranges(links) or links.empty:
-        return set()
-
-    cfg = get_cfg()
-    pre_cut_teams = set(
-        links[
-            (links.active_from_round.astype(int) == cfg.pre_cut_from)
-            & (links.active_to_round.astype(int) == cfg.pre_cut_to)
-        ].team_id.astype(int).tolist()
-    )
-    post_cut_teams = set(
-        links[
-            (links.active_from_round.astype(int) == cfg.post_cut_from)
-            & (links.active_to_round.astype(int) == cfg.post_cut_to)
-        ].team_id.astype(int).tolist()
-    )
-    return pre_cut_teams - post_cut_teams
-
-
-def build_post_cut_seed_rows(links: pd.DataFrame) -> list[dict[str, int]]:
-    """Copy pre-cut rosters only for teams without any saved post-cut roster."""
-    if not links_have_round_ranges(links) or links.empty:
-        return []
-
-    missing_teams = teams_missing_post_cut_roster(links)
-    if not missing_teams:
-        return []
-
-    cfg = get_cfg()
-    pre_cut = links[
-        (links.active_from_round.astype(int) == cfg.pre_cut_from)
-        & (links.active_to_round.astype(int) == cfg.pre_cut_to)
-    ]
-    return [
-        {
-            "team_id": int(row.team_id),
-            "player_id": int(row.player_id),
-            "active_from_round": cfg.post_cut_from,
-            "active_to_round": cfg.post_cut_to,
-            **({"tournament_id": cfg.id} if cfg.id is not None else {}),
-        }
-        for _, row in pre_cut.iterrows()
-        if int(row.team_id) in missing_teams
-    ]
-
-
-def ensure_post_cut_rosters(links: pd.DataFrame) -> pd.DataFrame:
-    """Seed Dag 3-4 rosters only when a team has no post-cut roster saved yet."""
-    inserts = build_post_cut_seed_rows(links)
-    if not inserts:
-        return links
-
-    sb.table("team_players").upsert(
-        inserts,
-        on_conflict="team_id,player_id,active_from_round",
-    ).execute()
-    return fetch_table("team_players")
-
-
-def save_team_roster(
-    team_id: int,
-    player_ids: list[int],
-    active_from_round: int,
-    active_to_round: int,
-) -> None:
-    sb.table("team_players").delete().eq("team_id", team_id).eq(
-        "active_from_round", active_from_round
-    ).eq("active_to_round", active_to_round).execute()
-    if player_ids:
-        cfg = get_cfg()
-        rows = [
-            {
-                "team_id": team_id,
-                "player_id": pid,
-                "active_from_round": active_from_round,
-                "active_to_round": active_to_round,
-                **({"tournament_id": cfg.id} if cfg.id is not None else {}),
-            }
-            for pid in player_ids
-        ]
-        sb.table("team_players").insert(rows).execute()
-
-
-def clear_cache():
-    st.cache_data.clear()
-
-
-AUTO_SYNC_INTERVAL_MS = 300_000
+def clear_data_cache() -> None:
+    load_competition_data.clear()
 
 
 def init_sync_state() -> None:
-    if "last_datagolf_sync_attempt_at" not in st.session_state:
-        st.session_state.last_datagolf_sync_attempt_at = None
+    if "auto_sync_enabled" not in st.session_state:
+        st.session_state.auto_sync_enabled = True
     if "datagolf_sync_status" not in st.session_state:
         st.session_state.datagolf_sync_status = None
-    if "daily_report_draft" not in st.session_state:
-        st.session_state.daily_report_draft = ""
-    if "daily_report_title" not in st.session_state:
-        st.session_state.daily_report_title = ""
-
-
-def is_auto_sync_enabled() -> bool:
-    result = app_settings.get_auto_sync_setting(sb)
-    if result.error:
-        st.session_state.auto_sync_read_error = result.error
-        return False
-    st.session_state.pop("auto_sync_read_error", None)
-    return app_settings.parse_bool(result.value)
-
-
-def ensure_auto_sync_checkbox_initialized() -> None:
-    if "datagolf_auto_sync_checkbox" not in st.session_state:
-        result = app_settings.get_auto_sync_setting(sb)
-        if result.error:
-            st.session_state.auto_sync_read_error = result.error
-            st.session_state.datagolf_auto_sync_checkbox = False
-        else:
-            st.session_state.datagolf_auto_sync_checkbox = app_settings.parse_bool(result.value)
-
-
-def persist_auto_sync_enabled() -> None:
-    enabled = bool(st.session_state.get("datagolf_auto_sync_checkbox", False))
-    result = app_settings.save_auto_sync_setting(sb, enabled)
-    if not result.ok:
-        st.session_state.auto_sync_save_error = result.error or "Ukjent Supabase-feil ved lagring av auto-sync."
-        st.session_state.auto_sync_probe = app_settings.probe_app_settings(sb)
-
-
-def render_app_settings_diagnostics() -> None:
-    with st.expander("Debug: app_settings i Supabase", expanded=bool(st.session_state.get("auto_sync_save_error"))):
-        if st.button("Kjør select/upsert-test", key="probe_app_settings"):
-            st.session_state.auto_sync_probe = app_settings.probe_app_settings(sb)
-
-        read_result = app_settings.get_auto_sync_setting(sb)
-        st.write("**get_auto_sync_setting()**")
-        if read_result.error:
-            st.error(read_result.error)
-        elif read_result.value is None:
-            st.info("Ingen rad for auto_sync_enabled ennå.")
-        else:
-            st.success(f"value={read_result.value!r} → enabled={app_settings.parse_bool(read_result.value)}")
-
-        probe = st.session_state.get("auto_sync_probe")
-        if probe is not None:
-            st.write("**select * from app_settings**")
-            if probe.select_ok:
-                st.success(f"OK ({len(probe.select_rows or [])} rader): {probe.select_rows}")
-            else:
-                st.error(probe.select_error or "Select feilet.")
-            st.write("**upsert auto_sync_enabled=true**")
-            if probe.upsert_ok:
-                st.success("OK")
-            else:
-                st.error(probe.upsert_error or "Upsert feilet.")
-                if probe.upsert_error and "42501" in probe.upsert_error:
-                    st.caption(
-                        "RLS-policy mangler. Kjør migrations/006_app_settings_rls.sql i Supabase SQL editor."
-                    )
-
-
-def render_auto_sync_status_label() -> None:
-    auto_sync_suspended = datagolf_sync.is_auto_sync_suspended(sb)
-    if is_auto_sync_enabled():
-        if auto_sync_suspended:
-            st.warning("Auto-sync aktiv (midlertidig pauset pga. DataGolf rate limit)")
-        else:
-            st.success("Auto-sync aktiv")
-    else:
-        st.info("Auto-sync av")
-
-
-def get_sync_secrets() -> dict[str, str]:
-    return {
-        "SUPABASE_URL": get_secret("SUPABASE_URL"),
-        "SUPABASE_ANON_KEY": get_any_secret(["SUPABASE_ANON_KEY", "SUPABASE_KEY", "sb_publishable_key"]),
-        "DATA_GOLF_API_KEY": get_secret("DATA_GOLF_API_KEY"),
-    }
+    if "datagolf_diagnostic_result" not in st.session_state:
+        st.session_state.datagolf_diagnostic_result = None
 
 
 def format_sync_timestamp(value: datetime | None) -> str:
     if value is None:
-        return "Aldri"
+        return "Never"
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
-def perform_live_sync(use_backoff: bool = True) -> datagolf_sync.SyncResult:
-    result = datagolf_sync.execute_sync(
-        sb,
-        get_sync_secrets(),
-        use_backoff=use_backoff,
-        tournament_config=get_cfg(),
-    )
-    st.session_state.datagolf_sync_status = result
-    st.session_state.last_datagolf_sync_attempt_at = result.synced_at
+def get_app_secrets() -> dict[str, str]:
+    return {
+        "SUPABASE_URL": st.secrets.get("SUPABASE_URL", ""),
+        "SUPABASE_ANON_KEY": st.secrets.get("SUPABASE_ANON_KEY", ""),
+        "SUPABASE_SERVICE_ROLE_KEY": st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", ""),
+        "DATA_GOLF_API_KEY": st.secrets.get("DATA_GOLF_API_KEY", ""),
+    }
+
+
+def perform_datagolf_test() -> datagolf_sync.DataGolfDiagnosticResult:
+    result = datagolf_sync.execute_datagolf_diagnostic(get_app_secrets())
+    st.session_state.datagolf_diagnostic_result = result
     return result
 
 
-def get_last_sync_attempt_time() -> datetime | None:
-    session_ts = st.session_state.get("last_datagolf_sync_attempt_at")
-    if session_ts is not None:
-        return session_ts
-    return datagolf_sync.get_last_sync_attempt(sb)
+def render_datagolf_diagnostics_panel(
+    tournament: dict,
+    diagnostic: datagolf_sync.DataGolfDiagnosticResult | None,
+    last_sync: datagolf_sync.SyncResult | None,
+) -> None:
+    st.subheader("DataGolf diagnostics")
+    st.caption("Read-only check against the live in-play feed. No scores are saved.")
+
+    st.markdown("**Active tournament**")
+    st.write(f"- Name: `{tournament.get('name')}`")
+    st.write(f"- Display title: `{db.tournament_display_title(tournament)}`")
+    st.write(f"- DataGolf event name: `{tournament.get('datagolf_event_name') or '—'}`")
+    st.write(f"- Tournament ID: `{tournament['id']}`")
+
+    st.divider()
+    st.markdown("**Last score sync (writes to database)**")
+    if last_sync is None:
+        st.info("No score sync has been run in this session.")
+    else:
+        st.write(f"- Time: {format_sync_timestamp(last_sync.synced_at)}")
+        st.write(f"- Status: {'Success' if last_sync.success else 'Failed'}")
+        if last_sync.event_name:
+            st.write(f"- DataGolf event: `{last_sync.event_name}`")
+        if last_sync.error:
+            st.error(last_sync.error)
+
+    st.divider()
+    if st.button("Test DataGolf", type="primary", key="test_datagolf_feed"):
+        with st.spinner("Fetching live DataGolf feed (no database writes)..."):
+            perform_datagolf_test()
+        st.rerun()
+
+    if diagnostic is None:
+        st.caption("Click **Test DataGolf** to run a live feed check.")
+        return
+
+    st.markdown("**Latest diagnostic test**")
+    st.write(f"- Checked at: {format_sync_timestamp(diagnostic.checked_at)}")
+    st.write(f"- DataGolf event received: `{diagnostic.datagolf_event_name or '—'}`")
+    st.write(f"- Event matches active tournament: **{'Yes' if diagnostic.event_found else 'No'}**")
+
+    if diagnostic.error:
+        st.error(diagnostic.error)
+    elif diagnostic.event_found:
+        st.success(
+            f"DataGolf feed matches expected event "
+            f"('{diagnostic.expected_event_name or diagnostic.datagolf_event_name}')."
+        )
+
+    if diagnostic.warning:
+        st.warning(diagnostic.warning)
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Players in feed", diagnostic.players_received)
+    col2.metric("Players with scores", diagnostic.players_with_scores)
+    col3.metric("Matched in DB", diagnostic.matched_count)
+    col4.metric("Unmatched", diagnostic.unmatched_count)
+    st.caption(f"Players in database for active tournament: {diagnostic.db_players_count}")
+
+    if diagnostic.current_round is not None:
+        st.caption(f"DataGolf current round: {diagnostic.current_round}")
+
+    if diagnostic.matched_players:
+        with st.expander(f"Matched players ({diagnostic.matched_count})", expanded=False):
+            for name in diagnostic.matched_players:
+                st.write(name)
+
+    if diagnostic.unmatched_players:
+        with st.expander(f"Unmatched players ({diagnostic.unmatched_count})", expanded=True):
+            for name in diagnostic.unmatched_players:
+                st.write(name)
 
 
-def maybe_run_auto_sync() -> None:
-    if sb is None or not is_auto_sync_enabled():
-        return
-    if datagolf_sync.is_auto_sync_suspended(sb):
-        return
-    last_attempt = get_last_sync_attempt_time()
-    if not datagolf_sync.is_auto_sync_due(sb, last_attempt=last_attempt):
-        return
-    result = perform_live_sync(use_backoff=False)
+def perform_live_sync() -> datagolf_sync.SyncResult:
+    result = datagolf_sync.execute_sync(get_app_secrets())
+    st.session_state.datagolf_sync_status = result
     if result.success:
-        clear_cache()
+        clear_data_cache()
+    return result
 
 
-def setup_auto_refresh() -> None:
-    if not is_auto_sync_enabled():
-        return
-    from streamlit_autorefresh import st_autorefresh
-
-    st_autorefresh(interval=AUTO_SYNC_INTERVAL_MS, key="datagolf_auto_refresh")
-    maybe_run_auto_sync()
+@st.cache_resource
+def sync_coordinator() -> dict:
+    """Coordinate public sessions so one app process performs one due sync."""
+    return {"lock": Lock(), "last_attempt": None}
 
 
-def render_datagolf_sync_status(result: datagolf_sync.SyncResult | None) -> None:
-    last_success = datagolf_sync.get_last_successful_sync(sb)
-    auto_sync_suspended = datagolf_sync.is_auto_sync_suspended(sb)
+def perform_live_sync_if_due() -> datagolf_sync.SyncResult | None:
+    coordinator = sync_coordinator()
+    now = datetime.now(timezone.utc)
+    with coordinator["lock"]:
+        last_attempt = coordinator["last_attempt"]
+        if last_attempt is not None and now - last_attempt < timedelta(minutes=4, seconds=30):
+            return None
+        coordinator["last_attempt"] = now
+    return perform_live_sync()
 
-    if result is not None:
-        last_success = result.last_successful_sync or last_success
-        auto_sync_suspended = result.auto_sync_suspended or auto_sync_suspended
 
-    st.metric("Sist vellykket synk", format_sync_timestamp(last_success))
+def render_datagolf_sync_status(result: datagolf_sync.SyncResult | None, tournament: dict | None) -> None:
+    if tournament is not None:
+        expected = tournament.get("datagolf_event_name") or "—"
+        st.caption(f"Active tournament: {db.tournament_display_title(tournament)}")
+        st.caption(f"Expected DataGolf event: {expected}")
 
     if result is None:
-        st.info("Ingen synkronisering kjørt ennå. Klikk knappen over for å hente scorer fra DataGolf.")
-        if auto_sync_suspended:
-            st.warning(
-                "Auto-sync er midlertidig deaktivert etter 3 påfølgende HTTP 429-svar fra DataGolf."
-            )
+        label = tournament.get("datagolf_event_name") if tournament else "the active tournament"
+        st.info(f"No sync has been run yet. Click the button above to fetch scores from DataGolf ({label}).")
         return
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Siste forsøk", format_sync_timestamp(result.synced_at))
-    c2.metric("Scorer oppdatert", result.scores_written)
-    c3.metric("Matchede spillere", len(result.matched_players))
+    status_label = "Success" if result.success else "Failed"
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Last sync", format_sync_timestamp(result.synced_at))
+    col2.metric("Scores updated", result.scores_written)
+    col3.metric("Matched players", len(result.matched_players))
+    col4.metric("Unmatched players", len(result.unmatched_players))
 
-    live_written = getattr(result, "live_events_written", 0)
-    live_detected = getattr(result, "score_changes_detected", 0)
-    if live_detected or live_written:
-        st.caption(
-            f"Live hendelser: {live_detected} scoreendringer funnet, {live_written} lagret i live_events."
-        )
-    live_events_error = getattr(result, "live_events_error", None)
-    if live_events_error:
-        st.error(f"live_events-feil: {live_events_error}")
-
+    st.caption(f"Status: {status_label}")
     if result.event_name:
-        st.caption(f"DataGolf-turnering: {result.event_name}")
-    if result.retry_count:
-        st.caption(f"DataGolf-forsøk i siste sync: {result.retry_count}")
-    if auto_sync_suspended:
-        st.warning(
-            "Auto-sync er midlertidig deaktivert etter 3 påfølgende HTTP 429-svar fra DataGolf. "
-            "Kjør manuell sync når API-et svarer igjen."
-        )
+        st.caption(f"DataGolf event received: {result.event_name}")
+    if result.expected_event_name:
+        st.caption(f"DataGolf event expected: {result.expected_event_name}")
     if result.warning:
         st.warning(result.warning)
-    elif result.error:
-        st.error(f"API-feil: {result.error}")
+
+    if result.error:
+        st.error(f"API error: {result.error}")
+
     if result.matched_players:
-        with st.expander(f"Matchede spillere ({len(result.matched_players)})"):
+        with st.expander(f"Matched players ({len(result.matched_players)})", expanded=False):
             for name in result.matched_players:
                 st.write(name)
+
     if result.unmatched_players:
-        with st.expander(f"Umatchede spillere ({len(result.unmatched_players)})"):
+        with st.expander(f"Unmatched players ({len(result.unmatched_players)})", expanded=True):
             for name in result.unmatched_players:
                 st.write(name)
 
 
-def render_field_import_result(result: datagolf_sync.FieldImportResult) -> None:
-    if result.event_name:
-        st.caption(f"DataGolf-turnering: {result.event_name}")
-    if result.error:
-        st.error(result.error)
+def render_sync_status(tournament: dict | None) -> None:
+    render_datagolf_sync_status(st.session_state.get("datagolf_sync_status"), tournament)
+
+
+@st.fragment(run_every=timedelta(seconds=30))
+def live_feed_fragment(tournament_id: str) -> None:
+    """Refresh the stored feed without requiring a full page reload."""
+    client = db.get_supabase_client()
+    if client is None:
         return
-    if not result.success:
-        st.error("Import av startliste feilet.")
-        return
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Spillere i startliste", result.field_count)
-    c2.metric("Fant fra før", result.existing_count)
-    c3.metric("Nye spillere lagt til", result.added_count)
-
-    if result.new_players:
-        with st.expander(f"Nye spillere ({len(result.new_players)})"):
-            for name in result.new_players:
-                st.write(name)
-    if result.ambiguous_names:
-        with st.expander(f"Tvetydige / ikke importerte ({len(result.ambiguous_names)})"):
-            for name in result.ambiguous_names:
-                st.write(name)
-
-def parse_excel(file_bytes: bytes | None = None) -> tuple[pd.DataFrame, list[str]]:
-    source = io.BytesIO(file_bytes) if file_bytes else default_excel_path()
-    raw = pd.read_excel(source, sheet_name=0, header=None, engine="openpyxl")
-    header_row = 2
-    teams = [str(x).strip() for x in raw.iloc[header_row, 6:].tolist() if pd.notna(x) and str(x).strip()]
-    rows = []
-    tier = None
-    for r in range(header_row + 1, len(raw)):
-        player = raw.iat[r, 0] if 0 < raw.shape[1] else None
-        if pd.isna(player) or not str(player).strip():
-            continue
-        txt = str(player).strip()
-        if txt.lower().startswith("tier"):
-            tier = txt
-            continue
-        row = {"name": txt, "tier": tier}
-        for offset, team in enumerate(teams, start=6):
-            marker = raw.iat[r, offset] if offset < raw.shape[1] else None
-            row[team] = str(marker).strip().upper() == "X" if pd.notna(marker) else False
-        rows.append(row)
-    return pd.DataFrame(rows), teams
-
-
-def import_excel_to_supabase(file_bytes: bytes | None = None):
-    require_db()
-    cfg = get_cfg()
-    players_df, teams = parse_excel(file_bytes)
-    for team in teams:
-        payload = {"name": team}
-        if cfg.id is not None:
-            payload["tournament_id"] = int(cfg.id)
-            sb.table("teams").upsert(payload, on_conflict="tournament_id,name").execute()
-        else:
-            sb.table("teams").upsert(payload, on_conflict="name").execute()
-    for _, row in players_df.iterrows():
-        payload = {"name": row["name"], "tier": row.get("tier")}
-        if cfg.id is not None:
-            payload["tournament_id"] = int(cfg.id)
-            sb.table("players").upsert(payload, on_conflict="tournament_id,name").execute()
-        else:
-            sb.table("players").upsert(payload, on_conflict="name").execute()
-    teams_db = fetch_table("teams")
-    players_db = fetch_table("players")
-    team_id = dict(zip(teams_db["name"], teams_db["id"])) if not teams_db.empty else {}
-    player_id = dict(zip(players_db["name"], players_db["id"])) if not players_db.empty else {}
-    links = []
-    for _, row in players_df.iterrows():
-        for team in teams:
-            if bool(row.get(team)) and team in team_id and row["name"] in player_id:
-                pid = int(player_id[row["name"]])
-                tid = int(team_id[team])
-                base = {"team_id": tid, "player_id": pid}
-                if cfg.id is not None:
-                    base["tournament_id"] = int(cfg.id)
-                links.append(
-                    {
-                        **base,
-                        "active_from_round": cfg.pre_cut_from,
-                        "active_to_round": cfg.pre_cut_to,
-                    }
-                )
-                links.append(
-                    {
-                        **base,
-                        "active_from_round": cfg.post_cut_from,
-                        "active_to_round": cfg.post_cut_to,
-                    }
-                )
-    if links:
-        sb.table("team_players").upsert(links, on_conflict="team_id,player_id,active_from_round").execute()
-
-
-def fmt_score(x):
-    if pd.isna(x): return ""
-    x = int(x)
-    return "E" if x == 0 else (f"{x:+d}" if x > 0 else str(x))
-
-
-def score_round_for_team(
-    team_name: str,
-    round_no: int,
-    day: str,
-    player_scores: list[dict[str, Any]],
-    roster_label: str,
-) -> tuple[int | None, list[dict[str, Any]]]:
-    """Pick the lowest counting round scores when enough roster players have scores."""
-    cfg = get_cfg()
-    counting_scores = cfg.counting_scores_per_day
-    frame = pd.DataFrame(player_scores)
-    scored = frame.dropna(subset=["Score"]).sort_values("Score", ascending=True)
-    counting = scored.head(counting_scores)
-    dropped = scored.iloc[counting_scores:]
-    enough_scores = len(scored) >= counting_scores
-    team_score = int(counting["Score"].sum()) if enough_scores and not counting.empty else None
-
-    detail_rows: list[dict[str, Any]] = []
-    for rank, (_, row) in enumerate(counting.iterrows(), 1):
-        detail_rows.append(
-            {
-                "Lag": team_name,
-                "Dag": day,
-                "Runde": round_no,
-                "Spiller": row["Spiller"],
-                "Score": int(row["Score"]),
-                "Lagtype": roster_label,
-                "Rang": rank,
-                "Teller": "✅ Teller",
-                "Status": "counted",
-            }
-        )
-    for _, row in dropped.iterrows():
-        detail_rows.append(
-            {
-                "Lag": team_name,
-                "Dag": day,
-                "Runde": round_no,
-                "Spiller": row["Spiller"],
-                "Score": int(row["Score"]),
-                "Lagtype": roster_label,
-                "Rang": None,
-                "Teller": "❌ Droppes",
-                "Status": "dropped",
-            }
-        )
-    for _, row in frame[frame["Score"].isna()].iterrows():
-        detail_rows.append(
-            {
-                "Lag": team_name,
-                "Dag": day,
-                "Runde": round_no,
-                "Spiller": row["Spiller"],
-                "Score": None,
-                "Lagtype": roster_label,
-                "Rang": None,
-                "Teller": "Mangler score",
-                "Status": "missing",
-            }
-        )
-    return team_score, detail_rows
-
-
-def collect_team_round_player_scores(
-    team_id: int,
-    round_no: int,
-    players: pd.DataFrame,
-    links: pd.DataFrame,
-    score_map: dict[tuple[int, int], int],
-) -> list[dict[str, Any]]:
-    picked_ids = get_team_player_ids(links, team_id, round_no)
-    picked = players[players.id.astype(int).isin(picked_ids)].sort_values("name")
-    return [
-        {
-            "Spiller": p["name"],
-            "Score": score_map.get((int(p.id), round_no)),
-        }
-        for _, p in picked.iterrows()
-    ]
-
-
-def build_score_map(scores: pd.DataFrame) -> dict[tuple[int, int], int]:
-    if scores.empty:
-        return {}
-    return {
-        (int(row.player_id), int(row.round_no)): int(row.score)
-        for _, row in scores.iterrows()
-    }
-
-
-def render_live_events_section(
-    teams: pd.DataFrame,
-    players: pd.DataFrame,
-    links: pd.DataFrame,
-    scores: pd.DataFrame,
-) -> None:
-    st.subheader("Live hendelser på banen")
-    events = fetch_recent_live_events(sb, limit=DISPLAY_EVENT_LIMIT, tournament_id=get_cfg().id)
-    score_map = build_score_map(scores)
-    display = build_live_events_display(
-        events,
-        teams,
-        players,
-        links,
-        score_map,
-        get_team_player_ids=get_team_player_ids,
-        limit=DISPLAY_EVENT_LIMIT,
-    )
-    if display.empty:
-        st.info("Ingen nye scoreendringer siden siste oppdatering.")
-        return
-    st.dataframe(display, width="stretch", hide_index=True)
-
-
-def rounds_with_scores(scores: pd.DataFrame) -> set[int]:
-    if scores.empty or "round_no" not in scores.columns:
-        return set()
-    return {int(value) for value in scores["round_no"].dropna().unique()}
-
-
-def score_counts_by_round(scores: pd.DataFrame) -> list[tuple[int, int]]:
-    if scores.empty or "round_no" not in scores.columns:
-        return []
-    counts = scores.groupby("round_no").size().sort_index()
-    return [(int(rnd), int(count)) for rnd, count in counts.items()]
-
-
-def describe_leaderboard_round_detection(
-    scores: pd.DataFrame,
-    leaderboard: pd.DataFrame,
-    details: pd.DataFrame,
-) -> dict[str, Any]:
-    started_rounds = sorted(rounds_with_scores(scores))
-    completed_round = get_highest_scored_round_from_details(details)
-    next_active = get_next_active_round(scores, details)
-    visible = prepare_leaderboard_display(leaderboard, scores)
-    visible_days = [column for column in visible.columns if column in get_cfg().days_list]
-    teams_with_day_totals = {
-        day: int(leaderboard[day].notna().sum())
-        for day in visible_days
-        if day in leaderboard.columns
-    }
-    return {
-        "started_rounds": started_rounds,
-        "completed_round": completed_round,
-        "next_active_round": next_active,
-        "visible_days": visible_days,
-        "teams_with_day_totals": teams_with_day_totals,
-    }
-
-
-def render_score_round_debug(
-    scores: pd.DataFrame,
-    leaderboard: pd.DataFrame,
-    details: pd.DataFrame,
-) -> None:
-    st.divider()
-    st.subheader("Debug: Runder i scores")
-    st.caption("Verifiser at Supabase har Dag 3-data og at leaderboard-logikken oppdager den.")
-
-    round_counts = score_counts_by_round(scores)
-    if not round_counts:
-        st.info("Ingen scorer i scores-tabellen.")
-    else:
-        for round_no, count in round_counts:
-            st.write(f"Round {round_no}: {count} scores")
-
-    detection = describe_leaderboard_round_detection(scores, leaderboard, details)
-    st.markdown("**Leaderboard-logikk oppdager nå:**")
-    started = detection["started_rounds"]
-    st.write(
-        f"- Runder med score i databasen: "
-        f"{', '.join(f'Round {r}' for r in started) if started else 'ingen'}"
-    )
-    st.write(f"- Høyest fullførte runde (lag har dagscore): Dag {detection['completed_round'] or 'ingen'}")
-    st.write(f"- Neste aktive runde: Dag {detection['next_active_round']}")
-    visible = detection["visible_days"]
-    st.write(f"- Synlige dagkolonner i leaderboard: {', '.join(visible) if visible else 'ingen'}")
-    if detection["teams_with_day_totals"]:
-        totals_lines = [
-            f"{day}: {count} lag med komplett score"
-            for day, count in detection["teams_with_day_totals"].items()
-        ]
-        st.write(f"- Lag med dagscore: {' · '.join(totals_lines)}")
-
-    st.divider()
-    st.markdown("**Debug: live_events**")
-    live_count = count_live_events(sb, tournament_id=get_cfg().id)
-    st.write(f"- Antall live_events i databasen: {live_count}")
-    recent_events = fetch_recent_live_events(sb, limit=5, tournament_id=get_cfg().id)
-    if recent_events.empty:
-        st.write("- Siste 5 hendelser: ingen")
-    else:
-        st.write("- Siste 5 hendelser:")
-        st.dataframe(
-            recent_events[
-                ["player_name", "round_no", "old_score", "new_score", "change", "event_text", "created_at"]
-            ],
-            width="stretch",
-            hide_index=True,
-        )
-
-    sync_status = st.session_state.get("datagolf_sync_status")
-    if sync_status is None:
-        st.write("- Siste sync: ingen sync kjørt i denne økten")
-    else:
-        st.write(
-            f"- Siste sync: endrede scorer funnet={getattr(sync_status, 'score_changes_detected', 0)}, "
-            f"live_events skrevet={getattr(sync_status, 'live_events_written', 0)}"
-        )
-        sync_events_error = getattr(sync_status, "live_events_error", None)
-        if sync_events_error:
-            st.error(f"live_events-feil ved siste sync: {sync_events_error}")
-
-
-def prepare_leaderboard_display(leaderboard: pd.DataFrame, scores: pd.DataFrame) -> pd.DataFrame:
-    """Show day columns once that round has started in scores, or any team has a day total."""
-    if leaderboard.empty:
-        return leaderboard
-
-    started_rounds = rounds_with_scores(scores)
-    cfg = get_cfg()
-    visible_days = [
-        day
-        for rnd, day in zip(cfg.rounds_list, cfg.days_list)
-        if day in leaderboard.columns
-        and (rnd in started_rounds or leaderboard[day].notna().any())
-    ]
-    columns = ["Plass", "Lag", *visible_days, "Totalt"]
-    return leaderboard[columns]
-
-
-def get_highest_scored_round_from_details(details: pd.DataFrame) -> int:
-    highest = 0
-    if details.empty:
-        return highest
-    cfg = get_cfg()
-    for rnd, day in zip(cfg.rounds_list, cfg.days_list):
-        if not details[details["Dag"] == day].dropna(subset=["Score"]).empty:
-            highest = rnd
-    return highest
-
-
-def get_global_highest_scored_round(details: pd.DataFrame) -> int:
-    return get_highest_scored_round_from_details(details)
-
-
-def get_next_active_round(scores: pd.DataFrame, details: pd.DataFrame) -> int:
-    completed = get_highest_scored_round_from_details(details)
-    started = rounds_with_scores(scores)
-    if started and max(started) > completed:
-        return max(started)
-    return min(completed + 1, get_cfg().rounds)
-
-
-def team_scored_rounds(details: pd.DataFrame, team: str) -> set[int]:
-    if details.empty or "Lag" not in details.columns:
-        return set()
-    team_details = details[details["Lag"] == team]
-    scored_rounds: set[int] = set()
-    cfg = get_cfg()
-    for rnd, day in zip(cfg.rounds_list, cfg.days_list):
-        if not team_details[team_details["Dag"] == day].dropna(subset=["Score"]).empty:
-            scored_rounds.add(rnd)
-    return scored_rounds
-
-
-def ordered_round_days_with_scores(
-    details: pd.DataFrame,
-    team: str,
-    scores: pd.DataFrame,
-) -> list[tuple[int, str]]:
-    """Show next active round first, then prior rounds with scores (newest first)."""
-    next_active = get_next_active_round(scores, details)
-    scored_rounds = team_scored_rounds(details, team)
-    completed_global = get_highest_scored_round_from_details(details)
-
-    ordered: list[tuple[int, str]] = [(next_active, get_cfg().days_list[next_active - 1])]
-    for rnd in range(completed_global, 0, -1):
-        if rnd == next_active or rnd not in scored_rounds:
-            continue
-        ordered.append((rnd, get_cfg().days_list[rnd - 1]))
-    return ordered
-
-
-def build_model(teams: pd.DataFrame, players: pd.DataFrame, links: pd.DataFrame, scores: pd.DataFrame):
-    if teams.empty or players.empty:
-        return pd.DataFrame(), pd.DataFrame()
-    score_map = {}
-    if not scores.empty:
-        for _, s in scores.iterrows():
-            score_map[(int(s.player_id), int(s.round_no))] = int(s.score)
-    detail = []
-    summary = []
-    for _, t in teams.sort_values("name").iterrows():
-        team_id = int(t.id)
-        team_name = t["name"]
-        total = 0
-        row = {"Lag": team_name}
-        cfg = get_cfg()
-        for rnd, day in zip(cfg.rounds_list, cfg.days_list):
-            player_scores = collect_team_round_player_scores(
-                team_id, rnd, players, links, score_map
-            )
-            day_sum, round_detail = score_round_for_team(
-                team_name,
-                rnd,
-                day,
-                player_scores,
-                cfg.roster_labels[rnd],
-            )
-            row[day] = day_sum
-            if day_sum is not None:
-                total += int(day_sum)
-            detail.extend(round_detail)
-        row["Totalt"] = total
-        summary.append(row)
-    leaderboard = pd.DataFrame(summary)
-    if not leaderboard.empty:
-        leaderboard = leaderboard.sort_values("Totalt", ascending=True).reset_index(drop=True)
-        leaderboard.insert(0, "Plass", range(1, len(leaderboard) + 1))
-    details = pd.DataFrame(detail)
-    return leaderboard, details
-
-
-def fetch_latest_daily_comment() -> dict | None:
     try:
-        cfg = get_cfg()
-        query = sb.table("daily_comments").select("*")
-        if cfg.uses_tournament_scope and cfg.id is not None:
-            query = query.eq("tournament_id", cfg.id)
-        response = query.order("updated_at", desc=True).limit(1).execute()
-        return response.data[0] if response.data else None
+        events = db.fetch_live_feed_events(client, tournament_id, limit=15)
+        roster_rows = db.fetch_team_players(client, tournament_id)
     except Exception:
-        return None
+        styles.render_live_feed([], {})
+        st.caption("Livefeeden aktiveres når live-feed-skjemaet er installert i Supabase.")
+        return
+
+    affected_teams = live_feed.group_affected_teams(roster_rows)
+    styles.render_live_feed(events, affected_teams)
 
 
-def save_daily_comment(round_no: int, title: str, body: str) -> None:
-    now = datetime.now(timezone.utc).isoformat()
-    cfg = get_cfg()
-    payload = {
-        "round_no": int(round_no),
-        "title": title.strip(),
-        "body": body.strip(),
-        "updated_at": now,
-    }
-    if cfg.id is not None:
-        payload["tournament_id"] = int(cfg.id)
-        sb.table("daily_comments").upsert(payload, on_conflict="tournament_id,round_no").execute()
-    else:
-        sb.table("daily_comments").upsert(payload, on_conflict="round_no").execute()
-
-
-def copy_text_to_clipboard(text: str) -> None:
-    import json
-
-    import streamlit.components.v1 as components
-
-    components.html(
-        f"""<script>
-        navigator.clipboard.writeText({json.dumps(text)});
-        </script>""",
-        height=0,
-    )
-
-
-def admin_login():
-    configured = get_any_secret(["ADMIN_PASSWORD", "admin_password"])
-    if not configured:
-        st.sidebar.warning("Admin-passord mangler i .streamlit/secrets.toml")
-        return False
-    pw = st.sidebar.text_input("Admin-passord", type="password")
-    ok = pw == configured
-    if pw and not ok:
-        st.sidebar.error("Feil passord")
-    return ok
-
-
-def render_hero() -> None:
-    cfg = get_cfg()
-    pills = "".join(f'<span class="pill">{text}</span>' for text in cfg.rule_pills())
-    subtitle = "Fantasy golf med live leaderboard."
-    if cfg.course_name and cfg.month_label:
-        subtitle = f"{cfg.course_name} · {cfg.month_label} · {subtitle}"
-    elif cfg.course_name:
-        subtitle = f"{cfg.course_name} · {subtitle}"
-    st.markdown(
-        f'''
-<div class="hero">
-  <h1>⛳ {cfg.display_title}</h1>
-  <p>{subtitle}</p>
-  {pills}
-</div>
-''',
-        unsafe_allow_html=True,
-    )
-
-
-render_hero()
-
-init_tournament_config()
-init_sync_state()
-setup_auto_refresh()
-
-with st.sidebar:
-    mode = st.radio("Modus", ["Deltakervisning", "Admin"])
-    cfg_sidebar = get_cfg()
-    st.caption(
-        f"Regel: {cfg_sidebar.number_of_players_per_team} spillere totalt, "
-        f"{cfg_sidebar.counting_scores_per_day} laveste scorer teller per dag."
-    )
-    if sb is None:
-        st.error("Supabase mangler. Sjekk .streamlit/secrets.toml")
-    else:
-        st.success("Supabase tilkoblet")
-    is_admin = admin_login() if mode == "Admin" else False
-
-require_db()
-teams, players, links, scores = fetch_all()
-leaderboard, details = build_model(teams, players, links, scores)
-
-if mode == "Admin" and is_admin:
-    tabs = st.tabs(["Turnering", "Importer", "Scorer", "Lag", "Spillere", "Laguttak", "Dagsrapport"])
-    with tabs[0]:
-        def _import_field() -> None:
-            result = datagolf_sync.import_missing_field_players(
-                sb,
-                datagolf_sync.get_api_key_from_mapping(get_sync_secrets()),
-                tour=get_cfg().datagolf_tour,
-                tournament_id=get_cfg().id,
-            )
-            render_field_import_result(result)
-
-        render_tournament_setup(
-            sb,
-            DATA_DIR,
-            import_excel_callback=import_excel_to_supabase,
-            import_field_callback=_import_field,
-            clear_cache_callback=clear_cache,
-        )
-    with tabs[1]:
-        st.subheader("Importer fra Excel")
-        uploaded = st.file_uploader("Last opp Excel-oppsett", type=["xlsx"])
-        if st.button("Importer lag, spillere og valg fra Excel"):
-            import_excel_to_supabase(uploaded.getvalue() if uploaded else None)
-            st.success("Import fullført. Last siden på nytt om dataene ikke vises med én gang.")
+@st.fragment(run_every=timedelta(minutes=5))
+def datagolf_auto_sync_fragment(tournament: dict) -> None:
+    if not tournament.get("is_active"):
+        return
+    if st.session_state.get("auto_sync_enabled"):
+        result = perform_live_sync_if_due()
+        if result is not None and result.success:
             st.rerun()
-    with tabs[2]:
+
+
+def get_client_or_warn() -> Client | None:
+    client = db.get_supabase_client()
+    if client is None:
+        st.error(
+            "Supabase is not configured. Add `SUPABASE_URL` and `SUPABASE_ANON_KEY` "
+            "to `.streamlit/secrets.toml`, then restart the app."
+        )
+    return client
+
+
+def get_write_client_or_warn() -> Client | None:
+    client = db.get_supabase_write_client()
+    if client is None:
+        st.error(
+            "Admin writes require `SUPABASE_URL` and the server-only "
+            "`SUPABASE_SERVICE_ROLE_KEY` in Streamlit secrets."
+        )
+    return client
+
+
+def render_tier_player_selectors(
+    players: list[dict],
+    key_prefix: str,
+    defaults: set[str] | None = None,
+) -> list[str]:
+    defaults = defaults or set()
+    selected: list[str] = []
+    for tier in participant_admin.REQUIRED_TIERS:
+        tier_players = [player for player in players if int(player["tier"]) == tier]
+        name_by_id = {str(player["id"]): str(player["name"]) for player in tier_players}
+        options: list[str | None] = [None, *name_by_id]
+        default_id = next((player_id for player_id in name_by_id if player_id in defaults), None)
+        choice = st.selectbox(
+            f"Tier {tier}",
+            options,
+            index=options.index(default_id),
+            format_func=lambda value, names=name_by_id: names.get(value, "Velg spiller"),
+            key=f"{key_prefix}_tier_{tier}",
+        )
+        if choice is not None:
+            selected.append(choice)
+    return selected
+
+
+def participant_preview(name: str, selected_ids: list[str], players: list[dict]) -> None:
+    players_by_id = {str(player["id"]): player for player in players}
+    st.markdown("**Forhåndsvisning**")
+    st.write(f"Deltaker: **{name.strip() or '—'}**")
+    rows = [
+        {"Tier": players_by_id[player_id]["tier"], "Spiller": players_by_id[player_id]["name"]}
+        for player_id in selected_ids
+        if player_id in players_by_id
+    ]
+    if rows:
+        st.dataframe(pd.DataFrame(rows).sort_values("Tier"), hide_index=True, use_container_width=True)
+    else:
+        st.caption("Ingen spillere valgt ennå.")
+
+
+def page_leaderboard() -> None:
+    client = get_client_or_warn()
+    if client is None:
+        return
+
+    tournament = db.get_active_tournament(client)
+    if not tournament:
+        styles.render_hero("Leaderboard", "No active tournament configured")
+        st.info("Set one tournament row to `is_active = true` in the tournaments table.")
+        return
+
+    styles.render_hero("Leaderboard", db.tournament_subtitle(tournament))
+
+    data = load_competition_data(tournament["id"], tournament)
+    standings = data["standings"]
+    selected_team_id = st.query_params.get("team")
+    if isinstance(selected_team_id, list):
+        selected_team_id = selected_team_id[0] if selected_team_id else None
+    valid_team_ids = {str(standing.team_id) for standing in standings}
+    if selected_team_id not in valid_team_ids:
+        selected_team_id = None
+
+    if not standings:
+        st.info("No teams found for the active tournament.")
+        return
+
+    styles.render_stat_cards(
+        [
+            ("Lag", str(len(standings))),
+            ("Runder", "4"),
+            ("1. plass", "4 000 kr"),
+            ("2. plass", "1 000 kr"),
+        ]
+    )
+
+    styles.render_rules_banner()
+
+    with st.expander("Live scoring-status", expanded=False):
+        render_sync_status(tournament)
+
+    rows = []
+    for index, standing in enumerate(standings, start=1):
+        rows.append(
+            {
+                "Rank": index,
+                "Team ID": str(standing.team_id),
+                "Team": standing.team_name,
+                "Selected": str(standing.team_id) == selected_team_id,
+                "Preview href": leaderboard_preview.preview_href(
+                    selected_team_id,
+                    str(standing.team_id),
+                ),
+                "Round 1": format_score(standing.round_totals.get(1)),
+                "Round 2": format_score(standing.round_totals.get(2)),
+                "Round 3": format_score(standing.round_totals.get(3)),
+                "Round 4": format_score(standing.round_totals.get(4)),
+                "Total": format_score(standing.tournament_total),
+            }
+        )
+
+    styles.render_leaderboard_table(rows)
+    if selected_team_id:
+        selected_standing = next(
+            standing for standing in standings if str(standing.team_id) == selected_team_id
+        )
+        active_round = leaderboard_preview.active_round_number(
+            data["scores"],
+            data["live_states"],
+            num_rounds=int(tournament.get("num_rounds", 4)),
+        )
+        preview_rows = leaderboard_preview.build_preview_rows(
+            selected_standing,
+            active_round,
+            data["live_states"],
+        )
+        styles.render_team_preview(
+            selected_standing.team_name,
+            active_round,
+            selected_standing.tournament_total,
+            preview_rows,
+        )
+    live_feed_fragment(str(tournament["id"]))
+
+
+def page_team_detail() -> None:
+    client = get_client_or_warn()
+    if client is None:
+        return
+
+    tournament = db.get_active_tournament(client)
+    if not tournament:
+        styles.render_hero("Team Detail", "No active tournament configured")
+        st.info("Set one tournament row to `is_active = true` in the tournaments table.")
+        return
+
+    styles.render_hero("Team Detail", db.tournament_display_title(tournament))
+
+    data = load_competition_data(tournament["id"], tournament)
+    standings = data["standings"]
+    if not standings:
+        st.info("No teams found.")
+        return
+
+    team_names = [standing.team_name for standing in standings]
+    selected_team = st.selectbox("Select team", team_names)
+    standing = next(item for item in standings if item.team_name == selected_team)
+
+    styles.render_stat_cards(
+        [
+            ("Team", standing.team_name),
+            ("Round 1", format_score(standing.round_totals.get(1))),
+            ("Round 2", format_score(standing.round_totals.get(2))),
+            ("Round 3", format_score(standing.round_totals.get(3))),
+            ("Round 4", format_score(standing.round_totals.get(4))),
+            ("Tournament total", format_score(standing.tournament_total)),
+        ]
+    )
+
+    for round_num in range(1, 5):
+        round_result = standing.rounds[round_num]
+        st.markdown(f"### Round {round_num}")
+        st.write(f"Round total: **{format_score(round_result.total)}**")
+
+        counting_rows = [
+            {
+                "Player": player.player_name,
+                "Tier": player.tier,
+                "Strokes": format_score(player.strokes),
+                "Type": (
+                    f"Straff ({player.status})"
+                    if player.score_kind == "PENALTY"
+                    else "Faktisk score"
+                ),
+            }
+            for player in round_result.counting
+        ]
+        dropped_rows = [
+            {
+                "Player": player.player_name,
+                "Tier": player.tier,
+                "Strokes": format_score(player.strokes),
+                "Type": (
+                    f"Straff ({player.status})"
+                    if player.score_kind == "PENALTY"
+                    else (player.status or "Ikke tellende")
+                ),
+            }
+            for player in round_result.dropped
+        ]
+
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**Counting (5)**")
+            if counting_rows:
+                st.dataframe(pd.DataFrame(counting_rows), use_container_width=True, hide_index=True)
+            else:
+                st.caption("Not enough scores entered yet.")
+        with right:
+            st.markdown("**Dropped (2)**")
+            if dropped_rows:
+                st.dataframe(pd.DataFrame(dropped_rows), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No dropped players yet.")
+
+
+def page_admin() -> None:
+    styles.render_hero("Admin", "Manage rosters, scores, and tournament data")
+
+    if not auth.is_admin():
+        with st.form("admin_login"):
+            password = st.text_input("Admin password", type="password")
+            submitted = st.form_submit_button("Log in")
+            if submitted:
+                if auth.login_admin(password):
+                    st.success("Logged in.")
+                    st.rerun()
+                else:
+                    st.error("Invalid password.")
+        return
+
+    client = get_write_client_or_warn()
+    if client is None:
+        return
+
+    tournament = db.get_active_tournament(client)
+    if not tournament:
+        st.error("No active tournament found. Configure `is_active = true` on one row in tournaments.")
+        return
+
+    st.success("Admin session active.")
+    if st.button("Log out"):
+        auth.logout_admin()
+        st.rerun()
+
+    tab_tournament, tab_datagolf, tab_import, tab_teams, tab_players, tab_rosters, tab_scorer, tab_status, tab_reset = st.tabs(
+        ["Tournament", "DataGolf", "Import", "Teams", "Players", "Rosters", "Scorer", "Statuses & penalties", "Reset"]
+    )
+
+    with tab_tournament:
+        render_active_tournament_info(tournament)
+        st.divider()
+        st.markdown("### All tournaments")
+        render_tournament_catalog(client, tournament)
+        st.caption("The clean production schema seeds The Open 2026 as the active tournament.")
+
+    with tab_datagolf:
+        render_datagolf_diagnostics_panel(
+            tournament,
+            st.session_state.get("datagolf_diagnostic_result"),
+            st.session_state.get("datagolf_sync_status"),
+        )
+
+    with tab_import:
+        excel_default = default_excel_path(tournament)
+        st.subheader("Import Excel roster")
+        st.caption(f"Default file for active tournament: `{excel_default}`")
+
+        uploaded = st.file_uploader("Upload new Excel roster file", type=["xlsx"])
+        use_default = st.checkbox("Use default project Excel file", value=True)
+
+        if st.button("Import roster", type="primary"):
+            try:
+                if uploaded is not None:
+                    temp_path = Path("data/uploaded_roster.xlsx")
+                    temp_path.parent.mkdir(parents=True, exist_ok=True)
+                    temp_path.write_bytes(uploaded.getvalue())
+                    result = excel_import.import_workbook(client, temp_path)
+                elif use_default and excel_default.exists():
+                    result = excel_import.import_workbook(client, excel_default)
+                else:
+                    st.error("Provide an uploaded file or enable the default Excel file.")
+                    result = None
+
+                if result:
+                    clear_data_cache()
+                    st.success(
+                        f"Imported {result['players_imported']} players and "
+                        f"{result['teams_imported']} teams."
+                    )
+                    st.json(result)
+            except Exception as exc:
+                st.error(str(exc))
+
+    with tab_teams:
+        st.subheader("Legg til deltaker")
+        teams = db.fetch_teams(client, tournament["id"])
+        players = db.fetch_players(client, tournament["id"])
+        team_players = db.fetch_team_players(client, tournament["id"])
+        scores_registered = bool(db.fetch_scores(client, tournament["id"]))
+        audit_rows = db.fetch_admin_audit(client, limit=1000)
+        created_team_ids = participant_admin.created_participant_ids(audit_rows)
+
+        st.caption("Velg nøyaktig én spiller fra hver av tier 1–7.")
+        participant_name = st.text_input("Deltakernavn", key="new_participant_name")
+        selected_player_ids = render_tier_player_selectors(players, "new_participant")
+        validation = participant_admin.validate_participant(
+            participant_name, selected_player_ids, players, teams
+        )
+        participant_preview(participant_name, selected_player_ids, players)
+        for error in validation.errors:
+            st.warning(error)
+        confirmed = st.checkbox(
+            "Jeg bekrefter at navn og alle sju spillervalg er korrekte.",
+            key="confirm_new_participant",
+        )
+        if st.button(
+            "Opprett deltaker",
+            type="primary",
+            disabled=not validation.is_valid or not confirmed,
+        ):
+            participant_admin.create_participant(
+                client,
+                tournament["id"],
+                participant_name,
+                selected_player_ids,
+                players,
+                teams,
+            )
+            clear_data_cache()
+            st.success(f"Deltakeren {participant_name.strip()} er opprettet.")
+            st.rerun()
+
+        st.divider()
+        st.subheader("Rediger ny deltaker")
+        editable_teams = [team for team in teams if str(team["id"]) in created_team_ids]
+        if not editable_teams:
+            st.caption("Ingen deltakere er lagt til etter hovedimporten.")
+        elif scores_registered:
+            st.warning("Redigering er låst fordi første score er registrert.")
+        else:
+            edit_team = st.selectbox(
+                "Deltaker",
+                editable_teams,
+                format_func=lambda team: team["name"],
+                key="edit_new_participant_team",
+            )
+            current_ids = {
+                str(link["player_id"])
+                for link in team_players
+                if str(link["team_id"]) == str(edit_team["id"])
+            }
+            edit_name = st.text_input(
+                "Deltakernavn",
+                value=edit_team["name"],
+                key=f"edit_participant_name_{edit_team['id']}",
+            )
+            edited_player_ids = render_tier_player_selectors(
+                players,
+                f"edit_participant_{edit_team['id']}",
+                defaults=current_ids,
+            )
+            edit_validation = participant_admin.validate_participant(
+                edit_name,
+                edited_player_ids,
+                players,
+                teams,
+                exclude_team_id=str(edit_team["id"]),
+            )
+            participant_preview(edit_name, edited_player_ids, players)
+            for error in edit_validation.errors:
+                st.warning(error)
+            edit_confirmed = st.checkbox(
+                "Jeg bekrefter endringene.",
+                key=f"confirm_edit_participant_{edit_team['id']}",
+            )
+            if st.button(
+                "Lagre endringer",
+                disabled=not edit_validation.is_valid or not edit_confirmed,
+            ):
+                participant_admin.update_participant(
+                    client,
+                    edit_team,
+                    edit_name,
+                    edited_player_ids,
+                    players,
+                    teams,
+                    sorted(current_ids),
+                    scores_registered=False,
+                )
+                clear_data_cache()
+                st.success("Deltakeren er oppdatert.")
+                st.rerun()
+
+        st.divider()
+        st.subheader("Alle deltakere")
+        for team in teams:
+            label = "Ny deltaker" if str(team["id"]) in created_team_ids else "Hovedimport"
+            st.write(f"{team['name']} — {label}")
+
+    with tab_players:
+        st.subheader("Players")
+        players = db.fetch_players(client, tournament["id"])
+
+        with st.form("add_player"):
+            player_name = st.text_input("Player name")
+            player_tier = st.number_input("Tier", min_value=1, max_value=20, value=1, step=1)
+            if st.form_submit_button("Add player"):
+                if player_name.strip():
+                    db.add_player(client, tournament["id"], player_name.strip(), int(player_tier))
+                    clear_data_cache()
+                    st.success(f"Added player {player_name.strip()}.")
+                    st.rerun()
+
+        for player in players:
+            cols = st.columns([4, 1, 1])
+            cols[0].write(f"{player['name']} (Tier {player['tier']})")
+            if cols[2].button("Remove", key=f"remove_player_{player['id']}"):
+                db.remove_player(client, player["id"])
+                clear_data_cache()
+                st.rerun()
+
+    with tab_rosters:
+        st.subheader("Laguttak")
+        st.info(
+            "Nye deltakere opprettes og redigeres under Teams. "
+            "De sju lagene fra hovedimporten er skrivebeskyttet her."
+        )
+
+    with tab_scorer:
         st.subheader("Live scoring from DataGolf")
 
         if st.button(
@@ -1119,415 +764,218 @@ if mode == "Admin" and is_admin:
             type="primary",
             key="sync_all_scores_datagolf",
         ):
-            with st.spinner(f"Henter {get_cfg().tournament_name}-scorer fra DataGolf..."):
-                result = perform_live_sync(use_backoff=True)
+            with st.spinner(
+                f"Fetching scores from DataGolf for {db.tournament_display_title(tournament)}..."
+            ):
+                result = perform_live_sync()
             if result.success:
-                clear_cache()
                 st.success(
-                    f"Oppdaterte {result.scores_written} scorer for "
-                    f"{len(result.matched_players)} spillere. Leaderboard er oppdatert."
+                    f"Updated {result.scores_written} scores for "
+                    f"{len(result.matched_players)} matched players."
                 )
                 st.rerun()
-            elif result.rate_limited:
-                st.warning(result.warning or "DataGolf rate limit (HTTP 429). Eksisterende scorer er beholdt.")
             else:
-                st.error(result.error or "DataGolf-synkronisering feilet.")
+                st.error(result.error or "DataGolf sync failed.")
 
-        auto_sync_suspended = datagolf_sync.is_auto_sync_suspended(sb)
-        render_auto_sync_status_label()
-        ensure_auto_sync_checkbox_initialized()
-        st.checkbox(
-            "Auto-sync hvert 5. minutt",
+        auto_sync = st.checkbox(
+            "Auto-sync every 5 minutes",
+            value=st.session_state.auto_sync_enabled,
             key="datagolf_auto_sync_checkbox",
-            on_change=persist_auto_sync_enabled,
         )
-        if st.session_state.get("auto_sync_read_error"):
-            st.error(f"Kunne ikke lese auto-sync fra Supabase: {st.session_state.auto_sync_read_error}")
-        if st.session_state.get("auto_sync_save_error"):
-            st.error(f"Kunne ikke lagre auto-sync: {st.session_state.auto_sync_save_error}")
-            st.session_state.auto_sync_save_error = None
-        if auto_sync_suspended:
-            st.caption("Auto-sync er pauset til DataGolf slutter å returnere HTTP 429.")
+        st.session_state.auto_sync_enabled = auto_sync
 
-        render_app_settings_diagnostics()
-
-        render_datagolf_sync_status(st.session_state.get("datagolf_sync_status"))
+        render_datagolf_sync_status(st.session_state.get("datagolf_sync_status"), tournament)
 
         st.divider()
-        st.subheader("Manuell scoreoppdatering (reserve)")
-        if players.empty:
-            st.info("Importer eller legg til spillere først.")
-        else:
-            p_name = st.selectbox("Spiller", players.sort_values("name")["name"].tolist())
-            p_id = int(players.loc[players.name == p_name, "id"].iloc[0])
-            c1, c2 = st.columns(2)
-            rnd = c1.selectbox("Runde", get_cfg().rounds_list, format_func=lambda r: f"Dag {r}")
-            score = c2.number_input("Score", min_value=-20, max_value=30, value=0, step=1)
-            if st.button("Lagre score"):
-                payload = {"player_id": p_id, "round_no": int(rnd), "score": int(score)}
-                cfg = get_cfg()
-                if cfg.id is not None:
-                    payload["tournament_id"] = int(cfg.id)
-                    sb.table("scores").upsert(payload, on_conflict="tournament_id,player_id,round_no").execute()
+        st.subheader("Manual score entry")
+        st.caption("Fallback if DataGolf sync is unavailable or a score needs correction.")
+        players = db.fetch_players(client, tournament["id"])
+        scores = db.fetch_scores(client, tournament["id"])
+        scores_lookup = {(score["player_id"], score["round"]): score["strokes"] for score in scores}
+
+        round_num = st.selectbox("Round", [1, 2, 3, 4], key="score_round_select")
+        score_rows = []
+        for player in players:
+            current_value = scores_lookup.get((player["id"], round_num))
+            score_rows.append(
+                {
+                    "player_id": player["id"],
+                    "Player": player["name"],
+                    "Tier": player["tier"],
+                    "Strokes": current_value,
+                }
+            )
+
+        edited = st.data_editor(
+            pd.DataFrame(score_rows),
+            column_config={
+                "player_id": None,
+                "Player": st.column_config.TextColumn(disabled=True),
+                "Tier": st.column_config.NumberColumn(disabled=True),
+                "Strokes": st.column_config.NumberColumn(min_value=0, step=1),
+            },
+            hide_index=True,
+            use_container_width=True,
+            key=f"score_editor_round_{round_num}",
+        )
+
+        if st.button("Save round scores", type="primary"):
+            for _, row in edited.iterrows():
+                player_id = row["player_id"]
+                strokes = row["Strokes"]
+                if pd.isna(strokes):
+                    db.delete_score(client, player_id, round_num)
                 else:
-                    sb.table("scores").upsert(payload, on_conflict="player_id,round_no").execute()
-                clear_cache()
-                st.success("Score lagret.")
-                st.rerun()
-            st.dataframe(scores.merge(players[["id","name"]], left_on="player_id", right_on="id", how="left")[["name","round_no","score"]].sort_values(["round_no","name"]) if not scores.empty else pd.DataFrame(), width="stretch", hide_index=True)
-        render_score_round_debug(scores, leaderboard, details)
-    with tabs[3]:
-        st.subheader("Legg til / fjern lag")
-        new_team = st.text_input("Nytt lagnavn")
-        if st.button("Legg til lag") and new_team.strip():
-            payload = {"name": new_team.strip()}
-            cfg = get_cfg()
-            if cfg.id is not None:
-                payload["tournament_id"] = int(cfg.id)
-                sb.table("teams").upsert(payload, on_conflict="tournament_id,name").execute()
-            else:
-                sb.table("teams").upsert(payload, on_conflict="name").execute()
-            st.rerun()
-        if not teams.empty:
-            del_team = st.selectbox("Fjern lag", teams.sort_values("name")["name"].tolist())
-            if st.button("Fjern valgt lag"):
-                tid = int(teams.loc[teams.name == del_team, "id"].iloc[0])
-                sb.table("teams").delete().eq("id", tid).execute()
-                st.rerun()
-    with tabs[4]:
-        st.subheader("Legg til / fjern spiller")
-        c1, c2 = st.columns(2)
-        new_player = c1.text_input("Spillernavn")
-        tier = c2.text_input("Tier", placeholder="f.eks. Tier 1")
-        if st.button("Legg til spiller") and new_player.strip():
-            payload = {"name": new_player.strip(), "tier": tier.strip() or None}
-            cfg = get_cfg()
-            if cfg.id is not None:
-                payload["tournament_id"] = int(cfg.id)
-                sb.table("players").upsert(payload, on_conflict="tournament_id,name").execute()
-            else:
-                sb.table("players").upsert(payload, on_conflict="name").execute()
+                    db.upsert_score(client, player_id, round_num, int(strokes))
+            clear_data_cache()
+            st.success(f"Saved scores for round {round_num}.")
             st.rerun()
 
-        st.divider()
-        st.subheader("DataGolf startliste")
+    with tab_status:
+        st.subheader("Player status")
         st.caption(
-            f"Henter hele {get_cfg().tournament_name}-feltet fra DataGolf og legger kun til spillere som ikke finnes fra før. "
-            "Eksisterende lag og rosters endres ikke."
+            "Only explicit CUT, WD, or DQ statuses can activate a frozen penalty. "
+            "Admin changes are appended to the audit history."
         )
-        if st.button("Hent hele startlisten fra DataGolf", key="import_datagolf_field"):
-            with st.spinner("Henter startliste fra DataGolf..."):
-                field_result = datagolf_sync.import_missing_field_players(
-                    sb,
-                    datagolf_sync.get_api_key_from_mapping(get_sync_secrets()),
-                    tour=get_cfg().datagolf_tour,
-                    tournament_id=get_cfg().id,
+        players = db.fetch_players(client, tournament["id"])
+        player_options = {player["name"]: player["id"] for player in players}
+        if players:
+            with st.form("player_status_override"):
+                selected_player_name = st.selectbox("Player", list(player_options))
+                selected_status = st.selectbox("Status", ["CUT", "WD", "DQ", "ACTIVE"])
+                effective_round = st.selectbox(
+                    "Effective from round",
+                    [3] if selected_status == "CUT" else [1, 2, 3, 4],
                 )
-            render_field_import_result(field_result)
-            if field_result.success and field_result.added_count:
-                clear_cache()
-                st.success("Startliste importert. Nye spillere er tilgjengelige for Dag 3–4-bytter.")
-                st.rerun()
-            elif field_result.success:
-                st.info("Ingen nye spillere å legge til.")
-
-        if not players.empty:
-            del_player = st.selectbox("Fjern spiller", players.sort_values("name")["name"].tolist())
-            if st.button("Fjern valgt spiller"):
-                pid = int(players.loc[players.name == del_player, "id"].iloc[0])
-                sb.table("players").delete().eq("id", pid).execute()
-                st.rerun()
-    with tabs[5]:
-        cfg = get_cfg()
-        st.subheader(f"Originalt lag (Dag {cfg.pre_cut_from}–{cfg.pre_cut_to})")
-        if teams.empty or players.empty:
-            st.info("Legg til lag og spillere først.")
-        elif not links_have_round_ranges(links):
-            st.warning(
-                "Kjør migrations/001_round_based_rosters.sql i Supabase for å aktivere lagbytter etter dag 2."
-            )
-            t_name = st.selectbox("Lag", teams.sort_values("name")["name"].tolist(), key="assign_team")
-            tid = int(teams.loc[teams.name == t_name, "id"].iloc[0])
-            current_ids = links[links.team_id == tid].player_id.astype(int).tolist() if not links.empty else []
-            player_options = players.sort_values("name")["name"].tolist()
-            current_names = players[players.id.astype(int).isin(current_ids)].sort_values("name")["name"].tolist()
-            legacy_key = f"legacy_roster_{tid}"
-            if st.session_state.get("laguttak_team_id") != tid:
-                if st.session_state.get("laguttak_team_id") is not None:
-                    prev_tid = st.session_state.laguttak_team_id
-                    st.session_state.pop(f"legacy_roster_{prev_tid}", None)
-                st.session_state.laguttak_team_id = tid
-                st.session_state[legacy_key] = current_names
-            selected = st.multiselect("Velg 7 spillere", player_options, key=legacy_key)
-            st.caption(
-                f"Debug: team_id={tid}, team={t_name}, original roster={current_names}, post-cut roster={current_names}"
-            )
-            st.caption(f"Valgt: {len(selected)} av {cfg.number_of_players_per_team}")
-            if st.button("Lagre laguttak"):
-                sb.table("team_players").delete().eq("team_id", tid).execute()
-                new_ids = players[players.name.isin(selected)].id.astype(int).tolist()
-                if new_ids:
-                    sb.table("team_players").insert(
-                        [{"team_id": tid, "player_id": pid} for pid in new_ids]
-                    ).execute()
-                clear_cache()
-                st.rerun()
+                status_note = st.text_input("Reason / note")
+                if st.form_submit_button("Save status override"):
+                    db.add_player_status_event(
+                        client,
+                        player_options[selected_player_name],
+                        int(effective_round),
+                        selected_status,
+                        source="ADMIN",
+                        note=status_note,
+                    )
+                    clear_data_cache()
+                    st.success("Status override saved and audited.")
+                    st.rerun()
         else:
-            t_name = st.selectbox("Lag", teams.sort_values("name")["name"].tolist(), key="assign_team")
-            tid = int(teams.loc[teams.name == t_name, "id"].iloc[0])
-            pre_cut_links = filter_team_roster(links, tid, cfg.pre_cut_from, cfg.pre_cut_to)
-            current_ids = pre_cut_links.player_id.astype(int).tolist() if not pre_cut_links.empty else []
-            player_options = players.sort_values("name")["name"].tolist()
-            current_names = players[players.id.astype(int).isin(current_ids)].sort_values("name")["name"].tolist()
+            st.info("Import players before adding statuses.")
 
-            original_ids = get_team_player_ids(links, tid, 1)
-            original_names = players[players.id.astype(int).isin(original_ids)].sort_values("name")["name"].tolist()
-
-            post_cut_links = filter_team_roster(links, tid, cfg.post_cut_from, cfg.post_cut_to)
-            post_cut_ids = (
-                set(post_cut_links.player_id.astype(int).tolist())
-                if not post_cut_links.empty
-                else set(current_ids)
-            )
-            post_cut_names = players[players.id.astype(int).isin(post_cut_ids)].sort_values("name")["name"].tolist()
-
-            force_reload = st.session_state.pop("laguttak_force_reload_team_id", None) == tid
-            pre_key, post_key = prepare_laguttak_roster_state(
-                tid,
-                current_names,
-                post_cut_names,
-                force_reload=force_reload,
-            )
-            st.caption(
-                f"Debug: team_id={tid}, team={t_name}, "
-                f"original roster count={len(original_names)}, "
-                f"post-cut roster count={len(post_cut_names)}, "
-                f"post-cut roster={post_cut_names}"
-            )
-
-            selected = st.multiselect(
-                f"Velg {cfg.number_of_players_per_team} spillere for Dag {cfg.pre_cut_from}–{cfg.pre_cut_to}",
-                player_options,
-                key=pre_key,
-            )
-            st.caption(f"Valgt: {len(selected)} av {cfg.number_of_players_per_team}")
-            if st.button("Lagre originalt lag"):
-                if len(selected) != cfg.number_of_players_per_team:
-                    st.error(f"Originalt lag må ha nøyaktig {cfg.number_of_players_per_team} spillere.")
-                else:
-                    new_ids = players[players.name.isin(selected)].id.astype(int).tolist()
-                    save_team_roster(tid, new_ids, cfg.pre_cut_from, cfg.pre_cut_to)
-                    clear_cache()
-                    st.success("Originalt lag lagret for Dag 1–2.")
-                    st.rerun()
-
-            st.divider()
-            st.subheader(f"Bytter etter dag {cfg.pre_cut_to}")
-            st.caption(
-                f"Dag {cfg.post_cut_from}–{cfg.post_cut_to} bruker oppdatert lag. "
-                f"Maks {cfg.max_swaps} bytter per lag."
-            )
-
-            st.write(
-                f"**Originalt lag (Dag {cfg.pre_cut_from}–{cfg.pre_cut_to}):**",
-                ", ".join(original_names) if original_names else "Ingen spillere",
-            )
-
-            post_cut_selected = st.multiselect(
-                f"Velg {cfg.number_of_players_per_team} spillere for Dag {cfg.post_cut_from}–{cfg.post_cut_to}",
-                player_options,
-                key=post_key,
-            )
-            post_cut_new_ids_list = players[players.name.isin(post_cut_selected)].id.astype(int).tolist()
-            post_cut_new_ids = set(post_cut_new_ids_list)
-            swaps_used = count_post_cut_swaps(original_ids, post_cut_new_ids)
-            st.caption(f"Bytter brukt: {swaps_used}/{cfg.max_swaps}")
-
-            if st.button("Lagre lag etter bytter"):
-                if len(post_cut_selected) != cfg.number_of_players_per_team:
-                    st.error(f"Lag etter bytter må ha nøyaktig {cfg.number_of_players_per_team} spillere.")
-                elif len(post_cut_new_ids) != cfg.number_of_players_per_team:
-                    st.error(
-                        f"Post-cut roster må inneholde nøyaktig {cfg.number_of_players_per_team} unike spillere. "
-                        f"Fant {len(post_cut_new_ids)}."
-                    )
-                elif swaps_used > cfg.max_swaps:
-                    st.error(f"Maks {cfg.max_swaps} bytter er tillatt etter dag {cfg.pre_cut_to}.")
-                else:
-                    save_team_roster(
-                        tid,
-                        list(post_cut_new_ids),
-                        cfg.post_cut_from,
-                        cfg.post_cut_to,
-                    )
-                    clear_cache()
-                    st.session_state.laguttak_force_reload_team_id = tid
-                    st.success("Lag for Dag 3–4 er lagret.")
-                    st.rerun()
-    with tabs[6]:
-        cfg = get_cfg()
-        st.subheader("Dagsrapport")
-        st.caption("Generer en norsk fantasy-kompis-rapport basert på leaderboard og tellende scorer.")
-
-        c1, c2 = st.columns(2)
-        report_round = c1.selectbox(
-            "Runde / dag",
-            cfg.rounds_list,
-            format_func=lambda r: cfg.days_list[r - 1],
-            key="daily_report_round",
+        st.divider()
+        st.subheader("Freeze round penalty")
+        st.caption(
+            "Do this only after the round is finished and all official completed scores are present. "
+            "The normal penalty is the field's highest official score plus "
+            f"{tournament.get('missing_score_penalty', 2)} strokes."
         )
-        report_tone = c2.selectbox("Tone", list(TONES), index=1, key="daily_report_tone")
-
-        action1, action2, action3 = st.columns(3)
-        if action1.button("Generer dagsrapport", type="primary", key="generate_daily_report"):
-            title, body = generate_daily_report(
-                leaderboard,
-                details,
-                int(report_round),
-                tone=report_tone,
+        round_rows = db.fetch_tournament_rounds(client, tournament["id"])
+        if round_rows:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Round": row["round"],
+                            "State": row["state"],
+                            "Worst official": row.get("official_worst_score"),
+                            "Frozen penalty": row.get("penalty_score"),
+                            "Override": row.get("is_override", False),
+                            "Reason": row.get("override_reason"),
+                            "Frozen at": row.get("frozen_at"),
+                        }
+                        for row in round_rows
+                    ]
+                ),
+                hide_index=True,
+                use_container_width=True,
             )
-            st.session_state.daily_report_title = title
-            st.session_state.daily_report_draft = body
-            st.rerun()
 
-        report_title = st.text_input(
-            "Tittel",
-            value=st.session_state.get("daily_report_title", f"{cfg.days_list[int(report_round) - 1]} – dagsrapport"),
+        freeze_round = st.selectbox("Round to freeze", [1, 2, 3, 4], key="freeze_round")
+        freeze_confirm = st.checkbox(
+            "I confirm the round is finished and official completed scores are final.",
+            key="freeze_confirm",
         )
-        report_body = st.text_area(
-            "Dagsrapport (rediger før publisering)",
-            value=st.session_state.get("daily_report_draft", ""),
-            height=360,
-        )
+        if st.button("Freeze calculated penalty", disabled=not freeze_confirm):
+            try:
+                saved = db.freeze_round_penalty(client, tournament, int(freeze_round))
+                clear_data_cache()
+                st.success(f"Round {freeze_round} penalty frozen at {saved['penalty_score']}.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
 
-        if action2.button("Kopier tekst", key="copy_daily_report"):
-            if report_body.strip():
-                copy_text_to_clipboard(report_body)
-                st.toast("Tekst kopiert til utklippstavlen.")
-            else:
-                st.warning("Ingen tekst å kopiere.")
-
-        if action3.button("Lagre kommentar", key="save_daily_report"):
-            if not report_body.strip():
-                st.error("Skriv eller generer en dagsrapport først.")
-            else:
+        with st.form("penalty_override"):
+            override_round = st.selectbox("Round", [1, 2, 3, 4], key="override_round")
+            override_score = st.number_input("Override penalty score", min_value=50, max_value=200)
+            override_reason = st.text_input("Required override reason")
+            if st.form_submit_button("Save penalty override"):
                 try:
-                    save_daily_comment(
-                        int(report_round),
-                        report_title or f"{cfg.days_list[int(report_round) - 1]} – dagsrapport",
-                        report_body,
+                    saved = db.freeze_round_penalty(
+                        client,
+                        tournament,
+                        int(override_round),
+                        override_score=int(override_score),
+                        override_reason=override_reason,
                     )
-                    clear_cache()
-                    st.success("Dagsrapport lagret.")
+                    clear_data_cache()
+                    st.success(f"Round {override_round} override saved at {saved['penalty_score']}.")
                     st.rerun()
                 except Exception as exc:
-                    st.error(
-                        "Kunne ikke lagre. Kjør migrations/002_daily_comments.sql i Supabase først. "
-                        f"({exc})"
-                    )
+                    st.error(str(exc))
 
-        saved_for_round = pd.DataFrame()
-        try:
-            saved_for_round = fetch_table("daily_comments")
-        except Exception:
-            saved_for_round = pd.DataFrame()
+        st.divider()
+        st.subheader("Audit history")
+        audit_rows = db.fetch_admin_audit(client)
+        if audit_rows:
+            st.dataframe(pd.DataFrame(audit_rows), hide_index=True, use_container_width=True)
+        else:
+            st.caption("No admin overrides recorded yet.")
 
-        if not saved_for_round.empty:
-            st.divider()
-            st.caption("Lagrede dagsrapporter")
-            st.dataframe(
-                saved_for_round.sort_values("round_no")[["round_no", "title", "updated_at"]],
-                width="stretch",
-                hide_index=True,
-            )
+    with tab_reset:
+        st.subheader("Reset tournament")
+        st.warning(
+            f"This deletes all teams, players, rosters, and scores for "
+            f"{db.tournament_display_title(tournament)}."
+        )
+        confirm = st.checkbox("I understand this cannot be undone.")
+        if st.button("Reset tournament", type="primary", disabled=not confirm):
+            db.reset_tournament_data(client, tournament["id"])
+            clear_data_cache()
+            st.success("Tournament data reset.")
+            st.rerun()
 
-latest_comment = fetch_latest_daily_comment()
-if latest_comment and latest_comment.get("body"):
-    st.markdown("### 💬 Dagens kommentar")
-    st.markdown(f"**{latest_comment.get('title', 'Dagsrapport')}**")
-    st.write(latest_comment["body"])
 
-last_success = datagolf_sync.get_last_successful_sync(sb)
-if is_auto_sync_enabled():
-    st.caption(
-        f"Auto-sync aktiv · Sist oppdatert: {format_sync_timestamp(last_success)}"
+def main() -> None:
+    styles.inject_styles()
+    init_sync_state()
+
+    client = db.get_supabase_client()
+    if client is not None:
+        tournament = db.get_active_tournament(client)
+        if tournament is not None:
+            datagolf_auto_sync_fragment(tournament)
+
+    styles.render_sidebar_brand()
+    active_label = "No active tournament"
+    if client is not None:
+        active = db.get_active_tournament(client)
+        if active is not None:
+            active_label = db.tournament_display_title(active)
+    st.sidebar.caption(f"Aktiv turnering: {active_label}")
+    page = st.sidebar.radio(
+        "Navigation",
+        ["Leaderboard", "Team Detail", "Admin"],
+        label_visibility="collapsed",
     )
-else:
-    st.caption(
-        f"Auto-sync av · Sist oppdatert: {format_sync_timestamp(last_success)}"
-    )
 
-st.subheader("🏆 Leaderboard")
-if leaderboard.empty:
-    st.info("Ingen data ennå. Gå til Admin og importer fra Excel.")
-else:
-    st.dataframe(prepare_leaderboard_display(leaderboard, scores), width="stretch", hide_index=True)
+    if page == "Leaderboard":
+        page_leaderboard()
+    elif page == "Team Detail":
+        page_team_detail()
+    else:
+        page_admin()
 
-render_live_events_section(teams, players, links, scores)
 
-st.subheader("🔎 Tellende og droppede scorer")
-if details.empty:
-    st.info("Ingen scorer registrert ennå.")
-else:
-    team = st.selectbox("Velg lag", sorted(details["Lag"].unique()))
-    team_details = details[details["Lag"] == team]
-    for idx, (rnd, day) in enumerate(ordered_round_days_with_scores(details, team, scores)):
-        day_df = team_details[team_details["Dag"] == day].copy()
-        roster_label = get_cfg().roster_labels[rnd]
-        status_order = {"counted": 0, "dropped": 1, "missing": 2}
-        day_df["status_order"] = day_df["Status"].map(status_order)
-        day_df = day_df.sort_values(
-            ["status_order", "Score"],
-            ascending=[True, True],
-            na_position="last",
-        )
-        scored_count = int(day_df["Score"].notna().sum())
-        counted_sum = (
-            int(day_df[day_df["Status"] == "counted"]["Score"].sum())
-            if scored_count >= get_cfg().counting_scores_per_day
-            else None
-        )
-        display_df = day_df.copy()
-        display_df["Score"] = display_df["Score"].map(fmt_score)
-        with st.expander(f"{day} - {team} ({roster_label})", expanded=(idx == 0)):
-            st.caption(f"Lagtype: {roster_label}")
-            st.dataframe(
-                display_df[["Teller", "Rang", "Spiller", "Score"]],
-                width="stretch",
-                hide_index=True,
-            )
-            team_row = leaderboard[leaderboard["Lag"] == team]
-            if not team_row.empty and day in team_row.columns:
-                leaderboard_value = team_row.iloc[0][day]
-                st.caption(
-                    f"**Lagscore {day}:** {fmt_score(counted_sum)} "
-                    f"(sum av 5 beste) · Leaderboard viser: {fmt_score(leaderboard_value)}"
-                )
-                if (
-                    counted_sum is not None
-                    and pd.notna(leaderboard_value)
-                    and int(leaderboard_value) != counted_sum
-                ):
-                    st.error("Avvik mellom beregnet lagscore og leaderboard.")
-
-render_post_cut_swaps_section(teams, players, links, leaderboard)
-
-st.subheader("📋 Spillerstall")
-if not teams.empty and not players.empty:
-    roster_rows = []
-    for _, t in teams.sort_values("name").iterrows():
-        tid = int(t.id)
-        pre_ids = get_team_player_ids(links, tid, 1)
-        post_ids = get_team_player_ids(links, tid, 3) if links_have_round_ranges(links) else pre_ids
-        pre_names = players[players.id.astype(int).isin(pre_ids)].sort_values("name")["name"].tolist()
-        post_names = players[players.id.astype(int).isin(post_ids)].sort_values("name")["name"].tolist()
-        swaps = count_post_cut_swaps(pre_ids, post_ids) if links_have_round_ranges(links) else 0
-        roster_rows.append(
-            {
-                "Lag": t["name"],
-                "Dag 1–2": ", ".join(pre_names),
-                "Dag 3–4": ", ".join(post_names),
-                "Bytter": f"{swaps}/{get_cfg().max_swaps}" if links_have_round_ranges(links) else "-",
-            }
-        )
-    st.dataframe(pd.DataFrame(roster_rows), width="stretch", hide_index=True)
+if __name__ == "__main__":
+    main()
