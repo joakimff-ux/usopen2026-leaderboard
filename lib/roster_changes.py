@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any
 
 
 ROSTER_SIZE = 7
 ROUND_FROM = 3
+MAX_CHANGES_PER_TEAM = 3
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,7 @@ def build_original_rosters(
 def validate_rosters(
     selected_by_team: dict[str, list[str]],
     valid_player_ids: set[str],
+    original_by_team: dict[str, list[str]] | None = None,
 ) -> RosterChangeValidation:
     errors: list[str] = []
     for team_id, player_ids in selected_by_team.items():
@@ -55,6 +56,12 @@ def validate_rosters(
             errors.append(f"{team_id}: Samme spiller kan ikke velges flere ganger.")
         if any(player_id not in valid_player_ids for player_id in player_ids):
             errors.append(f"{team_id}: Ett eller flere spillervalg finnes ikke i turneringen.")
+        if original_by_team is not None:
+            changes_used = len(set(original_by_team.get(team_id, [])) - set(player_ids))
+            if changes_used > MAX_CHANGES_PER_TEAM:
+                errors.append(
+                    f"{team_id}: Maks {MAX_CHANGES_PER_TEAM} spillerbytter er tillatt."
+                )
     return RosterChangeValidation(tuple(errors))
 
 
@@ -113,8 +120,14 @@ def rosters_differ(
     )
 
 
-def changes_are_locked(active_change_set: dict[str, Any] | None) -> bool:
-    return bool(active_change_set and active_change_set.get("is_locked"))
+def change_count_by_team(
+    original_by_team: dict[str, list[str]],
+    selected_by_team: dict[str, list[str]],
+) -> dict[str, int]:
+    return {
+        team_id: len(set(original_ids) - set(selected_by_team.get(team_id, original_ids)))
+        for team_id, original_ids in original_by_team.items()
+    }
 
 
 def round_two_is_finalized(tournament_rounds: list[dict[str, Any]]) -> bool:
@@ -124,101 +137,56 @@ def round_two_is_finalized(tournament_rounds: list[dict[str, Any]]) -> bool:
     )
 
 
+def round_three_has_started(
+    scores: list[dict[str, Any]],
+    live_states: list[dict[str, Any]],
+) -> bool:
+    if any(int(score.get("round", 0)) == 3 for score in scores):
+        return True
+    return any(
+        int(state.get("round", 0)) == 3
+        and (state.get("hole") is not None or bool(state.get("is_finished")))
+        for state in live_states
+    )
+
+
 def save_roster_changes(
     client: Any,
     tournament_id: str,
     original_by_team: dict[str, list[str]],
     selected_by_team: dict[str, list[str]],
     valid_player_ids: set[str],
-    active_change_set: dict[str, Any] | None,
     round_two_finalized: bool,
+    round_three_started: bool,
     changed_by: str = "admin",
 ) -> dict[str, Any]:
-    if changes_are_locked(active_change_set):
-        raise ValueError("Bytter er allerede gjennomført.")
     if not round_two_finalized:
         raise ValueError("Bytter kan først lagres etter at runde 2 er ferdig.")
-    validation = validate_rosters(selected_by_team, valid_player_ids)
+    if round_three_started:
+        raise ValueError("Byttevinduet er stengt. Runde 3 har startet.")
+    validation = validate_rosters(selected_by_team, valid_player_ids, original_by_team)
     if not validation.is_valid:
         raise ValueError(" ".join(validation.errors))
     change_pairs = build_change_pairs(original_by_team, selected_by_team)
-    if not change_pairs:
-        raise ValueError("Ingen spillerbytter er valgt.")
 
-    created = (
-        client.table("roster_change_sets")
-        .insert(
-            {
-                "tournament_id": tournament_id,
-                "round_from": ROUND_FROM,
-                "is_active": False,
-                "is_locked": True,
-                "created_by": changed_by,
-            }
-        )
-        .execute()
-        .data[0]
-    )
-    change_set_id = str(created["id"])
     rows = [
         {
-            "change_set_id": change_set_id,
-            "tournament_id": tournament_id,
             "team_id": pair["team_id"],
-            "round_from": ROUND_FROM,
             "old_player_id": pair["old_player_id"],
             "new_player_id": pair["new_player_id"],
-            "changed_by": changed_by,
         }
         for pair in change_pairs
     ]
-
-    old_change_set_id = str(active_change_set["id"]) if active_change_set else None
-    old_deactivated = False
-    try:
-        client.table("roster_changes").insert(rows).execute()
-        if old_change_set_id:
-            (
-                client.table("roster_change_sets")
-                .update({"is_active": False})
-                .eq("id", old_change_set_id)
-                .execute()
-            )
-            old_deactivated = True
-        saved = (
-            client.table("roster_change_sets")
-            .update({"is_active": True})
-            .eq("id", change_set_id)
-            .execute()
-            .data[0]
-        )
-        return saved
-    except Exception:
-        if old_change_set_id and old_deactivated:
-            client.table("roster_change_sets").update({"is_active": True}).eq(
-                "id", old_change_set_id
-            ).execute()
-        client.table("roster_change_sets").delete().eq("id", change_set_id).execute()
-        raise
-
-
-def unlock_roster_changes(
-    client: Any,
-    active_change_set: dict[str, Any],
-    changed_by: str = "admin",
-) -> dict[str, Any]:
-    if not changes_are_locked(active_change_set):
-        raise ValueError("Byttene er allerede låst opp.")
     response = (
-        client.table("roster_change_sets")
-        .update(
+        client.rpc(
+            "save_roster_changes_atomic",
             {
-                "is_locked": False,
-                "unlocked_at": datetime.now(timezone.utc).isoformat(),
-                "unlocked_by": changed_by,
-            }
+                "p_tournament_id": tournament_id,
+                "p_round_from": ROUND_FROM,
+                "p_changed_by": changed_by,
+                "p_changes": rows,
+            },
         )
-        .eq("id", active_change_set["id"])
         .execute()
     )
-    return response.data[0]
+    return {"id": response.data}

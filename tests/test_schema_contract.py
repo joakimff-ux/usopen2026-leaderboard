@@ -7,6 +7,11 @@ class SchemaContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.sql = (Path(__file__).parents[1] / "schema.sql").read_text(encoding="utf-8")
+        cls.atomic_roster_migration = (
+            Path(__file__).parents[1]
+            / "migrations"
+            / "006_atomic_roster_change_window.sql"
+        ).read_text(encoding="utf-8")
 
     def test_schema_creates_exact_expected_tables(self):
         tables = set(re.findall(r"create table\s+([a-z_]+)", self.sql, flags=re.IGNORECASE))
@@ -51,6 +56,17 @@ class SchemaContractTests(unittest.TestCase):
             self.sql.lower(),
             r"(?s)create table roster_changes.*?delete from team_players",
         )
+
+    def test_roster_changes_use_one_service_role_only_database_transaction(self):
+        sql = self.atomic_roster_migration.lower()
+        self.assertIn("create or replace function save_roster_changes_atomic", sql)
+        self.assertIn("security definer", sql)
+        self.assertIn("having count(*) > 3", sql)
+        self.assertIn("round = 3", sql)
+        self.assertIn("update roster_change_sets", sql)
+        self.assertIn("insert into roster_changes", sql)
+        self.assertIn("from public, anon, authenticated", sql)
+        self.assertIn("to service_role", sql)
 
 
 if __name__ == "__main__":
