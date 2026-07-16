@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime
 from html import escape
 from pathlib import Path
 
 import streamlit as st
+
+from lib import time_display
 
 
 NAVY = "#061f38"
@@ -357,7 +358,7 @@ def render_sidebar_brand() -> None:
 def render_hero(title: str, subtitle: str) -> None:
     image_uri = _hero_data_uri()
     background = f"background-image:url('{image_uri}');" if image_uri else ""
-    updated = datetime.now().strftime("%H:%M")
+    updated = time_display.current_oslo_time()
     st.markdown(
         f"""
         <div class="hero-banner" style="{background}">
@@ -484,13 +485,7 @@ def _relative_score(value: object) -> str:
 
 
 def _event_time(value: object) -> str:
-    if not value:
-        return ""
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        return parsed.astimezone().strftime("%H:%M")
-    except ValueError:
-        return str(value)
+    return time_display.format_oslo_time(value)
 
 
 def render_live_feed(

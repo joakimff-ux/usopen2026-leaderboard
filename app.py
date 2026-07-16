@@ -21,6 +21,7 @@ from lib import (
     participant_admin,
     scoring,
     styles,
+    time_display,
 )
 
 st.set_page_config(
@@ -129,9 +130,7 @@ def init_sync_state() -> None:
 def format_sync_timestamp(value: datetime | None) -> str:
     if value is None:
         return "Never"
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    return time_display.format_oslo_time(value)
 
 
 def get_app_secrets() -> dict[str, str]:
