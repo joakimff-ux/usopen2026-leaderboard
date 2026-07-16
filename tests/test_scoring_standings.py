@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from lib.scoring import build_team_standings
+from lib.scoring import build_team_standings, format_relative_score
 
 
 def build_fixture(rounds_by_team: dict[str, list[list[int]]]):
@@ -54,7 +54,7 @@ class LeaderboardStandingTests(unittest.TestCase):
         )
 
         self.assertEqual([item.team_name for item in standings], ["Lower score", "Higher score"])
-        self.assertEqual(standings[0].tournament_total, 350)
+        self.assertEqual(standings[0].tournament_total, -10)
         self.assertEqual(standings[0].completed_rounds, 1)
 
     def test_team_with_more_completed_rounds_sorts_first(self):
@@ -70,7 +70,7 @@ class LeaderboardStandingTests(unittest.TestCase):
 
         self.assertEqual(standings[0].team_name, "Two rounds")
         self.assertEqual(standings[0].completed_rounds, 2)
-        self.assertEqual(standings[0].tournament_total, 740)
+        self.assertEqual(standings[0].tournament_total, 20)
 
     def test_no_completed_rounds_falls_back_to_team_name(self):
         standings = self.standings({"Zulu": [], "Alpha": []})
@@ -78,6 +78,91 @@ class LeaderboardStandingTests(unittest.TestCase):
         self.assertEqual([item.team_name for item in standings], ["Alpha", "Zulu"])
         self.assertTrue(all(item.completed_rounds == 0 for item in standings))
         self.assertTrue(all(item.tournament_total is None for item in standings))
+
+    def test_five_best_relative_scores_count_and_two_worst_drop(self):
+        standings = self.standings(
+            {"Christine": [[69, 70, 72, 73, 74, 75, 76]]}
+        )
+
+        result = standings[0].rounds[1]
+        self.assertEqual([player.strokes for player in result.counting], [-3, -2, 0, 1, 2])
+        self.assertEqual([player.strokes for player in result.dropped], [3, 4])
+        self.assertEqual(result.total, -2)
+
+    def test_even_formats_as_e(self):
+        self.assertEqual(format_relative_score(0), "E")
+        self.assertEqual(format_relative_score(-10), "−10")
+        self.assertEqual(format_relative_score(4), "+4")
+
+    def test_active_round_uses_live_today_instead_of_absolute_strokes(self):
+        teams, players, team_players, scores = build_fixture(
+            {"Christine": [[74, 74, 74, 74, 74, 80, 81]]}
+        )
+        live_states = [
+            {
+                "player_id": player["id"],
+                "round": 1,
+                "round_score": score,
+                "is_finished": False,
+            }
+            for player, score in zip(players, [-4, -3, -2, -1, 0, 1, 2])
+        ]
+
+        standings = build_team_standings(
+            teams,
+            players,
+            team_players,
+            scores,
+            live_states=live_states,
+        )
+
+        self.assertEqual(standings[0].round_totals[1], -10)
+
+    def test_finished_round_uses_absolute_strokes_minus_course_par(self):
+        teams, players, team_players, scores = build_fixture(
+            {"Christine": [[69, 70, 71, 72, 73, 80, 81]]}
+        )
+        live_states = [
+            {
+                "player_id": player["id"],
+                "round": 1,
+                "round_score": -20,
+                "is_finished": True,
+            }
+            for player in players
+        ]
+
+        standings = build_team_standings(
+            teams,
+            players,
+            team_players,
+            scores,
+            live_states=live_states,
+            course_par=72,
+        )
+
+        self.assertEqual(standings[0].round_totals[1], -5)
+
+    def test_relative_total_sums_multiple_rounds(self):
+        standings = self.standings(
+            {
+                "Christine": [
+                    [70, 70, 70, 70, 70, 80, 81],
+                    [73, 73, 73, 73, 73, 80, 81],
+                ]
+            }
+        )
+
+        self.assertEqual(standings[0].round_totals, {1: -10, 2: 5, 3: None, 4: None})
+        self.assertEqual(standings[0].tournament_total, -5)
+
+    def test_christine_355_absolute_strokes_displays_minus_five(self):
+        standings = self.standings(
+            {"Christine": [[70, 71, 71, 71, 72, 80, 81]]}
+        )
+
+        self.assertEqual(sum([70, 71, 71, 71, 72]), 355)
+        self.assertEqual(standings[0].round_totals[1], -5)
 
 
 if __name__ == "__main__":

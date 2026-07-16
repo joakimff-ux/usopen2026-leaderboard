@@ -37,6 +37,14 @@ class TeamStanding:
     rounds: dict[int, TeamRoundResult]
 
 
+def format_relative_score(value: int | None) -> str:
+    if value is None:
+        return "—"
+    if value == 0:
+        return "E"
+    return f"+{value}" if value > 0 else f"−{abs(value)}"
+
+
 def _split_counting_and_dropped(
     player_results: list[PlayerRoundResult],
     counting_scores: int,
@@ -130,6 +138,8 @@ def build_team_standings(
     dropped_scores: int = 2,
     player_status_events: list[dict[str, Any]] | None = None,
     tournament_rounds: list[dict[str, Any]] | None = None,
+    live_states: list[dict[str, Any]] | None = None,
+    course_par: int = 72,
 ) -> list[TeamStanding]:
     players_by_id = {player["id"]: player for player in players}
     roster_by_team: dict[str, list[dict[str, Any]]] = {team["id"]: [] for team in teams}
@@ -140,10 +150,16 @@ def build_team_standings(
             roster_by_team.setdefault(link["team_id"], []).append(player)
 
     scores_by_player_round = {
-        (score["player_id"], score["round"]): score["strokes"]
+        (str(score["player_id"]), int(score["round"])): int(score["strokes"]) - course_par
         for score in scores
         if score.get("is_official", True)
     }
+    for state in live_states or []:
+        if state.get("round_score") is None or state.get("is_finished"):
+            continue
+        scores_by_player_round[(str(state["player_id"]), int(state["round"]))] = int(
+            state["round_score"]
+        )
     events_by_player: dict[str, list[dict[str, Any]]] = {}
     for event in player_status_events or []:
         events_by_player.setdefault(event["player_id"], []).append(event)
@@ -163,7 +179,7 @@ def build_team_standings(
                 statuses_by_player_round[(player["id"], round_num)] = current_status
 
     penalty_score_by_round = {
-        int(round_row["round"]): int(round_row["penalty_score"])
+        int(round_row["round"]): int(round_row["penalty_score"]) - course_par
         for round_row in tournament_rounds or []
         if round_row.get("state") == "FINALIZED" and round_row.get("penalty_score") is not None
     }

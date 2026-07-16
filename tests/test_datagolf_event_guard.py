@@ -161,8 +161,8 @@ class DataGolfEventGuardTests(unittest.TestCase):
             counting_scores=1,
             dropped_scores=0,
         )
-        self.assertEqual(standings[0].round_totals[1], 70)
-        self.assertEqual(standings[0].tournament_total, 70)
+        self.assertEqual(standings[0].round_totals[1], -2)
+        self.assertEqual(standings[0].tournament_total, -2)
 
     def test_not_started_today_zero_does_not_create_score(self):
         self.assertEqual(

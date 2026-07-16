@@ -43,10 +43,10 @@ class MissingScorePenaltyTests(unittest.TestCase):
             scores.extend((f"p{number}", round_num, 70 + number) for number in range(1, 5))
         standing = _standings(scores, [_event("p5", "CUT", 3)])
 
-        self.assertEqual(standing.rounds[1].total, sum(range(71, 76)))
-        self.assertEqual(standing.rounds[2].total, sum(range(71, 76)))
-        self.assertEqual(standing.rounds[3].total, sum(range(71, 75)) + 84)
-        self.assertEqual(standing.rounds[4].total, sum(range(71, 75)) + 84)
+        self.assertEqual(standing.rounds[1].total, 5)
+        self.assertEqual(standing.rounds[2].total, 5)
+        self.assertEqual(standing.rounds[3].total, 14)
+        self.assertEqual(standing.rounds[4].total, 14)
         self.assertEqual(standing.rounds[3].counting[-1].score_kind, "PENALTY")
         self.assertEqual(standing.rounds[3].counting[-1].status, "CUT")
 
@@ -62,7 +62,7 @@ class MissingScorePenaltyTests(unittest.TestCase):
         scores.extend((f"p{number}", 3, 70 + number) for number in range(1, 5))
         standing = _standings(scores, [_event("p5", "WD", 2)])
         p5_round_two = next(item for item in standing.rounds[2].counting if item.player_id == "p5")
-        self.assertEqual(p5_round_two.strokes, 75)
+        self.assertEqual(p5_round_two.strokes, 3)
         self.assertEqual(p5_round_two.score_kind, "ACTUAL")
         self.assertTrue(any(item.status == "WD" and item.score_kind == "PENALTY" for item in standing.rounds[3].counting))
 
@@ -71,7 +71,7 @@ class MissingScorePenaltyTests(unittest.TestCase):
         standing = _standings(scores, [_event("p6", "DQ", 1)])
         penalty = next(item for item in standing.rounds[1].counting if item.score_kind == "PENALTY")
         self.assertEqual(penalty.status, "DQ")
-        self.assertEqual(penalty.strokes, 84)
+        self.assertEqual(penalty.strokes, 12)
 
     def test_delayed_datagolf_data_without_status_never_gets_penalty(self):
         scores = [(f"p{number}", 1, 70 + number) for number in range(1, 5)]

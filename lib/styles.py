@@ -9,6 +9,8 @@ from pathlib import Path
 
 import streamlit as st
 
+from lib.scoring import format_relative_score
+
 
 NAVY = "#061f38"
 GOLD = "#d7a21d"
@@ -432,7 +434,7 @@ def render_team_preview(
     rows: list[dict],
 ) -> None:
     def score(value: object) -> str:
-        return "—" if value is None else str(value)
+        return format_relative_score(None if value is None else int(value))
 
     body: list[str] = []
     for row in rows:

@@ -71,7 +71,7 @@ def render_tournament_catalog(client: Client, active: dict | None) -> None:
 
 
 def format_score(value: int | None) -> str:
-    return "—" if value is None else str(value)
+    return scoring.format_relative_score(value)
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -100,6 +100,8 @@ def load_competition_data(tournament_id: str, tournament_rules: dict):
         dropped_scores=tournament_rules.get("dropped_scores", 2),
         player_status_events=status_events,
         tournament_rounds=tournament_rounds,
+        live_states=live_states,
+        course_par=int(tournament_rules.get("course_par", 72)),
     )
     return {
         "teams": teams,
