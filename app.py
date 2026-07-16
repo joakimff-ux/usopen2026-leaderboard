@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
@@ -419,16 +420,10 @@ def roster_change_export_csv(
     change_rows: list[dict],
 ) -> bytes:
     players_by_id = {str(player["id"]): str(player["name"]) for player in players}
-    teams_by_id = {
-        str(team["id"]): (f"Lag {index}", str(team["name"]))
-        for index, team in enumerate(teams, start=1)
-    }
+    teams_by_id = {str(team["id"]): str(team["name"]) for team in teams}
     rows = []
     for change in change_rows:
-        team_label, owner = teams_by_id.get(
-            str(change["team_id"]),
-            (str(change["team_id"]), str(change["team_id"])),
-        )
+        team_label = teams_by_id.get(str(change["team_id"]), str(change["team_id"]))
         changed_at = change.get("changed_at")
         timestamp = ""
         if changed_at:
@@ -439,24 +434,26 @@ def roster_change_export_csv(
         rows.append(
             {
                 "Lag": team_label,
-                "Eier": owner,
-                "Ut": players_by_id.get(str(change["old_player_id"]), change["old_player_id"]),
-                "Inn": players_by_id.get(str(change["new_player_id"]), change["new_player_id"]),
+                "OUT spiller": players_by_id.get(
+                    str(change["old_player_id"]), change["old_player_id"]
+                ),
+                "IN spiller": players_by_id.get(
+                    str(change["new_player_id"]), change["new_player_id"]
+                ),
                 "Tidspunkt": timestamp,
+                "Admin": str(change.get("changed_by") or ""),
             }
         )
-    return pd.DataFrame(rows, columns=["Lag", "Eier", "Ut", "Inn", "Tidspunkt"]).to_csv(
-        index=False
-    ).encode("utf-8-sig")
+    columns = ["Lag", "OUT spiller", "IN spiller", "Tidspunkt", "Admin"]
+    return pd.DataFrame(rows, columns=columns).to_csv(index=False).encode("utf-8-sig")
 
 
-def render_saved_roster_changes(
+def render_roster_change_summary(
     teams: list[dict],
     players: list[dict],
     change_rows: list[dict],
     *,
-    heading: str = "Sist lagrede bytter",
-    offer_download: bool = True,
+    heading: str,
 ) -> None:
     if not change_rows:
         return
@@ -481,14 +478,66 @@ def render_saved_roster_changes(
                 st.markdown("**IN**")
                 for row in team_changes:
                     st.write(players_by_id.get(str(row["new_player_id"]), row["new_player_id"]))
-    if offer_download:
-        st.download_button(
-            "📄 Last ned bytteliste",
-            data=roster_change_export_csv(teams, players, change_rows),
-            file_name="bytteliste.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+
+
+def render_roster_change_overview(
+    teams: list[dict],
+    players: list[dict],
+    change_rows: list[dict],
+) -> None:
+    if not change_rows:
+        return
+    players_by_id = {str(player["id"]): str(player["name"]) for player in players}
+    changes_by_team: dict[str, list[dict]] = {}
+    for row in change_rows:
+        changes_by_team.setdefault(str(row["team_id"]), []).append(row)
+
+    st.markdown("### Bytteoversikt")
+    st.caption("Alle lag og de sist lagrede spillerbyttene.")
+    for team in teams:
+        team_changes = changes_by_team.get(str(team["id"]), [])
+        with st.container(border=True):
+            st.markdown(f"**{team['name']}**")
+            out_col, in_col = st.columns(2)
+            with out_col:
+                st.markdown("**OUT**")
+                if not team_changes:
+                    st.write("—")
+                for row in team_changes:
+                    st.write(players_by_id.get(str(row["old_player_id"]), row["old_player_id"]))
+            with in_col:
+                st.markdown("**IN**")
+                if not team_changes:
+                    st.write("—")
+                for row in team_changes:
+                    st.write(players_by_id.get(str(row["new_player_id"]), row["new_player_id"]))
+
+    incoming = Counter(
+        players_by_id.get(str(row["new_player_id"]), str(row["new_player_id"]))
+        for row in change_rows
+    )
+    outgoing = Counter(
+        players_by_id.get(str(row["old_player_id"]), str(row["old_player_id"]))
+        for row in change_rows
+    )
+    st.markdown("#### Oppsummering")
+    in_col, out_col = st.columns(2)
+    with in_col:
+        st.markdown("**Mest populære inn:**")
+        for player_name, count in incoming.most_common(3):
+            st.write(f"{player_name} ({count})")
+    with out_col:
+        st.markdown("**Mest populære ut:**")
+        for player_name, count in outgoing.most_common(3):
+            st.write(f"{player_name} ({count})")
+
+    st.download_button(
+        "📥 Last ned bytter (CSV)",
+        data=roster_change_export_csv(teams, players, change_rows),
+        file_name="bytter.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
 
 
 @st.dialog("Bekreft spillerbytter")
@@ -502,12 +551,11 @@ def confirm_roster_changes_dialog(
     players: list[dict],
 ) -> None:
     change_pairs = roster_changes.build_change_pairs(original_by_team, selected_by_team)
-    render_saved_roster_changes(
+    render_roster_change_summary(
         teams,
         players,
         change_pairs,
         heading="Sammendrag før lagring",
-        offer_download=False,
     )
     st.write("Du er i ferd med å gjennomføre spillerbytter.")
     st.write("Disse vil gjelde fra og med runde 3.")
@@ -1033,7 +1081,7 @@ def page_admin() -> None:
 
             if st.session_state.pop("roster_changes_saved", False):
                 st.success("Alle spillerbytter er lagret.")
-            render_saved_roster_changes(teams, players, active_change_rows)
+            render_roster_change_overview(teams, players, active_change_rows)
 
             if round_three_started:
                 st.warning("Byttevinduet er stengt. Runde 3 har startet.")

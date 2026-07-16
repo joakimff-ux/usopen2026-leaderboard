@@ -70,11 +70,19 @@ class RosterChangeTests(unittest.TestCase):
 
     def test_admin_ui_shows_summary_and_csv_export(self):
         self.assertIn('heading="Sammendrag før lagring"', self.app_source)
-        self.assertIn('"📄 Last ned bytteliste"', self.app_source)
+        self.assertIn('"📥 Last ned bytter (CSV)"', self.app_source)
         self.assertIn(
-            '["Lag", "Eier", "Ut", "Inn", "Tidspunkt"]',
+            '["Lag", "OUT spiller", "IN spiller", "Tidspunkt", "Admin"]',
             self.app_source,
         )
+
+    def test_saved_change_overview_shows_every_team_and_popularity(self):
+        self.assertIn('st.markdown("### Bytteoversikt")', self.app_source)
+        self.assertIn("for team in teams:", self.app_source)
+        self.assertIn('st.markdown("**Mest populære inn:**")', self.app_source)
+        self.assertIn('st.markdown("**Mest populære ut:**")', self.app_source)
+        self.assertIn("incoming.most_common(3)", self.app_source)
+        self.assertIn("outgoing.most_common(3)", self.app_source)
 
     def test_duplicate_player_is_rejected(self):
         selected = {"team-1": ["p1", "p1", "p3", "p4", "p5", "p6", "p7"]}
