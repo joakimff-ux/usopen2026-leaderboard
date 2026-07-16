@@ -18,7 +18,8 @@ supabase_stub.Client = object
 supabase_stub.create_client = lambda *_args, **_kwargs: None
 sys.modules.setdefault("supabase", supabase_stub)
 
-from lib.datagolf_sync import sync_live_scores  # noqa: E402
+from lib.datagolf_sync import extract_round_scores, sync_live_scores  # noqa: E402
+from lib.scoring import build_team_standings  # noqa: E402
 
 
 class FakeScoresTable:
@@ -121,6 +122,62 @@ class DataGolfEventGuardTests(unittest.TestCase):
                     "updated_at": result.synced_at.isoformat(),
                 }
             ],
+        )
+
+    def test_active_today_score_is_written_and_updates_leaderboard(self):
+        result = self.run_sync(
+            {
+                "info": {"event_name": "The Open Championship", "current_round": 1},
+                "data": [
+                    {
+                        "player_name": "Scottie Scheffler",
+                        "course": "RB",
+                        "round": 1,
+                        "thru": 3,
+                        "today": -2,
+                        "current_score": -2,
+                        "R1": None,
+                        "R2": None,
+                        "R3": None,
+                        "R4": None,
+                    }
+                ],
+            }
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.scores_written, 1)
+        self.assertEqual(self.client.scores.rows[0]["strokes"], 70)
+
+        standings = build_team_standings(
+            teams=[{"id": "team-1", "name": "Joakim"}],
+            players=[{"id": "player-1", "name": "Scottie Scheffler", "tier": 1}],
+            team_players=[{"team_id": "team-1", "player_id": "player-1"}],
+            scores=self.client.scores.rows,
+            counting_scores=1,
+            dropped_scores=0,
+        )
+        self.assertEqual(standings[0].round_totals[1], 70)
+        self.assertEqual(standings[0].tournament_total, 70)
+
+    def test_not_started_today_zero_does_not_create_score(self):
+        self.assertEqual(
+            extract_round_scores(
+                {"course": "RB", "R1": None, "today": 0, "thru": 0},
+                current_round=1,
+                course_par=72,
+            ),
+            {},
+        )
+
+    def test_completed_round_score_has_priority_over_today(self):
+        self.assertEqual(
+            extract_round_scores(
+                {"course": "RB", "R1": 69, "today": -4, "thru": "F"},
+                current_round=1,
+                course_par=72,
+            ),
+            {1: 69},
         )
 
 

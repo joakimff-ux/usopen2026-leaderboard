@@ -44,6 +44,16 @@ ROUND_FIELD_NAMES = {
     3: ("R3", "r3", "round_3", "round3", "score_3", "score3"),
     4: ("R4", "r4", "round_4", "round4", "score_4", "score4"),
 }
+# DataGolf's in-play feed exposes completed rounds as absolute strokes in
+# R1-R4, but the active round only as `today` relative to par. Keep the
+# conversion fail-closed: only known event/course combinations may create a
+# provisional absolute score.
+COURSE_PAR_BY_CODE = {
+    "RB": 72,  # Royal Birkdale, The Open Championship 2026
+}
+EVENT_PAR_BY_NAME = {
+    "the open championship": 72,
+}
 NAME_TRANSLATION = str.maketrans(
     {
         "ø": "o",
@@ -211,7 +221,24 @@ def extract_current_round(payload: dict[str, Any]) -> int | None:
     return None
 
 
-def extract_round_scores(record: dict[str, Any], current_round: int | None = None) -> dict[int, int]:
+def resolve_course_par(
+    records: list[dict[str, Any]],
+    event_name: str | None,
+) -> int | None:
+    for record in records:
+        course_code = str(record.get("course") or "").strip().upper()
+        if course_code in COURSE_PAR_BY_CODE:
+            return COURSE_PAR_BY_CODE[course_code]
+
+    normalized_event = re.sub(r"\s+", " ", str(event_name or "").strip().casefold())
+    return EVENT_PAR_BY_NAME.get(normalized_event)
+
+
+def extract_round_scores(
+    record: dict[str, Any],
+    current_round: int | None = None,
+    course_par: int | None = None,
+) -> dict[int, int]:
     scores: dict[int, int] = {}
     for round_num, field_names in ROUND_FIELD_NAMES.items():
         for field_name in field_names:
@@ -222,15 +249,37 @@ def extract_round_scores(record: dict[str, Any], current_round: int | None = Non
                 scores[round_num] = parsed
                 break
 
-    if current_round is not None:
-        for field_name in ("today", "current_round_score", "round_score"):
-            if field_name in record:
-                parsed = parse_round_value(record.get(field_name))
-                if parsed is not None:
-                    scores[current_round] = parsed
-                break
+    if current_round is not None and current_round not in scores and course_par is not None:
+        hole, is_finished = live_feed.parse_hole(record.get("thru"))
+        has_started = hole is not None or is_finished
+        relative_score = live_feed.parse_relative_score(record.get("today"))
+        if has_started and relative_score is not None:
+            provisional_strokes = course_par + relative_score
+            if 50 <= provisional_strokes <= 100:
+                scores[current_round] = provisional_strokes
 
     return scores
+
+
+def score_log_sample(record: dict[str, Any]) -> dict[str, Any]:
+    """Return only score-related DataGolf fields; never credentials or odds."""
+    fields = (
+        "player_name",
+        "round",
+        "course",
+        "R1",
+        "R2",
+        "R3",
+        "R4",
+        "today",
+        "current_score",
+        "round_score",
+        "display_score",
+        "total",
+        "thru",
+        "current_pos",
+    )
+    return {field_name: record.get(field_name) for field_name in fields if field_name in record}
 
 
 def extract_player_name(record: dict[str, Any]) -> str | None:
@@ -433,6 +482,7 @@ def run_datagolf_diagnostic(
     records = extract_player_records(payload)
     current_round = extract_current_round(payload)
     event_name = extract_event_name(payload)
+    course_par = resolve_course_par(records, event_name)
 
     base.datagolf_event_name = event_name
     base.players_received = len(records)
@@ -440,7 +490,11 @@ def run_datagolf_diagnostic(
     base.players_with_scores = sum(
         1
         for record in records
-        if extract_round_scores(record, current_round=current_round)
+        if extract_round_scores(
+            record,
+            current_round=current_round,
+            course_par=course_par,
+        )
     )
 
     event_error = validate_event_name(expected_event_name, event_name)
@@ -597,6 +651,7 @@ def sync_live_scores(
         records = extract_player_records(payload)
         current_round = extract_current_round(payload)
         event_name = extract_event_name(payload)
+        course_par = resolve_course_par(records, event_name)
         source_updated_at = extract_source_updated_at(payload)
         event_error = validate_event_name(expected_event_name, event_name)
         if event_error:
@@ -630,6 +685,7 @@ def sync_live_scores(
         score_rows: list[dict[str, Any]] = []
         status_candidates: list[dict[str, Any]] = []
         live_snapshots: list[live_feed.LiveSnapshot] = []
+        logged_score_sample = False
 
         for record in records:
             datagolf_name = extract_player_name(record)
@@ -644,6 +700,12 @@ def sync_live_scores(
 
             matched_player_ids.add(db_player["id"])
             matched_players.append(db_player["name"])
+            if not logged_score_sample:
+                logger.info(
+                    "DataGolf matched score sample: %s",
+                    score_log_sample(record),
+                )
+                logged_score_sample = True
             if str(db_player["id"]) in selected_player_ids:
                 snapshot = extract_live_snapshot(
                     record,
@@ -653,7 +715,11 @@ def sync_live_scores(
                 )
                 if snapshot is not None:
                     live_snapshots.append(snapshot)
-            round_scores = extract_round_scores(record, current_round=current_round)
+            round_scores = extract_round_scores(
+                record,
+                current_round=current_round,
+                course_par=course_par,
+            )
             for round_num, strokes in round_scores.items():
                 score_rows.append(
                     {
@@ -797,16 +863,29 @@ def run_name_matching_test() -> dict[str, Any]:
 def run_api_test(api_key: str, tour: str = DEFAULT_TOUR) -> dict[str, Any]:
     payload = fetch_live_tournament_data(api_key=api_key, tour=tour)
     records = extract_player_records(payload)
+    event_name = extract_event_name(payload)
+    current_round = extract_current_round(payload)
+    course_par = resolve_course_par(records, event_name)
     sample = records[0] if records else {}
     players_with_scores = sum(
-        1 for record in records if extract_round_scores(record, current_round=extract_current_round(payload))
+        1
+        for record in records
+        if extract_round_scores(
+            record,
+            current_round=current_round,
+            course_par=course_par,
+        )
     )
     return {
-        "event_name": extract_event_name(payload),
+        "event_name": event_name,
         "records_found": len(records),
         "players_with_round_scores": players_with_scores,
         "sample_fields": sorted(sample.keys()) if sample else [],
-        "sample_round_scores": extract_round_scores(sample, current_round=extract_current_round(payload))
+        "sample_round_scores": extract_round_scores(
+            sample,
+            current_round=current_round,
+            course_par=course_par,
+        )
         if sample
         else {},
     }
