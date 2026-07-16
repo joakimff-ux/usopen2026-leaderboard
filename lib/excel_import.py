@@ -1,4 +1,4 @@
-"""Import roster and scores from the US Open 2026 Excel workbook."""
+"""Import roster and scores from a fantasy golf Excel workbook."""
 
 from __future__ import annotations
 
@@ -7,10 +7,6 @@ from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook
-from supabase import Client
-
-from lib.db import ensure_tournament, reset_tournament_data
-
 TEAM_HEADER_ROW = 3
 TEAM_COLUMN_START = 7
 PLAYER_NAME_COLUMN = 1
@@ -61,12 +57,35 @@ def parse_workbook(path: str | Path) -> ParsedWorkbook:
     workbook_path = Path(path)
     worksheet = load_workbook(workbook_path, data_only=True)["Ark1"]
 
-    teams: list[str] = []
-    for column in range(TEAM_COLUMN_START, worksheet.max_column + 1):
-        header = worksheet.cell(TEAM_HEADER_ROW, column).value
+    first_tier_row = next(
+        (
+            row
+            for row in range(1, worksheet.max_row + 1)
+            if _is_tier_label(_normalize_name(worksheet.cell(row, PLAYER_NAME_COLUMN).value or ""))
+        ),
+        None,
+    )
+
+    # The Open workbook has participant names on the first tier row from C.
+    # Keep support for the legacy result layout (row 3 from G, scores in B:E).
+    if first_tier_row is not None and worksheet.cell(first_tier_row, 3).value:
+        team_header_row = first_tier_row
+        team_column_start = 3
+        round_columns: dict[int, int] = {}
+    else:
+        team_header_row = TEAM_HEADER_ROW
+        team_column_start = TEAM_COLUMN_START
+        round_columns = ROUND_COLUMNS
+
+    team_columns: list[tuple[int, str]] = []
+    for column in range(team_column_start, worksheet.max_column + 1):
+        header = worksheet.cell(team_header_row, column).value
         if header is None:
+            if team_columns:
+                break
             continue
-        teams.append(_normalize_name(header))
+        team_columns.append((column, _normalize_name(header)))
+    teams = [team_name for _, team_name in team_columns]
 
     if not teams:
         raise ValueError("No team headers found in row 3 starting at column G.")
@@ -74,7 +93,7 @@ def parse_workbook(path: str | Path) -> ParsedWorkbook:
     players: list[ParsedPlayer] = []
     current_tier: int | None = None
 
-    for row in range(TEAM_HEADER_ROW + 1, worksheet.max_row + 1):
+    for row in range(first_tier_row or (TEAM_HEADER_ROW + 1), worksheet.max_row + 1):
         cell_value = worksheet.cell(row, PLAYER_NAME_COLUMN).value
         if cell_value is None:
             continue
@@ -92,12 +111,12 @@ def parse_workbook(path: str | Path) -> ParsedWorkbook:
 
         roster_teams = [
             team_name
-            for index, team_name in enumerate(teams)
-            if _is_roster_mark(worksheet.cell(row, TEAM_COLUMN_START + index).value)
+            for column, team_name in team_columns
+            if _is_roster_mark(worksheet.cell(row, column).value)
         ]
 
         scores: dict[int, int] = {}
-        for column, round_num in ROUND_COLUMNS.items():
+        for column, round_num in round_columns.items():
             parsed_score = _parse_score(worksheet.cell(row, column).value)
             if parsed_score is not None:
                 scores[round_num] = parsed_score
@@ -132,9 +151,13 @@ def parse_workbook(path: str | Path) -> ParsedWorkbook:
     return ParsedWorkbook(teams=teams, players=players, team_roster_counts=team_roster_counts)
 
 
-def import_workbook(client: Client, path: str | Path, replace_existing: bool = True) -> dict[str, Any]:
+def import_workbook(client: Any, path: str | Path, replace_existing: bool = True) -> dict[str, Any]:
+    from lib.db import get_active_tournament, reset_tournament_data, tournament_display_title
+
     parsed = parse_workbook(path)
-    tournament = ensure_tournament(client)
+    tournament = get_active_tournament(client)
+    if tournament is None:
+        raise RuntimeError("No active tournament found in tournaments table.")
 
     if replace_existing:
         reset_tournament_data(client, tournament["id"])
@@ -166,13 +189,22 @@ def import_workbook(client: Client, path: str | Path, replace_existing: bool = T
     for player in parsed.players:
         player_id = player_id_by_name[player.name]
         for round_num, strokes in player.scores.items():
-            score_rows.append({"player_id": player_id, "round": round_num, "strokes": strokes})
+            score_rows.append(
+                {
+                    "player_id": player_id,
+                    "round": round_num,
+                    "strokes": strokes,
+                    "source": "EXCEL",
+                    "is_official": True,
+                }
+            )
 
     if score_rows:
         client.table("scores").upsert(score_rows, on_conflict="player_id,round").execute()
 
     return {
         "tournament_id": tournament["id"],
+        "tournament_name": tournament_display_title(tournament),
         "teams_imported": len(parsed.teams),
         "players_imported": len(parsed.players),
         "roster_links": len(roster_rows),

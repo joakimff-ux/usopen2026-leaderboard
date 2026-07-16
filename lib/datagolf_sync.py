@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+import unicodedata
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -13,9 +14,26 @@ from urllib.request import urlopen
 
 from supabase import Client
 
-from lib.db import ensure_tournament, fetch_players, get_supabase_client_from_config
+from lib.db import (
+    event_name_matches,
+    fetch_live_player_states,
+    fetch_player_status_events,
+    fetch_players,
+    fetch_team_players,
+    get_active_tournament,
+    get_supabase_client_from_config,
+    tournament_display_title,
+)
+from lib import live_feed
 
 logger = logging.getLogger(__name__)
+
+ABORTED_NO_WRITE_MSG = "Existing scores were not modified."
+
+
+class DataGolfRateLimitError(RuntimeError):
+    """Raised when DataGolf returns HTTP 429."""
+
 
 BASE_URL = "https://feeds.datagolf.com"
 IN_PLAY_ENDPOINT = f"{BASE_URL}/preds/in-play"
@@ -26,6 +44,18 @@ ROUND_FIELD_NAMES = {
     3: ("R3", "r3", "round_3", "round3", "score_3", "score3"),
     4: ("R4", "r4", "round_4", "round4", "score_4", "score4"),
 }
+NAME_TRANSLATION = str.maketrans(
+    {
+        "ø": "o",
+        "Ø": "O",
+        "æ": "ae",
+        "Æ": "AE",
+        "œ": "oe",
+        "Œ": "OE",
+        "ł": "l",
+        "Ł": "L",
+    }
+)
 
 
 @dataclass
@@ -34,17 +64,52 @@ class SyncResult:
     synced_at: datetime
     players_updated: int = 0
     scores_written: int = 0
+    statuses_written: int = 0
+    live_events_written: int = 0
     matched_players: list[str] = field(default_factory=list)
     unmatched_players: list[str] = field(default_factory=list)
     event_name: str | None = None
+    expected_event_name: str | None = None
     error: str | None = None
+    warning: str | None = None
+
+
+@dataclass
+class DataGolfDiagnosticResult:
+    """Read-only DataGolf feed check. Never writes to Supabase."""
+
+    checked_at: datetime
+    tournament_id: str
+    tournament_name: str
+    display_title: str
+    expected_event_name: str | None
+    datagolf_event_name: str | None
+    event_found: bool
+    players_received: int
+    players_with_scores: int
+    db_players_count: int
+    matched_count: int
+    unmatched_count: int
+    matched_players: list[str] = field(default_factory=list)
+    unmatched_players: list[str] = field(default_factory=list)
+    current_round: int | None = None
+    error: str | None = None
+    warning: str | None = None
 
 
 def normalize_name(name: str) -> str:
-    cleaned = name.strip().lower()
-    cleaned = cleaned.replace(".", " ").replace("-", " ")
+    """Normalize local names and DataGolf's documented `Last, First` format."""
+    cleaned = unicodedata.normalize("NFKD", name.translate(NAME_TRANSLATION)).casefold().strip()
+    cleaned = "".join(character for character in cleaned if not unicodedata.combining(character))
+
+    if "," in cleaned:
+        family_name, given_name = cleaned.split(",", 1)
+        if family_name.strip() and given_name.strip():
+            cleaned = f"{given_name} {family_name}"
+
+    cleaned = re.sub(r"[.\-'’]", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned
+    return cleaned.strip()
 
 
 def get_api_key_from_mapping(config: dict[str, Any]) -> str:
@@ -73,7 +138,13 @@ def fetch_live_tournament_data(api_key: str, tour: str = DEFAULT_TOUR) -> dict[s
         with urlopen(url, timeout=30) as response:
             payload = response.read().decode("utf-8")
     except HTTPError as exc:
-        raise RuntimeError(f"DataGolf API request failed with HTTP {exc.code}.") from exc
+        if exc.code == 429:
+            raise DataGolfRateLimitError(
+                f"DataGolf API rate limited (HTTP 429). {ABORTED_NO_WRITE_MSG}"
+            ) from exc
+        raise RuntimeError(
+            f"DataGolf API request failed with HTTP {exc.code}. {ABORTED_NO_WRITE_MSG}"
+        ) from exc
     except URLError as exc:
         raise RuntimeError(f"DataGolf API request failed: {exc.reason}") from exc
 
@@ -170,6 +241,119 @@ def extract_player_name(record: dict[str, Any]) -> str | None:
     return None
 
 
+def extract_player_status(record: dict[str, Any]) -> str | None:
+    """Return only explicit terminal statuses; absence never implies a status."""
+    for field_name in ("status", "current_pos", "position", "pos"):
+        value = record.get(field_name)
+        if not isinstance(value, str):
+            continue
+        normalized = value.strip().upper()
+        if normalized in {"CUT", "WD", "DQ"}:
+            return normalized
+    return None
+
+
+def extract_live_snapshot(
+    record: dict[str, Any],
+    db_player: dict[str, Any],
+    current_round: int | None,
+    source_updated_at: str | None,
+) -> live_feed.LiveSnapshot | None:
+    """Extract only documented in-play fields needed for transition detection."""
+    round_value = record.get("round", current_round)
+    try:
+        round_num = int(round_value)
+    except (TypeError, ValueError):
+        round_num = current_round
+    if round_num is None or not 1 <= round_num <= 4:
+        return None
+
+    hole, is_finished = live_feed.parse_hole(record.get("thru"))
+    try:
+        end_hole = int(record.get("end_hole"))
+    except (TypeError, ValueError):
+        end_hole = None
+    if end_hole is not None and not 1 <= end_hole <= 18:
+        end_hole = None
+
+    return live_feed.LiveSnapshot(
+        player_id=str(db_player["id"]),
+        player_name=str(db_player["name"]),
+        round=round_num,
+        hole=hole,
+        is_finished=is_finished,
+        round_score=live_feed.parse_relative_score(record.get("today")),
+        status=extract_player_status(record),
+        end_hole=end_hole,
+        source_updated_at=source_updated_at,
+    )
+
+
+def extract_source_updated_at(payload: dict[str, Any]) -> str | None:
+    info = payload.get("info")
+    if isinstance(info, dict):
+        for field_name in ("last_update", "last_updated"):
+            value = info.get(field_name)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    for field_name in ("last_update", "last_updated"):
+        value = payload.get(field_name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _row_to_live_snapshot(row: dict[str, Any], player_name: str = "") -> live_feed.LiveSnapshot:
+    return live_feed.LiveSnapshot(
+        player_id=str(row["player_id"]),
+        player_name=player_name,
+        round=int(row["round"]),
+        hole=int(row["hole"]) if row.get("hole") is not None else None,
+        is_finished=bool(row.get("is_finished")),
+        round_score=int(row["round_score"]) if row.get("round_score") is not None else None,
+        status=str(row.get("status") or "ACTIVE"),
+        source_updated_at=row.get("source_updated_at"),
+    )
+
+
+def persist_live_feed_transitions(
+    client: Client,
+    tournament_id: str,
+    snapshots: list[live_feed.LiveSnapshot],
+) -> int:
+    """Persist baseline/state and new events; deterministic keys make retries safe."""
+    if not snapshots:
+        return 0
+
+    previous_rows = fetch_live_player_states(client, tournament_id)
+    previous_by_key = {
+        (str(row["player_id"]), int(row["round"])): _row_to_live_snapshot(row)
+        for row in previous_rows
+    }
+    event_rows: list[dict[str, Any]] = []
+    state_rows: list[dict[str, Any]] = []
+
+    for snapshot in snapshots:
+        key = (snapshot.player_id, snapshot.round)
+        previous = previous_by_key.get(key)
+        if snapshot.status is None and previous is not None:
+            snapshot = replace(snapshot, status=previous.status)
+        event_rows.extend(live_feed.build_events(tournament_id, previous, snapshot))
+        state_rows.append(live_feed.state_row(tournament_id, snapshot))
+
+    if event_rows:
+        client.table("live_feed_events").upsert(
+            event_rows,
+            on_conflict="dedupe_key",
+            ignore_duplicates=True,
+        ).execute()
+    client.table("live_player_states").upsert(
+        state_rows,
+        on_conflict="tournament_id,player_id,round",
+    ).execute()
+    return len(event_rows)
+
+
 def build_player_lookup(players: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     lookup: dict[str, dict[str, Any]] = {}
     for player in players:
@@ -185,12 +369,189 @@ def match_database_player(
     return player_lookup.get(normalize_name(datagolf_name))
 
 
+def validate_event_name(expected_event_name: str | None, event_name: str | None) -> str | None:
+    """Return an error unless the configured and received DataGolf events match."""
+    if not expected_event_name:
+        return (
+            "The active tournament has no datagolf_event_name configured. "
+            "Cannot verify the DataGolf feed."
+        )
+    if not event_name:
+        return (
+            "DataGolf response did not include an event name. "
+            "Cannot verify the live feed."
+        )
+    if not event_name_matches(expected_event_name, event_name):
+        return (
+            "DataGolf live feed does not match the active tournament. "
+            f"Expected event name: '{expected_event_name}'. "
+            f"Received event name: '{event_name}'."
+        )
+    return None
+
+
+def run_datagolf_diagnostic(
+    client: Client,
+    tournament: dict[str, Any],
+    api_key: str,
+    tour: str = DEFAULT_TOUR,
+) -> DataGolfDiagnosticResult:
+    """Fetch DataGolf in-play feed and compare to DB. No writes."""
+    checked_at = datetime.now(timezone.utc)
+    tournament_id = str(tournament["id"])
+    expected_event_name = tournament.get("datagolf_event_name")
+    display_title = tournament_display_title(tournament)
+
+    base = DataGolfDiagnosticResult(
+        checked_at=checked_at,
+        tournament_id=tournament_id,
+        tournament_name=str(tournament.get("name") or ""),
+        display_title=display_title,
+        expected_event_name=expected_event_name,
+        datagolf_event_name=None,
+        event_found=False,
+        players_received=0,
+        players_with_scores=0,
+        db_players_count=0,
+        matched_count=0,
+        unmatched_count=0,
+    )
+
+    if not api_key:
+        base.error = "DATA_GOLF_API_KEY is not configured."
+        return base
+
+    try:
+        payload = fetch_live_tournament_data(api_key=api_key, tour=tour)
+    except DataGolfRateLimitError as exc:
+        base.error = str(exc)
+        return base
+    except Exception as exc:
+        base.error = str(exc)
+        return base
+
+    records = extract_player_records(payload)
+    current_round = extract_current_round(payload)
+    event_name = extract_event_name(payload)
+
+    base.datagolf_event_name = event_name
+    base.players_received = len(records)
+    base.current_round = current_round
+    base.players_with_scores = sum(
+        1
+        for record in records
+        if extract_round_scores(record, current_round=current_round)
+    )
+
+    event_error = validate_event_name(expected_event_name, event_name)
+    if event_error:
+        base.error = event_error
+        return base
+
+    base.event_found = True
+
+    if not records:
+        base.warning = "Event name matches, but the feed contains no player records."
+        return base
+
+    db_players = fetch_players(client, tournament_id)
+    base.db_players_count = len(db_players)
+    player_lookup = build_player_lookup(db_players)
+
+    matched: list[str] = []
+    unmatched: list[str] = []
+    for record in records:
+        datagolf_name = extract_player_name(record)
+        if not datagolf_name:
+            continue
+        db_player = match_database_player(datagolf_name, player_lookup)
+        if db_player is None:
+            unmatched.append(datagolf_name)
+        else:
+            matched.append(db_player["name"])
+
+    base.matched_players = sorted(set(matched))
+    base.unmatched_players = sorted(set(unmatched))
+    base.matched_count = len(base.matched_players)
+    base.unmatched_count = len(base.unmatched_players)
+
+    if base.db_players_count == 0:
+        base.warning = (
+            "No players in the database for the active tournament yet. "
+            "All DataGolf field players appear as unmatched until roster import."
+        )
+
+    return base
+
+
+def execute_datagolf_diagnostic(secrets: dict[str, Any], tour: str = DEFAULT_TOUR) -> DataGolfDiagnosticResult:
+    checked_at = datetime.now(timezone.utc)
+    api_key = get_api_key_from_mapping(secrets)
+    supabase_url = str(secrets.get("SUPABASE_URL", "")).strip()
+    supabase_key = str(secrets.get("SUPABASE_ANON_KEY", "")).strip()
+
+    if not api_key:
+        return DataGolfDiagnosticResult(
+            checked_at=checked_at,
+            tournament_id="",
+            tournament_name="",
+            display_title="",
+            expected_event_name=None,
+            datagolf_event_name=None,
+            event_found=False,
+            players_received=0,
+            players_with_scores=0,
+            db_players_count=0,
+            matched_count=0,
+            unmatched_count=0,
+            error="DATA_GOLF_API_KEY is not configured.",
+        )
+
+    if not supabase_url or not supabase_key:
+        return DataGolfDiagnosticResult(
+            checked_at=checked_at,
+            tournament_id="",
+            tournament_name="",
+            display_title="",
+            expected_event_name=None,
+            datagolf_event_name=None,
+            event_found=False,
+            players_received=0,
+            players_with_scores=0,
+            db_players_count=0,
+            matched_count=0,
+            unmatched_count=0,
+            error="SUPABASE_URL and SUPABASE_ANON_KEY are required for diagnostics.",
+        )
+
+    client = get_supabase_client_from_config(supabase_url, supabase_key)
+    tournament = get_active_tournament(client)
+    if tournament is None:
+        return DataGolfDiagnosticResult(
+            checked_at=checked_at,
+            tournament_id="",
+            tournament_name="",
+            display_title="",
+            expected_event_name=None,
+            datagolf_event_name=None,
+            event_found=False,
+            players_received=0,
+            players_with_scores=0,
+            db_players_count=0,
+            matched_count=0,
+            unmatched_count=0,
+            error="No active tournament found in tournaments table.",
+        )
+
+    return run_datagolf_diagnostic(client, tournament, api_key=api_key, tour=tour)
+
+
 def execute_sync(secrets: dict[str, Any], tour: str = DEFAULT_TOUR) -> SyncResult:
     """Run the same sync routine used by datagolf_sync.py --sync."""
     synced_at = datetime.now(timezone.utc)
     api_key = get_api_key_from_mapping(secrets)
     supabase_url = str(secrets.get("SUPABASE_URL", "")).strip()
-    supabase_key = str(secrets.get("SUPABASE_ANON_KEY", "")).strip()
+    supabase_key = str(secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")).strip()
 
     if not api_key:
         return SyncResult(
@@ -202,47 +563,77 @@ def execute_sync(secrets: dict[str, Any], tour: str = DEFAULT_TOUR) -> SyncResul
         return SyncResult(
             success=False,
             synced_at=synced_at,
-            error="Supabase credentials are not configured.",
+            error="SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for score sync.",
         )
 
     client = get_supabase_client_from_config(supabase_url, supabase_key)
-    tournament = ensure_tournament(client)
-    return sync_live_scores(client, tournament["id"], api_key=api_key, tour=tour)
+    tournament = get_active_tournament(client)
+    if tournament is None:
+        return SyncResult(
+            success=False,
+            synced_at=synced_at,
+            error="No active tournament found in tournaments table.",
+        )
+    return sync_live_scores(
+        client,
+        tournament,
+        api_key=api_key,
+        tour=tour,
+    )
 
 
 def sync_live_scores(
     client: Client,
-    tournament_id: str,
+    tournament: dict[str, Any],
     api_key: str,
     tour: str = DEFAULT_TOUR,
 ) -> SyncResult:
     synced_at = datetime.now(timezone.utc)
+    tournament_id = str(tournament["id"])
+    expected_event_name = tournament.get("datagolf_event_name")
 
     try:
         payload = fetch_live_tournament_data(api_key=api_key, tour=tour)
         records = extract_player_records(payload)
         current_round = extract_current_round(payload)
+        event_name = extract_event_name(payload)
+        source_updated_at = extract_source_updated_at(payload)
+        event_error = validate_event_name(expected_event_name, event_name)
+        if event_error:
+            logger.warning("DataGolf sync blocked: %s", event_error)
+            return SyncResult(
+                success=False,
+                synced_at=synced_at,
+                event_name=event_name,
+                expected_event_name=expected_event_name,
+                error=f"{event_error} {ABORTED_NO_WRITE_MSG}",
+            )
         if not records:
             return SyncResult(
                 success=False,
                 synced_at=synced_at,
-                error="DataGolf response did not contain any player records.",
+                error=(
+                    "DataGolf response did not contain any player records. "
+                    f"{ABORTED_NO_WRITE_MSG}"
+                ),
             )
 
         db_players = fetch_players(client, tournament_id)
+        selected_player_ids = {
+            str(row["player_id"])
+            for row in fetch_team_players(client, tournament_id)
+        }
         player_lookup = build_player_lookup(db_players)
         matched_player_ids: set[str] = set()
         matched_players: list[str] = []
         unmatched_players: list[str] = []
         score_rows: list[dict[str, Any]] = []
+        status_candidates: list[dict[str, Any]] = []
+        live_snapshots: list[live_feed.LiveSnapshot] = []
 
         for record in records:
             datagolf_name = extract_player_name(record)
             if not datagolf_name:
-                continue
-
-            round_scores = extract_round_scores(record, current_round=current_round)
-            if not round_scores:
                 continue
 
             db_player = match_database_player(datagolf_name, player_lookup)
@@ -253,25 +644,90 @@ def sync_live_scores(
 
             matched_player_ids.add(db_player["id"])
             matched_players.append(db_player["name"])
+            if str(db_player["id"]) in selected_player_ids:
+                snapshot = extract_live_snapshot(
+                    record,
+                    db_player,
+                    current_round=current_round,
+                    source_updated_at=source_updated_at,
+                )
+                if snapshot is not None:
+                    live_snapshots.append(snapshot)
+            round_scores = extract_round_scores(record, current_round=current_round)
             for round_num, strokes in round_scores.items():
                 score_rows.append(
                     {
                         "player_id": db_player["id"],
                         "round": round_num,
                         "strokes": strokes,
+                        "source": "DATAGOLF",
+                        "is_official": True,
+                        "updated_at": synced_at.isoformat(),
                     }
                 )
 
-        if score_rows:
-            client.table("scores").upsert(score_rows, on_conflict="player_id,round").execute()
-        else:
+            status = extract_player_status(record)
+            effective_round = 3 if status == "CUT" else current_round
+            if status and effective_round is not None:
+                status_candidates.append(
+                    {
+                        "player_id": db_player["id"],
+                        "effective_round": effective_round,
+                        "status": status,
+                        "source": "DATAGOLF",
+                        "note": f"Explicit DataGolf status during verified event {event_name}",
+                    }
+                )
+
+        if not score_rows and not status_candidates and not live_snapshots:
             return SyncResult(
                 success=False,
                 synced_at=synced_at,
                 matched_players=sorted(set(matched_players)),
                 unmatched_players=sorted(set(unmatched_players)),
-                event_name=extract_event_name(payload),
-                error="No round scores were available to sync from DataGolf.",
+                event_name=event_name,
+                expected_event_name=expected_event_name,
+                error=(
+                    "No round scores were available to sync from DataGolf. "
+                    f"{ABORTED_NO_WRITE_MSG}"
+                ),
+            )
+
+        if score_rows:
+            client.table("scores").upsert(score_rows, on_conflict="player_id,round").execute()
+
+        status_rows: list[dict[str, Any]] = []
+        if status_candidates:
+            existing_events = fetch_player_status_events(client, tournament_id)
+            latest_by_player: dict[str, tuple[str, int]] = {}
+            for event in existing_events:
+                latest_by_player[event["player_id"]] = (
+                    str(event["status"]).upper(),
+                    int(event["effective_round"]),
+                )
+            for candidate in status_candidates:
+                signature = (candidate["status"], int(candidate["effective_round"]))
+                if latest_by_player.get(candidate["player_id"]) != signature:
+                    status_rows.append(candidate)
+                    latest_by_player[candidate["player_id"]] = signature
+            if status_rows:
+                client.table("player_status_events").insert(status_rows).execute()
+
+        live_events_written = 0
+        live_feed_warning = None
+        try:
+            live_events_written = persist_live_feed_transitions(
+                client,
+                tournament_id,
+                live_snapshots,
+            )
+        except Exception as exc:
+            # Keep the established score sync operational while the additive
+            # live-feed migration is waiting to be installed.
+            logger.warning("Live feed persistence unavailable: %s", exc)
+            live_feed_warning = (
+                "Scores were synchronized, but the live-feed tables are not available yet. "
+                "Run migrations/003_live_feed.sql in Supabase."
             )
 
         return SyncResult(
@@ -279,16 +735,30 @@ def sync_live_scores(
             synced_at=synced_at,
             players_updated=len(matched_player_ids),
             scores_written=len(score_rows),
+            statuses_written=len(status_rows),
+            live_events_written=live_events_written,
             matched_players=sorted(set(matched_players)),
             unmatched_players=sorted(set(unmatched_players)),
-            event_name=extract_event_name(payload),
+            event_name=event_name,
+            expected_event_name=expected_event_name,
+            warning=live_feed_warning,
         )
-    except Exception as exc:
-        logger.exception("DataGolf sync failed")
+    except DataGolfRateLimitError as exc:
+        logger.warning("DataGolf sync aborted due to rate limit")
         return SyncResult(
             success=False,
             synced_at=synced_at,
             error=str(exc),
+        )
+    except Exception as exc:
+        logger.exception("DataGolf sync failed")
+        message = str(exc)
+        if ABORTED_NO_WRITE_MSG not in message:
+            message = f"{message} {ABORTED_NO_WRITE_MSG}"
+        return SyncResult(
+            success=False,
+            synced_at=synced_at,
+            error=message,
         )
 
 
@@ -301,11 +771,11 @@ def run_name_matching_test() -> dict[str, Any]:
     ]
     lookup = build_player_lookup(sample_players)
     checks = [
-        ("Scottie Scheffler", True),
-        ("si woo kim", True),
-        ("Adam Scott", True),
-        ("Justin Rose", True),
-        ("Jon Rahm", False),
+        ("Scheffler, Scottie", True),
+        ("Kim, Si-Woo", True),
+        ("Scott, Adam", True),
+        ("Rose, Justin", True),
+        ("Rahm, Jon", False),
     ]
     results = []
     for datagolf_name, should_match in checks:

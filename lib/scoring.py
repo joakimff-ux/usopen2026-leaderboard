@@ -12,8 +12,10 @@ class PlayerRoundResult:
     player_name: str
     tier: int
     strokes: int | None
-    counts: bool
-    dropped: bool
+    counts: bool = False
+    dropped: bool = False
+    status: str | None = None
+    score_kind: str = "ACTUAL"
 
 
 @dataclass
@@ -31,6 +33,7 @@ class TeamStanding:
     team_name: str
     round_totals: dict[int, int | None]
     tournament_total: int | None
+    completed_rounds: int
     rounds: dict[int, TeamRoundResult]
 
 
@@ -38,11 +41,31 @@ def _split_counting_and_dropped(
     player_results: list[PlayerRoundResult],
     counting_scores: int,
     dropped_scores: int,
+    penalty_score: int | None = None,
 ) -> tuple[list[PlayerRoundResult], list[PlayerRoundResult], int | None]:
     scored = [result for result in player_results if result.strokes is not None]
     missing = [result for result in player_results if result.strokes is None]
 
     if len(scored) < counting_scores:
+        needed = counting_scores - len(scored)
+        eligible_for_penalty = [
+            result for result in missing if result.status in {"CUT", "WD", "DQ"}
+        ]
+        if penalty_score is not None and len(eligible_for_penalty) >= needed:
+            penalty_results = eligible_for_penalty[:needed]
+            for result in penalty_results:
+                result.strokes = penalty_score
+                result.score_kind = "PENALTY"
+            combined = scored + penalty_results
+            combined.sort(key=lambda item: item.strokes if item.strokes is not None else 999999)
+            for result in combined:
+                result.counts = True
+            dropped = [result for result in player_results if result not in combined]
+            for result in dropped:
+                result.dropped = True
+            return combined, dropped, sum(
+                result.strokes for result in combined if result.strokes is not None
+            )
         for result in missing:
             result.dropped = True
         return [], missing, None
@@ -66,13 +89,17 @@ def build_team_round_result(
     round_num: int,
     counting_scores: int,
     dropped_scores: int,
+    statuses_by_player_round: dict[tuple[str, int], str] | None = None,
+    penalty_score: int | None = None,
 ) -> TeamRoundResult:
+    statuses = statuses_by_player_round or {}
     player_results = [
         PlayerRoundResult(
             player_id=player["id"],
             player_name=player["name"],
             tier=player["tier"],
             strokes=scores_by_player_round.get((player["id"], round_num)),
+            status=statuses.get((player["id"], round_num)),
         )
         for player in roster_players
     ]
@@ -81,6 +108,7 @@ def build_team_round_result(
         player_results,
         counting_scores=counting_scores,
         dropped_scores=dropped_scores,
+        penalty_score=penalty_score,
     )
 
     return TeamRoundResult(
@@ -100,6 +128,8 @@ def build_team_standings(
     num_rounds: int = 4,
     counting_scores: int = 5,
     dropped_scores: int = 2,
+    player_status_events: list[dict[str, Any]] | None = None,
+    tournament_rounds: list[dict[str, Any]] | None = None,
 ) -> list[TeamStanding]:
     players_by_id = {player["id"]: player for player in players}
     roster_by_team: dict[str, list[dict[str, Any]]] = {team["id"]: [] for team in teams}
@@ -110,7 +140,32 @@ def build_team_standings(
             roster_by_team.setdefault(link["team_id"], []).append(player)
 
     scores_by_player_round = {
-        (score["player_id"], score["round"]): score["strokes"] for score in scores
+        (score["player_id"], score["round"]): score["strokes"]
+        for score in scores
+        if score.get("is_official", True)
+    }
+    events_by_player: dict[str, list[dict[str, Any]]] = {}
+    for event in player_status_events or []:
+        events_by_player.setdefault(event["player_id"], []).append(event)
+
+    statuses_by_player_round: dict[tuple[str, int], str] = {}
+    for player in players:
+        events = sorted(
+            events_by_player.get(player["id"], []),
+            key=lambda event: str(event.get("created_at") or ""),
+        )
+        for round_num in range(1, num_rounds + 1):
+            current_status: str | None = None
+            for event in events:
+                if int(event["effective_round"]) <= round_num:
+                    current_status = str(event["status"]).upper()
+            if current_status and current_status != "ACTIVE":
+                statuses_by_player_round[(player["id"], round_num)] = current_status
+
+    penalty_score_by_round = {
+        int(round_row["round"]): int(round_row["penalty_score"])
+        for round_row in tournament_rounds or []
+        if round_row.get("state") == "FINALIZED" and round_row.get("penalty_score") is not None
     }
 
     standings: list[TeamStanding] = []
@@ -129,12 +184,15 @@ def build_team_standings(
                 round_num=round_num,
                 counting_scores=counting_scores,
                 dropped_scores=dropped_scores,
+                statuses_by_player_round=statuses_by_player_round,
+                penalty_score=penalty_score_by_round.get(round_num),
             )
             round_results[round_num] = round_result
             round_totals[round_num] = round_result.total
 
         complete_rounds = [total for total in round_totals.values() if total is not None]
-        tournament_total = sum(complete_rounds) if len(complete_rounds) == num_rounds else None
+        completed_rounds = len(complete_rounds)
+        tournament_total = sum(complete_rounds) if complete_rounds else None
 
         standings.append(
             TeamStanding(
@@ -142,12 +200,14 @@ def build_team_standings(
                 team_name=team["name"],
                 round_totals=round_totals,
                 tournament_total=tournament_total,
+                completed_rounds=completed_rounds,
                 rounds=round_results,
             )
         )
 
     standings.sort(
         key=lambda item: (
+            -item.completed_rounds,
             item.tournament_total is None,
             item.tournament_total if item.tournament_total is not None else 999999,
             item.team_name,
