@@ -409,8 +409,7 @@ def page_leaderboard() -> None:
         [
             ("Lag", str(len(standings))),
             ("Runder", "4"),
-            ("1. plass", "4 000 kr"),
-            ("2. plass", "1 000 kr"),
+            ("1. plass", "4 500 kr"),
         ]
     )
 

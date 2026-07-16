@@ -175,6 +175,7 @@ section[data-testid="stSidebar"] div[role="radiogroup"] label:has(input:checked)
     box-shadow: 0 10px 25px rgba(39,31,16,.08);
 }
 .stat-card.prize { background:linear-gradient(135deg,#06243f,#0a3151); border-color:var(--gold); }
+.stat-card:last-child:nth-child(3) { grid-column:span 2; }
 .stat-icon { font-size:1.8rem; width:2.4rem; text-align:center; }
 .stat-card .label { color:var(--muted); font-size:.72rem; text-transform:uppercase; letter-spacing:.09em; font-weight:700; }
 .stat-card .value { color:var(--navy); font-family:'Cormorant Garamond',Georgia,serif; font-size:2rem; font-weight:700; line-height:1; margin-top:.22rem; }
@@ -377,7 +378,7 @@ def render_hero(title: str, subtitle: str) -> None:
 
 
 def render_stat_cards(items: list[tuple[str, str]]) -> None:
-    icons = {"Lag": "♜", "Runder": "⚑", "1. plass": "🏆", "2. plass": "🥈"}
+    icons = {"Lag": "♜", "Runder": "⚑", "1. plass": "🏆"}
     cards = "".join(
         f'<div class="stat-card {"prize" if "plass" in label else ""}">'
         f'<div class="stat-icon">{icons.get(label, "◆")}</div>'
