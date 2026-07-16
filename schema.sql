@@ -57,6 +57,38 @@ create table team_players (
     unique (team_id, player_id)
 );
 
+-- Append-only post-round-two roster revisions. team_players always remains
+-- the original roster used for rounds 1 and 2.
+create table roster_change_sets (
+    id uuid primary key default gen_random_uuid(),
+    tournament_id uuid not null references tournaments(id) on delete cascade,
+    round_from int not null default 3 check (round_from = 3),
+    is_active boolean not null default false,
+    is_locked boolean not null default true,
+    created_at timestamptz not null default now(),
+    created_by text not null,
+    unlocked_at timestamptz,
+    unlocked_by text
+);
+
+create unique index uq_roster_change_sets_active_tournament
+    on roster_change_sets(tournament_id)
+    where is_active = true;
+
+create table roster_changes (
+    id uuid primary key default gen_random_uuid(),
+    change_set_id uuid not null references roster_change_sets(id) on delete cascade,
+    tournament_id uuid not null references tournaments(id) on delete cascade,
+    team_id uuid not null references teams(id),
+    round_from int not null default 3 check (round_from = 3),
+    old_player_id uuid not null references players(id),
+    new_player_id uuid not null references players(id),
+    changed_at timestamptz not null default now(),
+    changed_by text not null,
+    unique (change_set_id, team_id, old_player_id),
+    check (old_player_id <> new_player_id)
+);
+
 create table scores (
     id uuid primary key default gen_random_uuid(),
     player_id uuid not null references players(id) on delete cascade,
@@ -151,6 +183,8 @@ create index idx_teams_tournament on teams(tournament_id);
 create index idx_players_tournament on players(tournament_id);
 create index idx_team_players_team on team_players(team_id);
 create index idx_team_players_player on team_players(player_id);
+create index idx_roster_changes_tournament
+    on roster_changes(tournament_id, change_set_id, team_id);
 create index idx_scores_player on scores(player_id);
 create index idx_scores_round on scores(round);
 create index idx_player_status_events_player on player_status_events(player_id, created_at desc);
@@ -200,6 +234,8 @@ alter table tournaments enable row level security;
 alter table teams enable row level security;
 alter table players enable row level security;
 alter table team_players enable row level security;
+alter table roster_change_sets enable row level security;
+alter table roster_changes enable row level security;
 alter table scores enable row level security;
 alter table player_status_events enable row level security;
 alter table live_player_states enable row level security;
@@ -211,6 +247,8 @@ create policy public_read_tournaments on tournaments for select to anon, authent
 create policy public_read_teams on teams for select to anon, authenticated using (true);
 create policy public_read_players on players for select to anon, authenticated using (true);
 create policy public_read_team_players on team_players for select to anon, authenticated using (true);
+create policy public_read_roster_change_sets on roster_change_sets for select to anon, authenticated using (true);
+create policy public_read_roster_changes on roster_changes for select to anon, authenticated using (true);
 create policy public_read_scores on scores for select to anon, authenticated using (true);
 create policy public_read_player_status_events on player_status_events for select to anon, authenticated using (true);
 create policy public_read_live_player_states on live_player_states for select to anon, authenticated using (true);
@@ -219,10 +257,11 @@ create policy public_read_tournament_rounds on tournament_rounds for select to a
 
 grant select on tournaments, teams, players, team_players, scores,
     player_status_events, live_player_states, live_feed_events,
-    tournament_rounds to anon, authenticated;
+    tournament_rounds, roster_change_sets, roster_changes to anon, authenticated;
 revoke insert, update, delete on tournaments, teams, players, team_players,
     scores, player_status_events, live_player_states, live_feed_events,
-    tournament_rounds, admin_audit_log from anon, authenticated;
+    tournament_rounds, roster_change_sets, roster_changes, admin_audit_log
+    from anon, authenticated;
 revoke all on admin_audit_log from anon, authenticated;
 
 commit;

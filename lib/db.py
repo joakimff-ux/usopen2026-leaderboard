@@ -136,6 +136,41 @@ def fetch_team_players(client: Client, tournament_id: str) -> list[dict[str, Any
     return response.data or []
 
 
+def fetch_active_roster_change_set(
+    client: Client,
+    tournament_id: str,
+) -> dict[str, Any] | None:
+    response = (
+        client.table("roster_change_sets")
+        .select("*")
+        .eq("tournament_id", tournament_id)
+        .eq("is_active", True)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
+def fetch_active_roster_changes(
+    client: Client,
+    tournament_id: str,
+    active_change_set: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    change_set = active_change_set or fetch_active_roster_change_set(client, tournament_id)
+    if change_set is None:
+        return []
+    response = (
+        client.table("roster_changes")
+        .select("*")
+        .eq("tournament_id", tournament_id)
+        .eq("change_set_id", change_set["id"])
+        .order("changed_at")
+        .execute()
+    )
+    return response.data or []
+
+
 def fetch_scores(client: Client, tournament_id: str) -> list[dict[str, Any]]:
     players = fetch_players(client, tournament_id)
     if not players:

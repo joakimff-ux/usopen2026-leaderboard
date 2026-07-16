@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from lib import roster_changes
+
 
 @dataclass
 class PlayerRoundResult:
@@ -139,15 +141,18 @@ def build_team_standings(
     player_status_events: list[dict[str, Any]] | None = None,
     tournament_rounds: list[dict[str, Any]] | None = None,
     live_states: list[dict[str, Any]] | None = None,
+    roster_change_rows: list[dict[str, Any]] | None = None,
     course_par: int = 72,
 ) -> list[TeamStanding]:
-    players_by_id = {player["id"]: player for player in players}
-    roster_by_team: dict[str, list[dict[str, Any]]] = {team["id"]: [] for team in teams}
+    players_by_id = {str(player["id"]): player for player in players}
+    roster_by_team: dict[str, list[dict[str, Any]]] = {
+        str(team["id"]): [] for team in teams
+    }
 
     for link in team_players:
-        player = players_by_id.get(link["player_id"])
+        player = players_by_id.get(str(link["player_id"]))
         if player:
-            roster_by_team.setdefault(link["team_id"], []).append(player)
+            roster_by_team.setdefault(str(link["team_id"]), []).append(player)
 
     scores_by_player_round = {
         (str(score["player_id"]), int(score["round"])): int(score["strokes"]) - course_par
@@ -186,14 +191,26 @@ def build_team_standings(
 
     standings: list[TeamStanding] = []
     for team in teams:
-        roster_players = sorted(
-            roster_by_team.get(team["id"], []),
+        team_id = str(team["id"])
+        original_roster_players = sorted(
+            roster_by_team.get(team_id, []),
             key=lambda player: (player["tier"], player["name"]),
         )
+        original_ids = [str(player["id"]) for player in original_roster_players]
         round_results: dict[int, TeamRoundResult] = {}
         round_totals: dict[int, int | None] = {}
 
         for round_num in range(1, num_rounds + 1):
+            effective_ids = roster_changes.apply_roster_changes(
+                {team_id: original_ids},
+                roster_change_rows or [],
+                round_num=round_num,
+            )[team_id]
+            roster_players = [
+                players_by_id[player_id]
+                for player_id in effective_ids
+                if player_id in players_by_id
+            ]
             round_result = build_team_round_result(
                 roster_players=roster_players,
                 scores_by_player_round=scores_by_player_round,

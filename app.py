@@ -19,6 +19,7 @@ from lib import (
     leaderboard_preview,
     live_feed,
     participant_admin,
+    roster_changes,
     scoring,
     styles,
     time_display,
@@ -88,6 +89,10 @@ def load_competition_data(tournament_id: str, tournament_rules: dict):
     status_events = db.fetch_player_status_events(client, tournament_id)
     tournament_rounds = db.fetch_tournament_rounds(client, tournament_id)
     try:
+        roster_change_rows = db.fetch_active_roster_changes(client, tournament_id)
+    except Exception:
+        roster_change_rows = []
+    try:
         live_states = db.fetch_live_player_states(client, tournament_id)
     except Exception:
         live_states = []
@@ -102,6 +107,7 @@ def load_competition_data(tournament_id: str, tournament_rules: dict):
         player_status_events=status_events,
         tournament_rounds=tournament_rounds,
         live_states=live_states,
+        roster_change_rows=roster_change_rows,
         course_par=int(tournament_rules.get("course_par", 72)),
     )
     return {
@@ -112,6 +118,7 @@ def load_competition_data(tournament_id: str, tournament_rules: dict):
         "status_events": status_events,
         "tournament_rounds": tournament_rounds,
         "live_states": live_states,
+        "roster_changes": roster_change_rows,
         "standings": standings,
     }
 
@@ -572,8 +579,30 @@ def page_admin() -> None:
         auth.logout_admin()
         st.rerun()
 
-    tab_tournament, tab_datagolf, tab_import, tab_teams, tab_players, tab_rosters, tab_scorer, tab_status, tab_reset = st.tabs(
-        ["Tournament", "DataGolf", "Import", "Teams", "Players", "Rosters", "Scorer", "Statuses & penalties", "Reset"]
+    (
+        tab_tournament,
+        tab_datagolf,
+        tab_import,
+        tab_teams,
+        tab_players,
+        tab_rosters,
+        tab_swaps,
+        tab_scorer,
+        tab_status,
+        tab_reset,
+    ) = st.tabs(
+        [
+            "Tournament",
+            "DataGolf",
+            "Import",
+            "Teams",
+            "Players",
+            "Rosters",
+            "Bytter",
+            "Scorer",
+            "Statuses & penalties",
+            "Reset",
+        ]
     )
 
     with tab_tournament:
@@ -755,6 +784,149 @@ def page_admin() -> None:
             "Nye deltakere opprettes og redigeres under Teams. "
             "De sju lagene fra hovedimporten er skrivebeskyttet her."
         )
+
+    with tab_swaps:
+        st.subheader("Bytter")
+        st.caption(
+            "Byttene gjelder fra og med runde 3. Opprinnelig laguttak og scorer "
+            "fra runde 1 og 2 beholdes uendret."
+        )
+        tournament_id = str(tournament["id"])
+        try:
+            active_change_set = db.fetch_active_roster_change_set(client, tournament_id)
+            active_change_rows = db.fetch_active_roster_changes(
+                client,
+                tournament_id,
+                active_change_set,
+            )
+        except Exception:
+            st.error(
+                "Byttefunksjonen krever databasemigrasjonen "
+                "`migrations/005_roster_changes.sql`."
+            )
+        else:
+            round_two_ready = active_change_set is not None or roster_changes.round_two_is_finalized(
+                db.fetch_tournament_rounds(client, tournament_id)
+            )
+            if roster_changes.changes_are_locked(active_change_set):
+                st.success("Bytter er gjennomført.")
+                if st.button("Lås opp", key="unlock_roster_changes"):
+                    roster_changes.unlock_roster_changes(
+                        client,
+                        active_change_set,
+                        changed_by="admin",
+                    )
+                    st.success("Byttene er låst opp for korrigering.")
+                    st.rerun()
+            elif not round_two_ready:
+                st.warning(
+                    "Bytter åpnes når runde 2 er ferdig og markert som FINALIZED "
+                    "under Statuses & penalties."
+                )
+            else:
+                teams = db.fetch_teams(client, tournament_id)
+                players = db.fetch_players(client, tournament_id)
+                team_players = db.fetch_team_players(client, tournament_id)
+                players_by_id = {str(player["id"]): player for player in players}
+                player_id_by_name = {str(player["name"]): str(player["id"]) for player in players}
+                player_names = [str(player["name"]) for player in players]
+                original_by_team = roster_changes.build_original_rosters(
+                    teams,
+                    players,
+                    team_players,
+                )
+                current_by_team = roster_changes.apply_roster_changes(
+                    original_by_team,
+                    active_change_rows,
+                )
+
+                editor_rows = []
+                for team_number, team in enumerate(teams, start=1):
+                    team_id = str(team["id"])
+                    current_ids = current_by_team.get(team_id, [])
+                    row = {
+                        "team_id": team_id,
+                        "Lag": f"Lag {team_number}",
+                        "Eier": str(team["name"]),
+                        "Lagre": True,
+                    }
+                    for slot in range(1, roster_changes.ROSTER_SIZE + 1):
+                        player_id = current_ids[slot - 1] if slot <= len(current_ids) else None
+                        player = players_by_id.get(player_id) if player_id else None
+                        row[f"Spiller {slot}"] = str(player["name"]) if player else None
+                    editor_rows.append(row)
+
+                edited = st.data_editor(
+                    pd.DataFrame(editor_rows),
+                    column_config={
+                        "team_id": None,
+                        "Lag": st.column_config.TextColumn(disabled=True),
+                        "Eier": st.column_config.TextColumn(disabled=True),
+                        **{
+                            f"Spiller {slot}": st.column_config.SelectboxColumn(
+                                f"Spiller {slot}",
+                                options=player_names,
+                                required=True,
+                            )
+                            for slot in range(1, roster_changes.ROSTER_SIZE + 1)
+                        },
+                        "Lagre": st.column_config.CheckboxColumn(
+                            "Lagre",
+                            help="Fjern avhukingen for å ignorere endringer på dette laget.",
+                        ),
+                    },
+                    disabled=["Lag", "Eier"],
+                    hide_index=True,
+                    use_container_width=True,
+                    num_rows="fixed",
+                    key="roster_changes_editor",
+                )
+
+                selected_by_team: dict[str, list[str]] = {}
+                owner_by_team = {str(team["id"]): str(team["name"]) for team in teams}
+                for _, row in edited.iterrows():
+                    team_id = str(row["team_id"])
+                    if not bool(row["Lagre"]):
+                        selected_by_team[team_id] = list(current_by_team.get(team_id, []))
+                        continue
+                    selected_by_team[team_id] = [
+                        player_id_by_name.get(str(row[f"Spiller {slot}"]), "")
+                        for slot in range(1, roster_changes.ROSTER_SIZE + 1)
+                    ]
+
+                validation = roster_changes.validate_rosters(
+                    selected_by_team,
+                    set(players_by_id),
+                )
+                for error in validation.errors:
+                    team_id, _, message = error.partition(": ")
+                    st.error(f"{owner_by_team.get(team_id, team_id)}: {message}")
+
+                has_edits = roster_changes.rosters_differ(
+                    current_by_team,
+                    selected_by_team,
+                )
+                if not has_edits and validation.is_valid:
+                    st.caption("Velg minst ett spillerbytte før lagring.")
+                if st.button(
+                    "Lagre bytter",
+                    type="primary",
+                    disabled=not validation.is_valid or not has_edits,
+                    key="save_roster_changes",
+                ):
+                    roster_changes.save_roster_changes(
+                        client,
+                        tournament_id,
+                        original_by_team,
+                        selected_by_team,
+                        set(players_by_id),
+                        active_change_set,
+                        round_two_finalized=round_two_ready,
+                        changed_by="admin",
+                    )
+                    clear_data_cache()
+                    st.success("Bytter er gjennomført.")
+                    st.rerun()
 
     with tab_scorer:
         st.subheader("Live scoring from DataGolf")

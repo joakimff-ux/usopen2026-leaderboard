@@ -164,6 +164,57 @@ class LeaderboardStandingTests(unittest.TestCase):
         self.assertEqual(sum([70, 71, 71, 71, 72]), 355)
         self.assertEqual(standings[0].round_totals[1], -5)
 
+    def test_roster_change_uses_original_for_rounds_one_two_and_new_from_three(self):
+        teams = [{"id": "team-1", "name": "Owner"}]
+        players = [
+            {"id": f"p{index}", "name": f"Player {index}", "tier": index}
+            for index in range(1, 9)
+        ]
+        team_players = [
+            {"team_id": "team-1", "player_id": f"p{index}"}
+            for index in range(1, 8)
+        ]
+        scores = [
+            {
+                "player_id": f"p{player_index}",
+                "round": round_num,
+                "strokes": 62 if player_index == 8 else 72,
+            }
+            for player_index in range(1, 9)
+            for round_num in range(1, 5)
+        ]
+        changes = [
+            {
+                "team_id": "team-1",
+                "old_player_id": "p1",
+                "new_player_id": "p8",
+                "round_from": 3,
+            }
+        ]
+
+        standing = build_team_standings(
+            teams,
+            players,
+            team_players,
+            scores,
+            roster_change_rows=changes,
+        )[0]
+
+        round_one_ids = {
+            result.player_id
+            for result in standing.rounds[1].counting + standing.rounds[1].dropped
+        }
+        round_three_ids = {
+            result.player_id
+            for result in standing.rounds[3].counting + standing.rounds[3].dropped
+        }
+        self.assertIn("p1", round_one_ids)
+        self.assertNotIn("p8", round_one_ids)
+        self.assertIn("p8", round_three_ids)
+        self.assertNotIn("p1", round_three_ids)
+        self.assertEqual(standing.round_totals, {1: 0, 2: 0, 3: -10, 4: -10})
+        self.assertEqual(standing.tournament_total, -20)
+
 
 if __name__ == "__main__":
     unittest.main()

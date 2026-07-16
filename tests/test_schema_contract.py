@@ -17,6 +17,8 @@ class SchemaContractTests(unittest.TestCase):
                 "teams",
                 "players",
                 "team_players",
+                "roster_change_sets",
+                "roster_changes",
                 "scores",
                 "player_status_events",
                 "live_player_states",
@@ -36,8 +38,19 @@ class SchemaContractTests(unittest.TestCase):
     def test_public_roles_are_read_only_and_audit_is_private(self):
         self.assertIn("grant select on tournaments", self.sql.lower())
         self.assertIn("public_read_live_player_states", self.sql.lower())
+        self.assertIn("public_read_roster_changes", self.sql.lower())
         self.assertIn("revoke insert, update, delete", self.sql.lower())
         self.assertIn("revoke all on admin_audit_log", self.sql.lower())
+
+    def test_roster_changes_are_round_three_only_and_preserve_original_roster(self):
+        self.assertRegex(self.sql, r"round_from\s+int\s+not null\s+default 3")
+        self.assertIn("check (round_from = 3)", self.sql)
+        self.assertIn("old_player_id", self.sql)
+        self.assertIn("new_player_id", self.sql)
+        self.assertNotRegex(
+            self.sql.lower(),
+            r"(?s)create table roster_changes.*?delete from team_players",
+        )
 
 
 if __name__ == "__main__":
