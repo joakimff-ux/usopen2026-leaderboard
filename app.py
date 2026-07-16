@@ -387,45 +387,76 @@ def participant_preview(name: str, selected_ids: list[str], players: list[dict])
         st.caption("Ingen spillere valgt ennå.")
 
 
-def render_pending_roster_changes(
+def render_roster_change_dashboard(
+    total_teams: int,
+    completed_teams: int,
+    changes_used: int,
+    window_is_open: bool,
+) -> None:
+    columns = st.columns(5)
+    columns[0].metric("Lag", total_teams)
+    columns[1].metric("Ferdige", completed_teams)
+    columns[2].metric("Mangler", total_teams - completed_teams)
+    columns[3].metric(
+        "Bytter brukt",
+        f"{changes_used} / {total_teams * roster_changes.MAX_CHANGES_PER_TEAM}",
+    )
+    columns[4].metric("Status", "🟢 Åpent" if window_is_open else "🔴 Stengt")
+
+
+def reset_roster_team(
+    editor_prefix: str,
+    team_id: str,
+    player_ids: list[str],
+) -> None:
+    for slot, player_id in enumerate(player_ids, start=1):
+        st.session_state[f"{editor_prefix}_{team_id}_{slot}"] = player_id
+
+
+def roster_change_export_csv(
     teams: list[dict],
     players: list[dict],
-    change_pairs: list[dict[str, str]],
-) -> None:
+    change_rows: list[dict],
+) -> bytes:
     players_by_id = {str(player["id"]): str(player["name"]) for player in players}
-    changes_by_team: dict[str, list[dict[str, str]]] = {}
-    for pair in change_pairs:
-        changes_by_team.setdefault(str(pair["team_id"]), []).append(pair)
-
-    st.markdown("#### Kontroll før lagring")
-    for team in teams:
-        team_id = str(team["id"])
-        team_changes = changes_by_team.get(team_id, [])
-        with st.container(border=True):
-            st.markdown(
-                f"**{team['name']} — Bytter brukt: "
-                f"{len(team_changes)} / {roster_changes.MAX_CHANGES_PER_TEAM}**"
-            )
-            if not team_changes:
-                st.caption("Ingen endringer.")
-                continue
-            if len(team_changes) == roster_changes.MAX_CHANGES_PER_TEAM:
-                st.info("Maks tre bytter er brukt på dette laget.")
-            for pair in team_changes:
-                old_name = escape(players_by_id.get(pair["old_player_id"], pair["old_player_id"]))
-                new_name = escape(players_by_id.get(pair["new_player_id"], pair["new_player_id"]))
-                st.markdown(
-                    '<span style="color:#777;text-decoration:line-through">'
-                    f"{old_name}</span> ➜ "
-                    f'<span style="color:#18864b;font-weight:700">{new_name}</span>',
-                    unsafe_allow_html=True,
-                )
+    teams_by_id = {
+        str(team["id"]): (f"Lag {index}", str(team["name"]))
+        for index, team in enumerate(teams, start=1)
+    }
+    rows = []
+    for change in change_rows:
+        team_label, owner = teams_by_id.get(
+            str(change["team_id"]),
+            (str(change["team_id"]), str(change["team_id"])),
+        )
+        changed_at = change.get("changed_at")
+        timestamp = ""
+        if changed_at:
+            try:
+                timestamp = time_display.to_oslo_datetime(changed_at).strftime("%Y-%m-%d %H:%M")
+            except (TypeError, ValueError):
+                timestamp = str(changed_at)
+        rows.append(
+            {
+                "Lag": team_label,
+                "Eier": owner,
+                "Ut": players_by_id.get(str(change["old_player_id"]), change["old_player_id"]),
+                "Inn": players_by_id.get(str(change["new_player_id"]), change["new_player_id"]),
+                "Tidspunkt": timestamp,
+            }
+        )
+    return pd.DataFrame(rows, columns=["Lag", "Eier", "Ut", "Inn", "Tidspunkt"]).to_csv(
+        index=False
+    ).encode("utf-8-sig")
 
 
 def render_saved_roster_changes(
     teams: list[dict],
     players: list[dict],
     change_rows: list[dict],
+    *,
+    heading: str = "Sist lagrede bytter",
+    offer_download: bool = True,
 ) -> None:
     if not change_rows:
         return
@@ -434,7 +465,7 @@ def render_saved_roster_changes(
     for row in change_rows:
         changes_by_team.setdefault(str(row["team_id"]), []).append(row)
 
-    st.markdown("#### Sist lagrede bytter")
+    st.markdown(f"#### {heading}")
     for team in teams:
         team_changes = changes_by_team.get(str(team["id"]), [])
         if not team_changes:
@@ -450,6 +481,14 @@ def render_saved_roster_changes(
                 st.markdown("**IN**")
                 for row in team_changes:
                     st.write(players_by_id.get(str(row["new_player_id"]), row["new_player_id"]))
+    if offer_download:
+        st.download_button(
+            "📄 Last ned bytteliste",
+            data=roster_change_export_csv(teams, players, change_rows),
+            file_name="bytteliste.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
 
 @st.dialog("Bekreft spillerbytter")
@@ -459,7 +498,17 @@ def confirm_roster_changes_dialog(
     original_by_team: dict[str, list[str]],
     selected_by_team: dict[str, list[str]],
     valid_player_ids: set[str],
+    teams: list[dict],
+    players: list[dict],
 ) -> None:
+    change_pairs = roster_changes.build_change_pairs(original_by_team, selected_by_team)
+    render_saved_roster_changes(
+        teams,
+        players,
+        change_pairs,
+        heading="Sammendrag før lagring",
+        offer_download=False,
+    )
     st.write("Du er i ferd med å gjennomføre spillerbytter.")
     st.write("Disse vil gjelde fra og med runde 3.")
     st.write("Runde 1 og 2 endres ikke.")
@@ -930,11 +979,6 @@ def page_admin() -> None:
             )
             round_three_started = roster_changes.round_three_has_started(scores, live_states)
             players_by_id = {str(player["id"]): player for player in players}
-            player_id_by_name = {
-                str(player["name"]): str(player["id"])
-                for player in players
-            }
-            player_names = [str(player["name"]) for player in players]
             original_by_team = roster_changes.build_original_rosters(
                 teams,
                 players,
@@ -943,6 +987,48 @@ def page_admin() -> None:
             current_by_team = roster_changes.apply_roster_changes(
                 original_by_team,
                 active_change_rows,
+            )
+
+            window_is_open = round_two_ready and not round_three_started
+            change_set_key = str(active_change_set["id"]) if active_change_set else "original"
+            editor_prefix = f"roster_editor_{tournament_id}_{change_set_key}"
+            for team in teams:
+                team_id = str(team["id"])
+                for slot, player_id in enumerate(current_by_team.get(team_id, []), start=1):
+                    state_key = f"{editor_prefix}_{team_id}_{slot}"
+                    if state_key not in st.session_state:
+                        st.session_state[state_key] = player_id
+
+            selected_by_team = {
+                str(team["id"]): [
+                    str(st.session_state.get(
+                        f"{editor_prefix}_{team['id']}_{slot}",
+                        "",
+                    ))
+                    for slot in range(1, roster_changes.ROSTER_SIZE + 1)
+                ]
+                for team in teams
+            }
+            changes_by_team = roster_changes.change_count_by_team(
+                original_by_team,
+                selected_by_team,
+            )
+            valid_player_ids = set(players_by_id)
+            valid_changed_teams = {
+                team_id
+                for team_id, count in changes_by_team.items()
+                if count > 0
+                and roster_changes.validate_rosters(
+                    {team_id: selected_by_team[team_id]},
+                    valid_player_ids,
+                    {team_id: original_by_team[team_id]},
+                ).is_valid
+            }
+            render_roster_change_dashboard(
+                len(teams),
+                len(valid_changed_teams),
+                sum(changes_by_team.values()),
+                window_is_open,
             )
 
             if st.session_state.pop("roster_changes_saved", False):
@@ -957,55 +1043,118 @@ def page_admin() -> None:
                     "under Statuses & penalties."
                 )
             else:
-                editor_rows = []
-                for team_number, team in enumerate(teams, start=1):
-                    team_id = str(team["id"])
-                    current_ids = current_by_team.get(team_id, [])
-                    row = {
-                        "team_id": team_id,
-                        "Lag": f"Lag {team_number}",
-                        "Eier": str(team["name"]),
-                    }
-                    for slot in range(1, roster_changes.ROSTER_SIZE + 1):
-                        player_id = current_ids[slot - 1] if slot <= len(current_ids) else None
-                        player = players_by_id.get(player_id) if player_id else None
-                        row[f"Spiller {slot}"] = str(player["name"]) if player else None
-                    editor_rows.append(row)
-
-                edited = st.data_editor(
-                    pd.DataFrame(editor_rows),
-                    column_config={
-                        "team_id": None,
-                        "Lag": st.column_config.TextColumn(disabled=True),
-                        "Eier": st.column_config.TextColumn(disabled=True),
-                        **{
-                            f"Spiller {slot}": st.column_config.SelectboxColumn(
-                                f"Spiller {slot}",
-                                options=player_names,
-                                required=True,
-                            )
-                            for slot in range(1, roster_changes.ROSTER_SIZE + 1)
-                        },
-                    },
-                    disabled=["Lag", "Eier"],
-                    hide_index=True,
-                    use_container_width=True,
-                    num_rows="fixed",
-                    key="roster_changes_editor",
-                )
-
-                selected_by_team: dict[str, list[str]] = {}
                 owner_by_team = {str(team["id"]): str(team["name"]) for team in teams}
-                for _, row in edited.iterrows():
-                    team_id = str(row["team_id"])
-                    selected_by_team[team_id] = [
-                        player_id_by_name.get(str(row[f"Spiller {slot}"]), "")
-                        for slot in range(1, roster_changes.ROSTER_SIZE + 1)
-                    ]
+                search_query = st.text_input(
+                    "Søk i lag, eier eller spiller",
+                    placeholder="For eksempel Scottie, Fleetwood eller Joakim",
+                    key=f"{editor_prefix}_search",
+                ).strip().casefold()
+                visible_teams = []
+                for team in teams:
+                    team_id = str(team["id"])
+                    searchable = [str(team["name"])]
+                    searchable.extend(
+                        str(players_by_id[player_id]["name"])
+                        for player_id in {
+                            *original_by_team.get(team_id, []),
+                            *selected_by_team.get(team_id, []),
+                        }
+                        if player_id in players_by_id
+                    )
+                    if not search_query or any(
+                        search_query in value.casefold() for value in searchable
+                    ):
+                        visible_teams.append(team)
+
+                if visible_teams:
+                    navigation = " · ".join(
+                        f"[{escape(str(team['name']))}](#bytter-{team['id']})"
+                        for team in visible_teams
+                    )
+                    st.markdown(f"**Hurtignavigasjon:** {navigation}")
+                else:
+                    st.info("Ingen lag eller spillere samsvarer med søket.")
+
+                for team in visible_teams:
+                    team_id = str(team["id"])
+                    original_ids = original_by_team.get(team_id, [])
+                    current_ids = current_by_team.get(team_id, [])
+                    team_selected = selected_by_team.get(team_id, [])
+                    changes_used = changes_by_team.get(team_id, 0)
+                    team_validation = roster_changes.validate_rosters(
+                        {team_id: team_selected},
+                        valid_player_ids,
+                        {team_id: original_ids},
+                    )
+                    is_complete = changes_used > 0 and team_validation.is_valid
+                    st.markdown(
+                        f'<div id="bytter-{escape(team_id)}"></div>',
+                        unsafe_allow_html=True,
+                    )
+                    with st.container(border=True):
+                        title_col, reset_col = st.columns([4, 1])
+                        marker = "✅ " if is_complete else ""
+                        title_col.markdown(
+                            f"### {marker}{team['name']}  \n"
+                            f"Bytter brukt: **{changes_used} / "
+                            f"{roster_changes.MAX_CHANGES_PER_TEAM}**"
+                        )
+                        reset_col.button(
+                            "↩ Tilbakestill lag",
+                            key=f"{editor_prefix}_{team_id}_reset",
+                            on_click=reset_roster_team,
+                            args=(editor_prefix, team_id, current_ids),
+                            use_container_width=True,
+                        )
+
+                        selector_columns = st.columns(roster_changes.ROSTER_SIZE)
+                        for slot, column in enumerate(selector_columns, start=1):
+                            state_key = f"{editor_prefix}_{team_id}_{slot}"
+                            selected_id = str(st.session_state.get(state_key, ""))
+                            original_id = (
+                                original_ids[slot - 1]
+                                if slot <= len(original_ids)
+                                else None
+                            )
+                            lock_unchanged_slot = (
+                                changes_used >= roster_changes.MAX_CHANGES_PER_TEAM
+                                and selected_id == original_id
+                            )
+                            column.selectbox(
+                                f"Spiller {slot}",
+                                options=list(players_by_id),
+                                format_func=lambda value, lookup=players_by_id: str(
+                                    lookup[value]["name"]
+                                ),
+                                key=state_key,
+                                disabled=lock_unchanged_slot,
+                            )
+
+                        if changes_used >= roster_changes.MAX_CHANGES_PER_TEAM:
+                            st.caption("Maks tre bytter er brukt. Uendrede spillervalg er låst.")
+                        for error in team_validation.errors:
+                            _, _, message = error.partition(": ")
+                            st.error(message)
+                        try:
+                            team_pairs = roster_changes.build_change_pairs(
+                                {team_id: original_ids},
+                                {team_id: team_selected},
+                            )
+                        except ValueError:
+                            team_pairs = []
+                        for pair in team_pairs:
+                            old_name = escape(str(players_by_id[pair["old_player_id"]]["name"]))
+                            new_name = escape(str(players_by_id[pair["new_player_id"]]["name"]))
+                            st.markdown(
+                                '<span style="color:#777;text-decoration:line-through">'
+                                f"{old_name}</span> ➜ "
+                                f'<span style="color:#18864b;font-weight:700">{new_name}</span>',
+                                unsafe_allow_html=True,
+                            )
 
                 validation = roster_changes.validate_rosters(
                     selected_by_team,
-                    set(players_by_id),
+                    valid_player_ids,
                     original_by_team,
                 )
                 for error in validation.errors:
@@ -1016,14 +1165,6 @@ def page_admin() -> None:
                     current_by_team,
                     selected_by_team,
                 )
-                try:
-                    change_pairs = roster_changes.build_change_pairs(
-                        original_by_team,
-                        selected_by_team,
-                    )
-                except ValueError:
-                    change_pairs = []
-                render_pending_roster_changes(teams, players, change_pairs)
                 if not has_edits and validation.is_valid:
                     st.caption("Velg minst ett spillerbytte før lagring.")
                 if st.button(
@@ -1038,7 +1179,9 @@ def page_admin() -> None:
                         tournament_id,
                         original_by_team,
                         selected_by_team,
-                        set(players_by_id),
+                        valid_player_ids,
+                        teams,
+                        players,
                     )
 
     with tab_scorer:

@@ -49,6 +49,33 @@ class RosterChangeTests(unittest.TestCase):
             self.app_source,
         )
 
+    def test_admin_ui_has_operational_dashboard_and_quick_tools(self):
+        for label in (
+            '"Lag"',
+            '"Ferdige"',
+            '"Mangler"',
+            '"Bytter brukt"',
+            '"Søk i lag, eier eller spiller"',
+            'f"**Hurtignavigasjon:',
+            '"↩ Tilbakestill lag"',
+        ):
+            self.assertIn(label, self.app_source)
+
+    def test_admin_ui_prevents_more_edits_after_three_changes(self):
+        self.assertIn("lock_unchanged_slot", self.app_source)
+        self.assertIn(
+            '"Maks tre bytter er brukt. Uendrede spillervalg er låst."',
+            self.app_source,
+        )
+
+    def test_admin_ui_shows_summary_and_csv_export(self):
+        self.assertIn('heading="Sammendrag før lagring"', self.app_source)
+        self.assertIn('"📄 Last ned bytteliste"', self.app_source)
+        self.assertIn(
+            '["Lag", "Eier", "Ut", "Inn", "Tidspunkt"]',
+            self.app_source,
+        )
+
     def test_duplicate_player_is_rejected(self):
         selected = {"team-1": ["p1", "p1", "p3", "p4", "p5", "p6", "p7"]}
         validation = validate_rosters(selected, {f"p{index}" for index in range(1, 9)})
