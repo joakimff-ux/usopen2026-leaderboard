@@ -18,7 +18,11 @@ supabase_stub.Client = object
 supabase_stub.create_client = lambda *_args, **_kwargs: None
 sys.modules.setdefault("supabase", supabase_stub)
 
-from lib.datagolf_sync import extract_round_scores, sync_live_scores  # noqa: E402
+from lib.datagolf_sync import (  # noqa: E402
+    extract_round_scores,
+    log_raw_player_samples,
+    sync_live_scores,
+)
 from lib.scoring import build_team_standings  # noqa: E402
 
 
@@ -179,6 +183,29 @@ class DataGolfEventGuardTests(unittest.TestCase):
             ),
             {1: 69},
         )
+
+    def test_logs_complete_raw_json_for_only_first_five_players(self):
+        records = [
+            {
+                "player_name": f"Player {index}",
+                "today": index,
+                "thru": index,
+                "round": 1,
+                "R1": None,
+                "R2": None,
+                "R3": None,
+                "R4": None,
+            }
+            for index in range(1, 7)
+        ]
+
+        with self.assertLogs("lib.datagolf_sync", level="INFO") as captured:
+            log_raw_player_samples(records)
+
+        self.assertEqual(len(captured.output), 5)
+        self.assertIn('"player_name": "Player 1"', captured.output[0])
+        self.assertIn('"today": 5', captured.output[-1])
+        self.assertNotIn("Player 6", "\n".join(captured.output))
 
 
 if __name__ == "__main__":

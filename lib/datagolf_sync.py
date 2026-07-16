@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import unicodedata
@@ -158,8 +159,6 @@ def fetch_live_tournament_data(api_key: str, tour: str = DEFAULT_TOUR) -> dict[s
     except URLError as exc:
         raise RuntimeError(f"DataGolf API request failed: {exc.reason}") from exc
 
-    import json
-
     try:
         return json.loads(payload)
     except json.JSONDecodeError as exc:
@@ -178,6 +177,17 @@ def extract_player_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
             return [record for record in nested if isinstance(record, dict)]
 
     return []
+
+
+def log_raw_player_samples(records: list[dict[str, Any]], limit: int = 5) -> None:
+    """Log complete DataGolf player objects without request credentials."""
+    for index, record in enumerate(records[:limit], start=1):
+        logger.info(
+            "DataGolf raw player JSON %s/%s: %s",
+            index,
+            min(limit, len(records)),
+            json.dumps(record, ensure_ascii=False, sort_keys=True, default=str),
+        )
 
 
 def extract_event_name(payload: dict[str, Any]) -> str | None:
@@ -649,6 +659,7 @@ def sync_live_scores(
     try:
         payload = fetch_live_tournament_data(api_key=api_key, tour=tour)
         records = extract_player_records(payload)
+        log_raw_player_samples(records)
         current_round = extract_current_round(payload)
         event_name = extract_event_name(payload)
         course_par = resolve_course_par(records, event_name)
