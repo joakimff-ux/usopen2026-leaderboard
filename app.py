@@ -742,20 +742,39 @@ def page_team_detail() -> None:
             }
             for player in round_result.dropped
         ]
+        undecided_rows = [
+            {
+                "Player": player.player_name,
+                "Tier": player.tier,
+                "Strokes": format_score(player.strokes),
+                "Type": "Ikke avgjort",
+            }
+            for player in round_result.undecided
+        ]
 
-        left, right = st.columns(2)
+        left, middle, right = st.columns(3)
         with left:
             st.markdown("**Counting (5)**")
             if counting_rows:
                 st.dataframe(pd.DataFrame(counting_rows), use_container_width=True, hide_index=True)
             else:
                 st.caption("Not enough scores entered yet.")
-        with right:
+        with middle:
             st.markdown("**Dropped (2)**")
             if dropped_rows:
                 st.dataframe(pd.DataFrame(dropped_rows), use_container_width=True, hide_index=True)
             else:
                 st.caption("No dropped players yet.")
+        with right:
+            st.markdown("**Ikke avgjort**")
+            if undecided_rows:
+                st.dataframe(
+                    pd.DataFrame(undecided_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.caption("Ingen uavklarte spillere.")
 
 
 def page_admin() -> None:

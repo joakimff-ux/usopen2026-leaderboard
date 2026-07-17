@@ -24,12 +24,8 @@ def active_round_number(
     num_rounds: int = 4,
 ) -> int:
     live_rounds = [int(row["round"]) for row in live_states if row.get("round") is not None]
-    if live_rounds:
-        return min(max(live_rounds), num_rounds)
     score_rounds = [int(row["round"]) for row in scores if row.get("round") is not None]
-    if score_rounds:
-        return min(max(score_rounds), num_rounds)
-    return 1
+    return min(max([*live_rounds, *score_rounds] or [1]), num_rounds)
 
 
 def build_preview_rows(
@@ -57,6 +53,7 @@ def build_preview_rows(
         for result in [
             *round_result.counting,
             *round_result.dropped,
+            *round_result.undecided,
             *round_result.missing_scores,
         ]:
             players[result.player_id] = result
@@ -72,6 +69,7 @@ def build_preview_rows(
             all_results = [
                 *round_result.counting,
                 *round_result.dropped,
+                *round_result.undecided,
                 *round_result.missing_scores,
             ]
             round_player = next(

@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from lib.leaderboard_preview import (
     active_round_number,
@@ -90,6 +91,11 @@ class LeaderboardPreviewTests(unittest.TestCase):
         states = [{"player_id": "p1", "round": 2}]
         self.assertEqual(active_round_number(self.scores, states), 2)
 
+    def test_stale_live_state_does_not_override_newer_score_round(self):
+        scores = [{"player_id": "p1", "round": 2}]
+        states = [{"player_id": "p1", "round": 1}]
+        self.assertEqual(active_round_number(scores, states), 2)
+
     def test_empty_round_is_pending_not_seven_dropped(self):
         empty_standing = build_team_standings(
             teams=[{"id": "team-a", "name": "Joakim"}],
@@ -105,6 +111,58 @@ class LeaderboardPreviewTests(unittest.TestCase):
             len([row for row in rows if row["selection"] == "PENDING"]),
             7,
         )
+
+    def test_all_equal_active_scores_are_pending(self):
+        standing = build_team_standings(
+            teams=[{"id": "team-a", "name": "Joakim"}],
+            players=self.players,
+            team_players=[
+                {"team_id": "team-a", "player_id": player["id"]}
+                for player in self.players
+            ],
+            scores=[
+                {
+                    "player_id": player["id"],
+                    "round": 1,
+                    "strokes": 72,
+                    "is_official": True,
+                }
+                for player in self.players
+            ],
+        )[0]
+
+        rows = build_preview_rows(standing, active_round=1)
+        self.assertTrue(all(row["selection"] == "PENDING" for row in rows))
+
+    def test_three_way_cutoff_tie_marks_only_affected_players_pending(self):
+        strokes = [68, 69, 70, 71, 72, 72, 72]
+        standing = build_team_standings(
+            teams=[{"id": "team-a", "name": "Joakim"}],
+            players=self.players,
+            team_players=[
+                {"team_id": "team-a", "player_id": player["id"]}
+                for player in self.players
+            ],
+            scores=[
+                {
+                    "player_id": player["id"],
+                    "round": 1,
+                    "strokes": score,
+                    "is_official": True,
+                }
+                for player, score in zip(self.players, strokes)
+            ],
+        )[0]
+
+        rows = build_preview_rows(standing, active_round=1)
+        self.assertEqual(sum(row["selection"] == "COUNTING" for row in rows), 4)
+        self.assertEqual(sum(row["selection"] == "DROPPED" for row in rows), 0)
+        self.assertEqual(sum(row["selection"] == "PENDING" for row in rows), 3)
+
+    def test_team_detail_renders_undecided_results(self):
+        app_source = (Path(__file__).parents[1] / "app.py").read_text(encoding="utf-8")
+        self.assertIn("for player in round_result.undecided", app_source)
+        self.assertIn('st.markdown("**Ikke avgjort**")', app_source)
 
 
 if __name__ == "__main__":

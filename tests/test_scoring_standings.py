@@ -87,7 +87,40 @@ class LeaderboardStandingTests(unittest.TestCase):
         result = standings[0].rounds[1]
         self.assertEqual([player.strokes for player in result.counting], [-3, -2, 0, 1, 2])
         self.assertEqual([player.strokes for player in result.dropped], [3, 4])
+        self.assertEqual(result.undecided, [])
         self.assertEqual(result.total, -2)
+
+    def test_all_seven_equal_are_undecided_in_active_round(self):
+        result = self.standings({"Joakim": [[72, 72, 72, 72, 72, 72, 72]]})[0].rounds[1]
+
+        self.assertEqual(result.counting, [])
+        self.assertEqual(result.dropped, [])
+        self.assertEqual(len(result.undecided), 7)
+        self.assertEqual(result.total, 0)
+
+    def test_three_players_tied_across_fifth_place_are_undecided(self):
+        result = self.standings({"Joakim": [[68, 69, 70, 71, 72, 72, 72]]})[0].rounds[1]
+
+        self.assertEqual([player.strokes for player in result.counting], [-4, -3, -2, -1])
+        self.assertEqual(result.dropped, [])
+        self.assertEqual([player.strokes for player in result.undecided], [0, 0, 0])
+        self.assertEqual(result.total, -10)
+
+    def test_previous_round_scores_do_not_resolve_active_round_tie(self):
+        standing = self.standings(
+            {
+                "Joakim": [
+                    [66, 67, 68, 69, 70, 80, 81],
+                    [72, 72, 72, 72, 72, 72, 72],
+                ]
+            }
+        )[0]
+
+        active_result = standing.rounds[2]
+        self.assertEqual(active_result.counting, [])
+        self.assertEqual(active_result.dropped, [])
+        self.assertEqual(len(active_result.undecided), 7)
+        self.assertEqual(active_result.total, 0)
 
     def test_even_formats_as_e(self):
         self.assertEqual(format_relative_score(0), "E")

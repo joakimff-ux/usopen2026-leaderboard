@@ -26,6 +26,7 @@ class TeamRoundResult:
     total: int | None
     counting: list[PlayerRoundResult]
     dropped: list[PlayerRoundResult]
+    undecided: list[PlayerRoundResult]
     missing_scores: list[PlayerRoundResult]
 
 
@@ -52,7 +53,13 @@ def _split_counting_and_dropped(
     counting_scores: int,
     dropped_scores: int,
     penalty_score: int | None = None,
-) -> tuple[list[PlayerRoundResult], list[PlayerRoundResult], int | None]:
+    mark_cutoff_ties_undecided: bool = False,
+) -> tuple[
+    list[PlayerRoundResult],
+    list[PlayerRoundResult],
+    list[PlayerRoundResult],
+    int | None,
+]:
     scored = [result for result in player_results if result.strokes is not None]
     missing = [result for result in player_results if result.strokes is None]
 
@@ -73,14 +80,33 @@ def _split_counting_and_dropped(
             dropped = [result for result in player_results if result not in combined]
             for result in dropped:
                 result.dropped = True
-            return combined, dropped, sum(
+            return combined, dropped, [], sum(
                 result.strokes for result in combined if result.strokes is not None
             )
         for result in missing:
             result.dropped = True
-        return [], missing, None
+        return [], missing, [], None
 
     scored.sort(key=lambda item: item.strokes)
+    total = sum(
+        result.strokes
+        for result in scored[:counting_scores]
+        if result.strokes is not None
+    )
+    if mark_cutoff_ties_undecided:
+        cutoff_score = scored[counting_scores - 1].strokes
+        definitely_counting = [result for result in scored if result.strokes < cutoff_score]
+        tied_at_cutoff = [result for result in scored if result.strokes == cutoff_score]
+        remaining_counting_places = counting_scores - len(definitely_counting)
+        if len(tied_at_cutoff) > remaining_counting_places:
+            definitely_dropped = [result for result in scored if result.strokes > cutoff_score]
+            dropped = definitely_dropped + missing
+            for result in definitely_counting:
+                result.counts = True
+            for result in dropped:
+                result.dropped = True
+            return definitely_counting, dropped, tied_at_cutoff, total
+
     counting = scored[:counting_scores]
     dropped = scored[counting_scores : counting_scores + dropped_scores] + missing
 
@@ -89,8 +115,7 @@ def _split_counting_and_dropped(
     for result in dropped:
         result.dropped = True
 
-    total = sum(result.strokes for result in counting if result.strokes is not None)
-    return counting, dropped, total
+    return counting, dropped, [], total
 
 
 def build_team_round_result(
@@ -101,6 +126,7 @@ def build_team_round_result(
     dropped_scores: int,
     statuses_by_player_round: dict[tuple[str, int], str] | None = None,
     penalty_score: int | None = None,
+    mark_cutoff_ties_undecided: bool = False,
 ) -> TeamRoundResult:
     statuses = statuses_by_player_round or {}
     player_results = [
@@ -114,11 +140,12 @@ def build_team_round_result(
         for player in roster_players
     ]
 
-    counting, dropped, total = _split_counting_and_dropped(
+    counting, dropped, undecided, total = _split_counting_and_dropped(
         player_results,
         counting_scores=counting_scores,
         dropped_scores=dropped_scores,
         penalty_score=penalty_score,
+        mark_cutoff_ties_undecided=mark_cutoff_ties_undecided,
     )
 
     return TeamRoundResult(
@@ -126,6 +153,7 @@ def build_team_round_result(
         total=total,
         counting=counting,
         dropped=dropped,
+        undecided=undecided,
         missing_scores=[result for result in player_results if result.strokes is None],
     )
 
@@ -188,6 +216,17 @@ def build_team_standings(
         for round_row in tournament_rounds or []
         if round_row.get("state") == "FINALIZED" and round_row.get("penalty_score") is not None
     }
+    live_rounds = [
+        int(state["round"])
+        for state in live_states or []
+        if state.get("round") is not None
+    ]
+    score_rounds = [
+        int(score["round"])
+        for score in scores
+        if score.get("round") is not None
+    ]
+    active_round = max([*live_rounds, *score_rounds] or [1])
 
     standings: list[TeamStanding] = []
     for team in teams:
@@ -219,6 +258,7 @@ def build_team_standings(
                 dropped_scores=dropped_scores,
                 statuses_by_player_round=statuses_by_player_round,
                 penalty_score=penalty_score_by_round.get(round_num),
+                mark_cutoff_ties_undecided=round_num == active_round,
             )
             round_results[round_num] = round_result
             round_totals[round_num] = round_result.total
