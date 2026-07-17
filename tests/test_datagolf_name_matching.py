@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 
 # Keep this unit test independent of installed Streamlit/Supabase packages.
@@ -17,7 +18,10 @@ supabase_stub.Client = object
 supabase_stub.create_client = lambda *_args, **_kwargs: None
 sys.modules.setdefault("supabase", supabase_stub)
 
+from lib import datagolf_sync  # noqa: E402
 from lib.datagolf_sync import (  # noqa: E402
+    PLAYER_NAME_ALIASES,
+    build_player_id_lookup,
     build_player_lookup,
     match_database_player,
     normalize_name,
@@ -62,6 +66,59 @@ class DataGolfNameMatchingTests(unittest.TestCase):
 
     def test_does_not_guess_a_different_player(self):
         self.assertIsNone(match_database_player("Rahm, Jon", self.lookup))
+
+    def test_required_aliases_match_only_after_direct_name_fails(self):
+        alias_players = [
+            {"id": str(index), "name": local_name, "tier": index}
+            for index, local_name in enumerate(PLAYER_NAME_ALIASES, start=1)
+        ]
+        lookup = build_player_lookup(alias_players)
+        for player, datagolf_name in zip(alias_players, PLAYER_NAME_ALIASES.values()):
+            with self.subTest(datagolf_name=datagolf_name):
+                self.assertEqual(match_database_player(datagolf_name, lookup), player)
+
+    def test_alias_use_is_logged(self):
+        player = {"id": "cam", "name": "Cam Smith", "tier": 2}
+        with patch.object(datagolf_sync.logger, "warning") as warning:
+            self.assertEqual(
+                match_database_player("Cameron Smith", build_player_lookup([player])),
+                player,
+            )
+        warning.assert_called_once_with(
+            "Matched alias: %s -> %s",
+            "Cam Smith",
+            "Cameron Smith",
+        )
+
+    def test_direct_name_match_takes_priority_over_alias(self):
+        local_alias = {"id": "cam", "name": "Cam Smith", "tier": 2}
+        direct = {"id": "cameron", "name": "Cameron Smith", "tier": 2}
+        with patch.object(datagolf_sync.logger, "warning") as warning:
+            matched = match_database_player(
+                "Cameron Smith",
+                build_player_lookup([local_alias, direct]),
+            )
+        self.assertEqual(matched, direct)
+        warning.assert_not_called()
+
+    def test_datagolf_id_takes_priority_when_available(self):
+        id_match = {
+            "id": "cam",
+            "name": "Cam Smith",
+            "tier": 2,
+            "datagolf_id": 123,
+        }
+        name_match = {"id": "scottie", "name": "Scottie Scheffler", "tier": 1}
+        players = [id_match, name_match]
+        self.assertEqual(
+            match_database_player(
+                "Scottie Scheffler",
+                build_player_lookup(players),
+                datagolf_id="123",
+                player_id_lookup=build_player_id_lookup(players),
+            ),
+            id_match,
+        )
 
     def test_cli_name_matching_check_uses_datagolf_format(self):
         self.assertTrue(run_name_matching_test()["passed"])

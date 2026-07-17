@@ -67,6 +67,13 @@ NAME_TRANSLATION = str.maketrans(
         "Ł": "L",
     }
 )
+PLAYER_NAME_ALIASES = {
+    "Cam Smith": "Cameron Smith",
+    "Mike Kim": "Michael Kim",
+    "Mav McNealy": "Maverick McNealy",
+    "JT Poston": "J.T. Poston",
+}
+DATAGOLF_ID_FIELDS = ("dg_id", "datagolf_id", "data_golf_id")
 
 
 @dataclass
@@ -300,6 +307,14 @@ def extract_player_name(record: dict[str, Any]) -> str | None:
     return None
 
 
+def extract_datagolf_player_id(record: dict[str, Any]) -> str | None:
+    for field_name in DATAGOLF_ID_FIELDS:
+        value = record.get(field_name)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
 def extract_player_status(record: dict[str, Any]) -> str | None:
     """Return only explicit terminal statuses; absence never implies a status."""
     for field_name in ("status", "current_pos", "position", "pos"):
@@ -421,11 +436,46 @@ def build_player_lookup(players: list[dict[str, Any]]) -> dict[str, dict[str, An
     return lookup
 
 
+def build_player_id_lookup(players: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    for player in players:
+        for field_name in DATAGOLF_ID_FIELDS:
+            value = player.get(field_name)
+            if value is not None and str(value).strip():
+                lookup[str(value).strip()] = player
+                break
+    return lookup
+
+
 def match_database_player(
     datagolf_name: str,
     player_lookup: dict[str, dict[str, Any]],
+    *,
+    datagolf_id: str | None = None,
+    player_id_lookup: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
-    return player_lookup.get(normalize_name(datagolf_name))
+    if datagolf_id and player_id_lookup:
+        id_match = player_id_lookup.get(str(datagolf_id).strip())
+        if id_match is not None:
+            return id_match
+
+    normalized_datagolf_name = normalize_name(datagolf_name)
+    direct_match = player_lookup.get(normalized_datagolf_name)
+    if direct_match is not None:
+        return direct_match
+
+    for local_name, canonical_datagolf_name in PLAYER_NAME_ALIASES.items():
+        if normalize_name(canonical_datagolf_name) != normalized_datagolf_name:
+            continue
+        alias_match = player_lookup.get(normalize_name(local_name))
+        if alias_match is not None:
+            logger.warning(
+                "Matched alias: %s -> %s",
+                alias_match.get("name", local_name),
+                canonical_datagolf_name,
+            )
+            return alias_match
+    return None
 
 
 def validate_event_name(expected_event_name: str | None, event_name: str | None) -> str | None:
@@ -521,6 +571,7 @@ def run_datagolf_diagnostic(
     db_players = fetch_players(client, tournament_id)
     base.db_players_count = len(db_players)
     player_lookup = build_player_lookup(db_players)
+    player_id_lookup = build_player_id_lookup(db_players)
 
     matched: list[str] = []
     unmatched: list[str] = []
@@ -528,7 +579,12 @@ def run_datagolf_diagnostic(
         datagolf_name = extract_player_name(record)
         if not datagolf_name:
             continue
-        db_player = match_database_player(datagolf_name, player_lookup)
+        db_player = match_database_player(
+            datagolf_name,
+            player_lookup,
+            datagolf_id=extract_datagolf_player_id(record),
+            player_id_lookup=player_id_lookup,
+        )
         if db_player is None:
             unmatched.append(datagolf_name)
         else:
@@ -690,6 +746,7 @@ def sync_live_scores(
             for row in fetch_team_players(client, tournament_id)
         }
         player_lookup = build_player_lookup(db_players)
+        player_id_lookup = build_player_id_lookup(db_players)
         matched_player_ids: set[str] = set()
         matched_players: list[str] = []
         unmatched_players: list[str] = []
@@ -703,7 +760,12 @@ def sync_live_scores(
             if not datagolf_name:
                 continue
 
-            db_player = match_database_player(datagolf_name, player_lookup)
+            db_player = match_database_player(
+                datagolf_name,
+                player_lookup,
+                datagolf_id=extract_datagolf_player_id(record),
+                player_id_lookup=player_id_lookup,
+            )
             if db_player is None:
                 unmatched_players.append(datagolf_name)
                 logger.warning("Unmatched DataGolf player: %s", datagolf_name)
@@ -845,6 +907,7 @@ def run_name_matching_test() -> dict[str, Any]:
         {"id": "2", "name": "Si woo Kim", "tier": 3},
         {"id": "3", "name": "Adam scott", "tier": 6},
         {"id": "4", "name": "Justin Rose ", "tier": 4},
+        {"id": "5", "name": "Cam Smith", "tier": 2},
     ]
     lookup = build_player_lookup(sample_players)
     checks = [
@@ -852,6 +915,7 @@ def run_name_matching_test() -> dict[str, Any]:
         ("Kim, Si-Woo", True),
         ("Scott, Adam", True),
         ("Rose, Justin", True),
+        ("Cameron Smith", True),
         ("Rahm, Jon", False),
     ]
     results = []
