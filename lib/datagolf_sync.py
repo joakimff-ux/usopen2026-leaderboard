@@ -71,6 +71,7 @@ NAME_TRANSLATION = str.maketrans(
 )
 PLAYER_NAME_ALIASES = {
     "Michael Thorbjørnsen": "Michael Thorbjornsen",
+    "Micheal Thorbjornsen": "Michael Thorbjornsen",
     "Cam Smith": "Cameron Smith",
     "Mike Kim": "Michael Kim",
     "Mav McNealy": "Maverick McNealy",

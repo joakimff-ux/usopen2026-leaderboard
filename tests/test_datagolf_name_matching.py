@@ -101,6 +101,10 @@ class DataGolfNameMatchingTests(unittest.TestCase):
             PLAYER_NAME_ALIASES["Michael Thorbjørnsen"],
             "Michael Thorbjornsen",
         )
+        self.assertEqual(
+            PLAYER_NAME_ALIASES["Micheal Thorbjornsen"],
+            "Michael Thorbjornsen",
+        )
         self.assertEqual(PLAYER_NAME_ALIASES["Cam Smith"], "Cameron Smith")
 
     def test_does_not_guess_a_different_player(self):
@@ -112,9 +116,16 @@ class DataGolfNameMatchingTests(unittest.TestCase):
             for index, local_name in enumerate(PLAYER_NAME_ALIASES, start=1)
         ]
         lookup = build_player_lookup(alias_players)
-        for player, datagolf_name in zip(alias_players, PLAYER_NAME_ALIASES.values()):
+        for datagolf_name in set(PLAYER_NAME_ALIASES.values()):
             with self.subTest(datagolf_name=datagolf_name):
-                self.assertEqual(match_database_player(datagolf_name, lookup), player)
+                matched = match_database_player(datagolf_name, lookup)
+                valid_local_names = {
+                    local_name
+                    for local_name, canonical_name in PLAYER_NAME_ALIASES.items()
+                    if canonical_name == datagolf_name
+                }
+                self.assertIsNotNone(matched)
+                self.assertIn(matched["name"], valid_local_names)
 
     def test_alias_use_is_logged(self):
         player = {"id": "cam", "name": "Cam Smith", "tier": 2}
