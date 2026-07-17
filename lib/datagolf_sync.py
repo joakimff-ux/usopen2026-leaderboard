@@ -61,6 +61,8 @@ NAME_TRANSLATION = str.maketrans(
         "Ø": "O",
         "æ": "ae",
         "Æ": "AE",
+        "å": "a",
+        "Å": "A",
         "œ": "oe",
         "Œ": "OE",
         "ł": "l",
@@ -68,6 +70,7 @@ NAME_TRANSLATION = str.maketrans(
     }
 )
 PLAYER_NAME_ALIASES = {
+    "Michael Thorbjørnsen": "Michael Thorbjornsen",
     "Cam Smith": "Cameron Smith",
     "Mike Kim": "Michael Kim",
     "Mav McNealy": "Maverick McNealy",
@@ -436,6 +439,14 @@ def build_player_lookup(players: list[dict[str, Any]]) -> dict[str, dict[str, An
     return lookup
 
 
+def build_exact_player_lookup(players: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {
+        str(player.get("name") or "").strip(): player
+        for player in players
+        if str(player.get("name") or "").strip()
+    }
+
+
 def build_player_id_lookup(players: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     lookup: dict[str, dict[str, Any]] = {}
     for player in players:
@@ -453,16 +464,31 @@ def match_database_player(
     *,
     datagolf_id: str | None = None,
     player_id_lookup: dict[str, dict[str, Any]] | None = None,
+    exact_player_lookup: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     if datagolf_id and player_id_lookup:
         id_match = player_id_lookup.get(str(datagolf_id).strip())
         if id_match is not None:
             return id_match
 
+    stripped_datagolf_name = datagolf_name.strip()
+    exact_match = (exact_player_lookup or {}).get(stripped_datagolf_name)
+    if exact_player_lookup is None:
+        exact_match = next(
+            (
+                player
+                for player in player_lookup.values()
+                if str(player.get("name") or "").strip() == stripped_datagolf_name
+            ),
+            None,
+        )
+    if exact_match is not None:
+        return exact_match
+
     normalized_datagolf_name = normalize_name(datagolf_name)
-    direct_match = player_lookup.get(normalized_datagolf_name)
-    if direct_match is not None:
-        return direct_match
+    normalized_match = player_lookup.get(normalized_datagolf_name)
+    if normalized_match is not None:
+        return normalized_match
 
     for local_name, canonical_datagolf_name in PLAYER_NAME_ALIASES.items():
         if normalize_name(canonical_datagolf_name) != normalized_datagolf_name:
@@ -571,6 +597,7 @@ def run_datagolf_diagnostic(
     db_players = fetch_players(client, tournament_id)
     base.db_players_count = len(db_players)
     player_lookup = build_player_lookup(db_players)
+    exact_player_lookup = build_exact_player_lookup(db_players)
     player_id_lookup = build_player_id_lookup(db_players)
 
     matched: list[str] = []
@@ -584,6 +611,7 @@ def run_datagolf_diagnostic(
             player_lookup,
             datagolf_id=extract_datagolf_player_id(record),
             player_id_lookup=player_id_lookup,
+            exact_player_lookup=exact_player_lookup,
         )
         if db_player is None:
             unmatched.append(datagolf_name)
@@ -746,6 +774,7 @@ def sync_live_scores(
             for row in fetch_team_players(client, tournament_id)
         }
         player_lookup = build_player_lookup(db_players)
+        exact_player_lookup = build_exact_player_lookup(db_players)
         player_id_lookup = build_player_id_lookup(db_players)
         matched_player_ids: set[str] = set()
         matched_players: list[str] = []
@@ -765,6 +794,7 @@ def sync_live_scores(
                 player_lookup,
                 datagolf_id=extract_datagolf_player_id(record),
                 player_id_lookup=player_id_lookup,
+                exact_player_lookup=exact_player_lookup,
             )
             if db_player is None:
                 unmatched_players.append(datagolf_name)

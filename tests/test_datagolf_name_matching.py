@@ -21,6 +21,7 @@ sys.modules.setdefault("supabase", supabase_stub)
 from lib import datagolf_sync  # noqa: E402
 from lib.datagolf_sync import (  # noqa: E402
     PLAYER_NAME_ALIASES,
+    build_exact_player_lookup,
     build_player_id_lookup,
     build_player_lookup,
     match_database_player,
@@ -63,6 +64,44 @@ class DataGolfNameMatchingTests(unittest.TestCase):
 
     def test_preserves_support_for_local_first_last_format(self):
         self.assertEqual(normalize_name(" Scottie   Scheffler "), "scottie scheffler")
+
+    def test_normalizes_norwegian_letters_accents_periods_case_and_spacing(self):
+        self.assertEqual(
+            normalize_name("  HÅKON.  SÆTHER  THORBJØRNSEN  "),
+            "hakon saether thorbjornsen",
+        )
+        self.assertEqual(normalize_name("José María"), "jose maria")
+
+    def test_exact_name_takes_priority_over_normalized_name(self):
+        norwegian = {"id": "no", "name": "Michael Thorbjørnsen", "tier": 2}
+        ascii_name = {"id": "ascii", "name": "Michael Thorbjornsen", "tier": 2}
+        players = [norwegian, ascii_name]
+        self.assertEqual(
+            match_database_player(
+                "Michael Thorbjørnsen",
+                build_player_lookup(players),
+                exact_player_lookup=build_exact_player_lookup(players),
+            ),
+            norwegian,
+        )
+
+    def test_normalized_name_takes_priority_over_alias(self):
+        player = {"id": "michael", "name": "Michael Thorbjørnsen", "tier": 2}
+        with patch.object(datagolf_sync.logger, "warning") as warning:
+            matched = match_database_player(
+                "  MICHAEL THORBJORNsen. ",
+                build_player_lookup([player]),
+                exact_player_lookup=build_exact_player_lookup([player]),
+            )
+        self.assertEqual(matched, player)
+        warning.assert_not_called()
+
+    def test_thorbjornsen_and_cam_aliases_are_registered(self):
+        self.assertEqual(
+            PLAYER_NAME_ALIASES["Michael Thorbjørnsen"],
+            "Michael Thorbjornsen",
+        )
+        self.assertEqual(PLAYER_NAME_ALIASES["Cam Smith"], "Cameron Smith")
 
     def test_does_not_guess_a_different_player(self):
         self.assertIsNone(match_database_player("Rahm, Jon", self.lookup))
