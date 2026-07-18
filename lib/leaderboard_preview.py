@@ -39,6 +39,8 @@ def build_preview_rows(
         for row in live_states or []
     }
     active_result = standing.rounds[active_round]
+    original_ids = set(standing.original_player_ids)
+    active_ids = set(standing.active_player_ids or standing.original_player_ids)
     counting_ids = {result.player_id for result in active_result.counting}
     dropped_ids = {result.player_id for result in active_result.dropped}
     if active_result.total is None or not counting_ids:
@@ -94,6 +96,8 @@ def build_preview_rows(
             hole_status = "—"
 
         completed_scores = [score for score in round_scores.values() if score is not None]
+        is_swapped_out = player_id in original_ids and player_id not in active_ids
+        is_swapped_in = player_id in active_ids and player_id not in original_ids
         rows.append(
             {
                 "player_id": player_id,
@@ -102,9 +106,12 @@ def build_preview_rows(
                 "round_scores": round_scores,
                 "running_total": sum(completed_scores) if completed_scores else None,
                 "hole_status": hole_status,
-                "status": status,
+                "status": "INACTIVE" if is_swapped_out else status,
+                "roster_note": "Byttet inn fra R3" if is_swapped_in else None,
                 "selection": (
-                    "COUNTING"
+                    "INACTIVE"
+                    if is_swapped_out
+                    else "COUNTING"
                     if player_id in counting_ids
                     else "DROPPED"
                     if player_id in dropped_ids

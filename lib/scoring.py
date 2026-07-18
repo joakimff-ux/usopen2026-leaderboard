@@ -38,6 +38,8 @@ class TeamStanding:
     tournament_total: int | None
     completed_rounds: int
     rounds: dict[int, TeamRoundResult]
+    original_player_ids: tuple[str, ...] = ()
+    active_player_ids: tuple[str, ...] = ()
 
 
 def format_relative_score(value: int | None) -> str:
@@ -236,6 +238,11 @@ def build_team_standings(
             key=lambda player: (player["tier"], player["name"]),
         )
         original_ids = [str(player["id"]) for player in original_roster_players]
+        active_ids = roster_changes.apply_roster_changes(
+            {team_id: original_ids},
+            roster_change_rows or [],
+            round_num=roster_changes.ROUND_FROM,
+        )[team_id]
         round_results: dict[int, TeamRoundResult] = {}
         round_totals: dict[int, int | None] = {}
 
@@ -275,6 +282,8 @@ def build_team_standings(
                 tournament_total=tournament_total,
                 completed_rounds=completed_rounds,
                 rounds=round_results,
+                original_player_ids=tuple(original_ids),
+                active_player_ids=tuple(active_ids),
             )
         )
 

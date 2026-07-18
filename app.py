@@ -440,11 +440,21 @@ def roster_change_export_csv(
                 "IN spiller": players_by_id.get(
                     str(change["new_player_id"]), change["new_player_id"]
                 ),
+                "OUT status": "INACTIVE fra R3",
+                "IN status": "ACTIVE fra R3",
                 "Tidspunkt": timestamp,
                 "Admin": str(change.get("changed_by") or ""),
             }
         )
-    columns = ["Lag", "OUT spiller", "IN spiller", "Tidspunkt", "Admin"]
+    columns = [
+        "Lag",
+        "OUT spiller",
+        "IN spiller",
+        "OUT status",
+        "IN status",
+        "Tidspunkt",
+        "Admin",
+    ]
     return pd.DataFrame(rows, columns=columns).to_csv(index=False).encode("utf-8-sig")
 
 
@@ -471,11 +481,11 @@ def render_roster_change_summary(
             st.markdown(f"**{team['name']}**")
             out_col, in_col = st.columns(2)
             with out_col:
-                st.markdown("**OUT**")
+                st.markdown("**OUT · INACTIVE fra R3**")
                 for row in team_changes:
                     st.write(players_by_id.get(str(row["old_player_id"]), row["old_player_id"]))
             with in_col:
-                st.markdown("**IN**")
+                st.markdown("**IN · ACTIVE fra R3**")
                 for row in team_changes:
                     st.write(players_by_id.get(str(row["new_player_id"]), row["new_player_id"]))
 
@@ -500,13 +510,13 @@ def render_roster_change_overview(
             st.markdown(f"**{team['name']}**")
             out_col, in_col = st.columns(2)
             with out_col:
-                st.markdown("**OUT**")
+                st.markdown("**OUT · INACTIVE fra R3**")
                 if not team_changes:
                     st.write("—")
                 for row in team_changes:
                     st.write(players_by_id.get(str(row["old_player_id"]), row["old_player_id"]))
             with in_col:
-                st.markdown("**IN**")
+                st.markdown("**IN · ACTIVE fra R3**")
                 if not team_changes:
                     st.write("—")
                 for row in team_changes:
@@ -710,6 +720,23 @@ def page_team_detail() -> None:
             ("Round 4", format_score(standing.round_totals.get(4))),
             ("Tournament total", format_score(standing.tournament_total)),
         ]
+    )
+
+    active_round = leaderboard_preview.active_round_number(
+        data["scores"],
+        data["live_states"],
+        num_rounds=int(tournament.get("num_rounds", 4)),
+    )
+    detail_rows = leaderboard_preview.build_preview_rows(
+        standing,
+        active_round,
+        data["live_states"],
+    )
+    styles.render_team_preview(
+        standing.team_name,
+        active_round,
+        standing.tournament_total,
+        detail_rows,
     )
 
     for round_num in range(1, 5):

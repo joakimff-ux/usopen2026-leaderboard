@@ -247,6 +247,11 @@ class LeaderboardStandingTests(unittest.TestCase):
         self.assertNotIn("p1", round_three_ids)
         self.assertEqual(standing.round_totals, {1: 0, 2: 0, 3: -10, 4: -10})
         self.assertEqual(standing.tournament_total, -20)
+        self.assertEqual(standing.original_player_ids, tuple(f"p{i}" for i in range(1, 8)))
+        self.assertEqual(
+            set(standing.active_player_ids),
+            {"p8", "p2", "p3", "p4", "p5", "p6", "p7"},
+        )
 
 
 if __name__ == "__main__":

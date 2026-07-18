@@ -77,9 +77,12 @@ class RosterChangeTests(unittest.TestCase):
         self.assertIn('heading="Sammendrag før lagring"', self.app_source)
         self.assertIn('"📥 Last ned bytter (CSV)"', self.app_source)
         self.assertIn(
-            '["Lag", "OUT spiller", "IN spiller", "Tidspunkt", "Admin"]',
+            '"OUT status",',
             self.app_source,
         )
+        self.assertIn('"IN status",', self.app_source)
+        self.assertIn('"Tidspunkt",', self.app_source)
+        self.assertIn('"Admin",', self.app_source)
 
     def test_saved_change_overview_shows_every_team_and_popularity(self):
         self.assertIn('st.markdown("### Bytteoversikt")', self.app_source)

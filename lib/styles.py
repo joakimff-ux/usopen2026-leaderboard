@@ -267,12 +267,18 @@ section[data-testid="stSidebar"] div[role="radiogroup"] label:has(input:checked)
 .team-preview-table tr.counting { background:linear-gradient(90deg,rgba(44,154,86,.10),rgba(215,162,29,.06)); border-left:4px solid #35a35d; }
 .team-preview-table tr.dropped { background:#f2eee6; opacity:.66; border-left:4px solid #aaa08f; }
 .team-preview-table tr.pending { border-left:4px solid #d1b973; }
+.team-preview-table tr.inactive { background:#fff0f2; border-left:4px solid #b42332; }
+.team-preview-table tr.inactive .preview-player { color:#7f2630; }
+.roster-note { display:block; margin-top:.15rem; font-size:.62rem; font-weight:700; }
+.roster-note.swapped-in { color:#18864b; }
 .preview-player { font-family:'Cormorant Garamond',Georgia,serif; font-size:1.08rem; font-weight:700; }
 .selection-badge, .status-badge { display:inline-block; border-radius:999px; padding:.25rem .5rem; font-size:.62rem; font-weight:800; letter-spacing:.04em; white-space:nowrap; }
 .selection-badge.counting { color:#145d32; background:#dcefe2; border:1px solid #8fc6a1; }
 .selection-badge.dropped { color:#6f675b; background:#e5dfd4; border:1px solid #c9c0b1; }
 .selection-badge.pending { color:#755900; background:#f6ecc9; border:1px solid #dec777; }
+.selection-badge.inactive { color:#fff; background:#a61f2b; border:1px solid #7c111b; }
 .status-badge.active { color:#155d34; background:#dff1e5; }
+.status-badge.inactive { color:#fff; background:#a61f2b; }
 .status-badge.cut, .status-badge.wd, .status-badge.dq { color:#fff; background:#8c2630; }
 
 /* Native Streamlit elements */
@@ -444,13 +450,21 @@ def render_team_preview(
             "counting": "Teller",
             "dropped": "Droppes",
             "pending": "Ikke avgjort",
+            "inactive": "Byttet ut",
         }.get(selection, selection)
         status = str(row.get("status") or "ACTIVE").upper()
         round_scores = row["round_scores"]
+        roster_note = str(row.get("roster_note") or "")
+        roster_note_html = (
+            f'<span class="roster-note swapped-in">{escape(roster_note)}</span>'
+            if roster_note
+            else ""
+        )
         body.append(
             f'<tr class="{selection}">'
             f'<td data-label="Tier">{escape(str(row["tier"]))}</td>'
-            f'<td data-label="Spiller" class="preview-player">{escape(str(row["player_name"]))}</td>'
+            f'<td data-label="Spiller" class="preview-player">'
+            f'{escape(str(row["player_name"]))}{roster_note_html}</td>'
             f'<td data-label="R1">{escape(score(round_scores.get(1)))}</td>'
             f'<td data-label="R2">{escape(score(round_scores.get(2)))}</td>'
             f'<td data-label="R3">{escape(score(round_scores.get(3)))}</td>'
