@@ -15,6 +15,7 @@ from supabase import Client
 
 from lib import (
     auth,
+    competition_data,
     datagolf_sync,
     db,
     excel_import,
@@ -83,46 +84,11 @@ def load_competition_data(tournament_id: str, tournament_rules: dict):
     client = db.get_supabase_client()
     if client is None:
         return None
-
-    teams = db.fetch_teams(client, tournament_id)
-    players = db.fetch_players(client, tournament_id)
-    team_players = db.fetch_team_players(client, tournament_id)
-    scores = db.fetch_scores(client, tournament_id)
-    status_events = db.fetch_player_status_events(client, tournament_id)
-    tournament_rounds = db.fetch_tournament_rounds(client, tournament_id)
-    try:
-        roster_change_rows = db.fetch_active_roster_changes(client, tournament_id)
-    except Exception:
-        roster_change_rows = []
-    try:
-        live_states = db.fetch_live_player_states(client, tournament_id)
-    except Exception:
-        live_states = []
-    standings = scoring.build_team_standings(
-        teams=teams,
-        players=players,
-        team_players=team_players,
-        scores=scores,
-        num_rounds=tournament_rules.get("num_rounds", 4),
-        counting_scores=tournament_rules.get("counting_scores", 5),
-        dropped_scores=tournament_rules.get("dropped_scores", 2),
-        player_status_events=status_events,
-        tournament_rounds=tournament_rounds,
-        live_states=live_states,
-        roster_change_rows=roster_change_rows,
-        course_par=int(tournament_rules.get("course_par", 72)),
+    return competition_data.load_competition_data(
+        client,
+        tournament_id,
+        tournament_rules,
     )
-    return {
-        "teams": teams,
-        "players": players,
-        "team_players": team_players,
-        "scores": scores,
-        "status_events": status_events,
-        "tournament_rounds": tournament_rounds,
-        "live_states": live_states,
-        "roster_changes": roster_change_rows,
-        "standings": standings,
-    }
 
 
 def clear_data_cache() -> None:

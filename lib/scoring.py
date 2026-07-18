@@ -210,16 +210,17 @@ def build_team_standings(
         if player:
             roster_by_team.setdefault(str(link["team_id"]), []).append(player)
 
-    scores_by_player_round = {
+    official_scores_by_player_round = {
         (str(score["player_id"]), int(score["round"])): int(score["strokes"]) - course_par
         for score in scores
         if score.get("is_official", True)
     }
-    official_score_keys = set(scores_by_player_round)
+    official_score_keys = set(official_scores_by_player_round)
+    live_scores_by_player_round: dict[tuple[str, int], int] = {}
     for state in live_states or []:
         if state.get("round_score") is None or state.get("is_finished"):
             continue
-        scores_by_player_round[(str(state["player_id"]), int(state["round"]))] = int(
+        live_scores_by_player_round[(str(state["player_id"]), int(state["round"]))] = int(
             state["round_score"]
         )
     events_by_player: dict[str, list[dict[str, Any]]] = {}
@@ -293,14 +294,30 @@ def build_team_standings(
                 (player_id, round_num) in official_score_keys
                 for player_id in effective_ids
             )
+            round_has_live_play_in_progress = any(
+                int(state.get("round") or 0) == round_num
+                and not state.get("is_finished")
+                and str(state.get("status") or "ACTIVE").upper() == "ACTIVE"
+                and (
+                    state.get("hole") is None
+                    or int(state.get("hole") or 0) < 18
+                )
+                for state in live_states or []
+            )
             round_is_complete = (
                 round_num in finalized_rounds
                 or round_num < active_round
-                or has_complete_official_roster
+                or (
+                    has_complete_official_roster
+                    and not round_has_live_play_in_progress
+                )
             )
+            scores_for_round = dict(official_scores_by_player_round)
+            if not round_is_complete:
+                scores_for_round.update(live_scores_by_player_round)
             round_result = build_team_round_result(
                 roster_players=roster_players,
-                scores_by_player_round=scores_by_player_round,
+                scores_by_player_round=scores_for_round,
                 round_num=round_num,
                 counting_scores=counting_scores,
                 dropped_scores=dropped_scores,
