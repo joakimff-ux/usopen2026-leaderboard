@@ -12,6 +12,7 @@ from lib.roster_changes import (
     change_count_by_team,
     ROSTER_CHANGE_POOL_NAMES,
     save_roster_changes,
+    roster_for_scoring_round,
     validate_roster_change_pool,
     validate_rosters,
 )
@@ -256,6 +257,30 @@ class RosterChangeTests(unittest.TestCase):
         self.assertEqual(
             apply_roster_changes(original, changes, round_num=3)["team-1"],
             ["p8", "p2", "p3", "p4", "p5", "p6", "p7"],
+        )
+
+    def test_scoring_roster_hard_blocks_changes_before_round_three(self):
+        original = {"team-1": [f"p{index}" for index in range(1, 8)]}
+        malformed_early_change = [
+            {
+                "team_id": "team-1",
+                "old_player_id": "p1",
+                "new_player_id": "p8",
+                "round_from": 1,
+            }
+        ]
+
+        self.assertEqual(
+            roster_for_scoring_round(original, malformed_early_change, 1),
+            original,
+        )
+        self.assertEqual(
+            roster_for_scoring_round(original, malformed_early_change, 2),
+            original,
+        )
+        self.assertEqual(
+            roster_for_scoring_round(original, malformed_early_change, 3),
+            original,
         )
 
     def test_more_than_three_changes_on_one_team_is_rejected(self):

@@ -214,6 +214,33 @@ def apply_roster_changes(
     return effective
 
 
+def roster_for_scoring_round(
+    original_by_team: dict[str, list[str]],
+    change_rows: list[dict[str, Any]],
+    round_num: int,
+) -> dict[str, list[str]]:
+    """Return the immutable original roster for R1-2 and valid R3 changes later."""
+    if round_num < ROUND_FROM:
+        return {
+            team_id: list(player_ids)
+            for team_id, player_ids in original_by_team.items()
+        }
+
+    valid_round_three_changes: list[dict[str, Any]] = []
+    for row in change_rows:
+        try:
+            is_valid = int(row.get("round_from")) == ROUND_FROM
+        except (TypeError, ValueError):
+            is_valid = False
+        if is_valid:
+            valid_round_three_changes.append(row)
+    return apply_roster_changes(
+        original_by_team,
+        valid_round_three_changes,
+        round_num=round_num,
+    )
+
+
 def build_change_pairs(
     original_by_team: dict[str, list[str]],
     selected_by_team: dict[str, list[str]],

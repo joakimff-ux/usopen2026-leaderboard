@@ -270,7 +270,7 @@ def build_team_standings(
             key=lambda player: (player["tier"], player["name"]),
         )
         original_ids = [str(player["id"]) for player in original_roster_players]
-        active_ids = roster_changes.apply_roster_changes(
+        active_ids = roster_changes.roster_for_scoring_round(
             {team_id: original_ids},
             roster_change_rows or [],
             round_num=roster_changes.ROUND_FROM,
@@ -279,7 +279,7 @@ def build_team_standings(
         round_totals: dict[int, int | None] = {}
 
         for round_num in range(1, num_rounds + 1):
-            effective_ids = roster_changes.apply_roster_changes(
+            effective_ids = roster_changes.roster_for_scoring_round(
                 {team_id: original_ids},
                 roster_change_rows or [],
                 round_num=round_num,

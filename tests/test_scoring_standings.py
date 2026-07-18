@@ -45,6 +45,96 @@ class LeaderboardStandingTests(unittest.TestCase):
         teams, players, team_players, scores = build_fixture(rounds_by_team)
         return build_team_standings(teams, players, team_players, scores)
 
+    def swap_regression_standings(self, change_count: int):
+        teams = [{"id": "team-1", "name": "Joakim"}]
+        players = [
+            {"id": f"p{index}", "name": f"Player {index}", "tier": index}
+            for index in range(1, 11)
+        ]
+        team_players = [
+            {"team_id": "team-1", "player_id": f"p{index}"}
+            for index in range(1, 8)
+        ]
+        scores = [
+            {
+                "player_id": f"p{player_index}",
+                "round": round_num,
+                "strokes": (
+                    60
+                    if player_index >= 8
+                    else 72
+                    if player_index <= 5
+                    else 80 + player_index
+                ),
+                "is_official": True,
+            }
+            for player_index in range(1, 11)
+            for round_num in range(1, 5)
+        ]
+        changes = [
+            {
+                "team_id": "team-1",
+                "old_player_id": f"p{index}",
+                "new_player_id": f"p{index + 7}",
+                "round_from": 3,
+            }
+            for index in range(1, change_count + 1)
+        ]
+        before = build_team_standings(
+            teams,
+            players,
+            team_players,
+            scores,
+            roster_change_rows=[],
+        )[0]
+        after = build_team_standings(
+            teams,
+            players,
+            team_players,
+            scores,
+            roster_change_rows=changes,
+        )[0]
+        return before, after
+
+    def test_one_swap_does_not_change_round_one(self):
+        before, after = self.swap_regression_standings(1)
+        self.assertEqual(after.round_totals[1], before.round_totals[1])
+
+    def test_three_swaps_do_not_change_round_two(self):
+        before, after = self.swap_regression_standings(3)
+        self.assertEqual(after.round_totals[2], before.round_totals[2])
+
+    def test_incoming_players_first_count_from_round_three(self):
+        _, after = self.swap_regression_standings(3)
+        round_one_ids = {
+            player.player_id
+            for player in after.rounds[1].counting + after.rounds[1].dropped
+        }
+        round_three_ids = {
+            player.player_id
+            for player in after.rounds[3].counting + after.rounds[3].dropped
+        }
+        self.assertTrue({"p8", "p9", "p10"}.isdisjoint(round_one_ids))
+        self.assertTrue({"p8", "p9", "p10"}.issubset(round_three_ids))
+
+    def test_outgoing_players_still_count_in_rounds_one_and_two(self):
+        _, after = self.swap_regression_standings(3)
+        for round_num in (1, 2):
+            round_ids = {
+                player.player_id
+                for player in (
+                    after.rounds[round_num].counting
+                    + after.rounds[round_num].dropped
+                )
+            }
+            self.assertTrue({"p1", "p2", "p3"}.issubset(round_ids))
+
+    def test_total_after_round_two_is_identical_before_and_after_swaps(self):
+        before, after = self.swap_regression_standings(3)
+        before_total = before.round_totals[1] + before.round_totals[2]
+        after_total = after.round_totals[1] + after.round_totals[2]
+        self.assertEqual(after_total, before_total)
+
     def test_sorts_by_cumulative_total_before_all_rounds_are_complete(self):
         standings = self.standings(
             {
