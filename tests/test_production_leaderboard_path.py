@@ -266,6 +266,27 @@ class ProductionLeaderboardPathTests(unittest.TestCase):
             standings.index(next(item for item in standings if item.team_name == "Christine")),
         )
 
+    def test_one_started_player_produces_a_running_round_three_score(self):
+        source = NineTeamProductionDataSource()
+        state = next(
+            item
+            for item in source.live_states
+            if item["player_id"] == "team-philip-p1"
+        )
+        state["hole"] = 3
+        state["round_score"] = -2
+
+        standings = load_competition_data(
+            object(),
+            "the-open-2026",
+            {"course_name": "Royal Birkdale"},
+            data_source=source,
+        )["standings"]
+        philip = next(item for item in standings if item.team_name == "Philip")
+
+        self.assertEqual(philip.round_totals[3], -2)
+        self.assertEqual(philip.tournament_total, -20)
+
 
 if __name__ == "__main__":
     unittest.main()

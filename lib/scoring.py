@@ -64,6 +64,7 @@ def _split_counting_and_dropped(
     penalty_score: int | None = None,
     mark_cutoff_ties_undecided: bool = False,
     resolve_completed_ties: bool = False,
+    allow_partial_live_scores: bool = False,
 ) -> tuple[
     list[PlayerRoundResult],
     list[PlayerRoundResult],
@@ -72,6 +73,14 @@ def _split_counting_and_dropped(
 ]:
     scored = [result for result in player_results if result.strokes is not None]
     missing = [result for result in player_results if result.strokes is None]
+
+    if allow_partial_live_scores and 0 < len(scored) < counting_scores:
+        scored.sort(key=lambda item: item.strokes)
+        for result in scored:
+            result.counts = True
+        return scored, [], [], sum(
+            result.strokes for result in scored if result.strokes is not None
+        )
 
     if len(scored) < counting_scores:
         needed = counting_scores - len(scored)
@@ -154,6 +163,7 @@ def build_team_round_result(
     penalty_score: int | None = None,
     mark_cutoff_ties_undecided: bool = False,
     resolve_completed_ties: bool = False,
+    allow_partial_live_scores: bool = False,
 ) -> TeamRoundResult:
     statuses = statuses_by_player_round or {}
     player_results = [
@@ -174,6 +184,7 @@ def build_team_round_result(
         penalty_score=penalty_score,
         mark_cutoff_ties_undecided=mark_cutoff_ties_undecided,
         resolve_completed_ties=resolve_completed_ties,
+        allow_partial_live_scores=allow_partial_live_scores,
     )
 
     return TeamRoundResult(
@@ -336,6 +347,9 @@ def build_team_standings(
                     round_num == active_round and not round_is_complete
                 ),
                 resolve_completed_ties=round_is_complete,
+                allow_partial_live_scores=(
+                    round_num == active_round and not round_is_complete
+                ),
             )
             round_results[round_num] = round_result
             round_totals[round_num] = round_result.total

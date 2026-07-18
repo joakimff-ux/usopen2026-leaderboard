@@ -67,6 +67,9 @@ class DataGolfEventGuardTests(unittest.TestCase):
         ), patch(
             "lib.datagolf_sync.fetch_team_players",
             return_value=[],
+        ), patch(
+            "lib.datagolf_sync.fetch_active_roster_changes",
+            return_value=[],
         ):
             return sync_live_scores(self.client, self.tournament, api_key="test-key")
 
@@ -163,6 +166,60 @@ class DataGolfEventGuardTests(unittest.TestCase):
         )
         self.assertEqual(standings[0].round_totals[1], -2)
         self.assertEqual(standings[0].tournament_total, -2)
+
+    def test_round_three_today_snapshot_uses_active_swapped_roster(self):
+        payload = {
+            "info": {"event_name": "The Open Championship", "current_round": 3},
+            "data": [
+                {
+                    "player_name": "Incoming Player",
+                    "course": "RB",
+                    "round": 3,
+                    "thru": 4,
+                    "today": -2,
+                    "R1": None,
+                    "R2": None,
+                    "R3": None,
+                    "R4": None,
+                }
+            ],
+        }
+        with patch(
+            "lib.datagolf_sync.fetch_live_tournament_data", return_value=payload
+        ), patch(
+            "lib.datagolf_sync.fetch_players",
+            return_value=[
+                {"id": "outgoing", "name": "Outgoing Player", "tier": 1},
+                {"id": "incoming", "name": "Incoming Player", "tier": 1},
+            ],
+        ), patch(
+            "lib.datagolf_sync.fetch_team_players",
+            return_value=[
+                {"team_id": "team-1", "player_id": "outgoing"},
+            ],
+        ), patch(
+            "lib.datagolf_sync.fetch_active_roster_changes",
+            return_value=[
+                {
+                    "team_id": "team-1",
+                    "old_player_id": "outgoing",
+                    "new_player_id": "incoming",
+                    "round_from": 3,
+                }
+            ],
+        ), patch(
+            "lib.datagolf_sync.persist_live_feed_transitions", return_value=0
+        ) as persist:
+            result = sync_live_scores(
+                self.client,
+                self.tournament,
+                api_key="test-key",
+            )
+
+        self.assertTrue(result.success)
+        snapshots = persist.call_args.args[2]
+        self.assertEqual([snapshot.player_id for snapshot in snapshots], ["incoming"])
+        self.assertEqual(snapshots[0].round_score, -2)
 
     def test_not_started_today_zero_does_not_create_score(self):
         self.assertEqual(

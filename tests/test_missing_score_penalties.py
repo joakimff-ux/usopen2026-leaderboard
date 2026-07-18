@@ -79,10 +79,13 @@ class MissingScorePenaltyTests(unittest.TestCase):
         self.assertIsNone(standing.rounds[1].total)
         self.assertFalse(any(item.score_kind == "PENALTY" for item in standing.rounds[1].counting))
 
-    def test_penalty_is_not_used_before_round_penalty_is_frozen(self):
+    def test_live_partial_total_does_not_use_unfrozen_penalty(self):
         scores = [(f"p{number}", 3, 70 + number) for number in range(1, 5)]
         standing = _standings(scores, [_event("p5", "CUT", 3)], finalized_rounds=(1, 2, 4))
-        self.assertIsNone(standing.rounds[3].total)
+        self.assertEqual(standing.rounds[3].total, 2)
+        self.assertFalse(
+            any(item.score_kind == "PENALTY" for item in standing.rounds[3].counting)
+        )
 
     def test_four_actual_scores_fill_exactly_one_place_with_penalty(self):
         scores = [(f"p{number}", 3, 70 + number) for number in range(1, 5)]

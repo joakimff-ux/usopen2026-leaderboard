@@ -18,6 +18,7 @@ from supabase import Client
 from lib.db import (
     event_name_matches,
     fetch_live_player_states,
+    fetch_active_roster_changes,
     fetch_player_status_events,
     fetch_players,
     fetch_team_players,
@@ -25,7 +26,7 @@ from lib.db import (
     get_supabase_client_from_config,
     tournament_display_title,
 )
-from lib import live_feed
+from lib import live_feed, roster_changes
 
 logger = logging.getLogger(__name__)
 
@@ -770,9 +771,25 @@ def sync_live_scores(
             )
 
         db_players = fetch_players(client, tournament_id)
+        team_player_rows = fetch_team_players(client, tournament_id)
+        original_by_team: dict[str, list[str]] = {}
+        for row in team_player_rows:
+            original_by_team.setdefault(str(row["team_id"]), []).append(
+                str(row["player_id"])
+            )
+        try:
+            active_change_rows = fetch_active_roster_changes(client, tournament_id)
+        except Exception:
+            active_change_rows = []
+        active_by_team = roster_changes.roster_for_scoring_round(
+            original_by_team,
+            active_change_rows,
+            round_num=current_round or 1,
+        )
         selected_player_ids = {
-            str(row["player_id"])
-            for row in fetch_team_players(client, tournament_id)
+            player_id
+            for player_ids in active_by_team.values()
+            for player_id in player_ids
         }
         player_lookup = build_player_lookup(db_players)
         exact_player_lookup = build_exact_player_lookup(db_players)
