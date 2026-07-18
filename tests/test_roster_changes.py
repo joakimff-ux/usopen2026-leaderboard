@@ -7,8 +7,12 @@ from lib.roster_changes import (
     apply_roster_changes,
     build_change_pairs,
     build_roster_editor_defaults,
+    build_roster_change_pool,
+    build_roster_slot_options,
     change_count_by_team,
+    ROSTER_CHANGE_POOL_NAMES,
     save_roster_changes,
+    validate_roster_change_pool,
     validate_rosters,
 )
 
@@ -165,8 +169,67 @@ class RosterChangeTests(unittest.TestCase):
 
     def test_admin_editor_uses_player_ids_and_never_name_keys(self):
         self.assertIn('editor_prefix = f"roster_editor_v2_', self.app_source)
-        self.assertIn('options=list(players_by_id)', self.app_source)
+        self.assertIn('options=roster_changes.build_roster_slot_options(', self.app_source)
         self.assertNotIn("player_id_by_name", self.app_source)
+
+    def test_change_pool_contains_exactly_the_eleven_allowed_unique_players(self):
+        names = list(ROSTER_CHANGE_POOL_NAMES)
+        players = [
+            {"id": f"p{index}", "name": name, "tier": 1}
+            for index, name in enumerate(names, start=1)
+        ]
+
+        pool = build_roster_change_pool(players)
+
+        self.assertTrue(pool.is_valid)
+        self.assertEqual(len(pool.player_ids), 11)
+        self.assertEqual(len(set(pool.player_ids)), 11)
+        self.assertIn("Patrick Cantlay", names)
+        self.assertNotIn("Patrick Cantley", names)
+
+    def test_current_player_is_prefilled_alongside_restricted_change_pool(self):
+        options = build_roster_slot_options(
+            "current",
+            ["pool-1", "pool-2", "current"],
+            "original",
+        )
+        self.assertEqual(options, ["current", "original", "pool-1", "pool-2"])
+
+    def test_player_outside_current_roster_and_change_pool_is_rejected(self):
+        validation = validate_roster_change_pool(
+            {"team-1": ["p1", "p2", "p3", "p4", "p5", "p6", "not-allowed"]},
+            {"team-1": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"]},
+            {"pool-1", "pool-2"},
+        )
+        self.assertFalse(validation.is_valid)
+        self.assertIn("utenfor tillatt byttepool", validation.errors[0])
+
+    def test_atomic_save_rejects_player_outside_change_pool(self):
+        client = FakeRpcClient()
+        current = {"team-1": [f"p{index}" for index in range(1, 8)]}
+        selected = {"team-1": ["not-allowed", *current["team-1"][1:]]}
+
+        with self.assertRaisesRegex(ValueError, "utenfor tillatt byttepool"):
+            save_roster_changes(
+                client,
+                "tournament-1",
+                current,
+                selected,
+                {*current["team-1"], "not-allowed", "pool-1"},
+                window_is_open=True,
+                current_by_team=current,
+                pool_player_ids={"pool-1"},
+            )
+        self.assertEqual(client.calls, [])
+
+    def test_missing_change_pool_player_blocks_editor(self):
+        players = [
+            {"id": f"p{index}", "name": name, "tier": 1}
+            for index, name in enumerate(ROSTER_CHANGE_POOL_NAMES[:-1], start=1)
+        ]
+        pool = build_roster_change_pool(players)
+        self.assertFalse(pool.is_valid)
+        self.assertIn("Sepp Straka", pool.errors[0])
 
     def test_change_pairs_only_include_actual_replacements(self):
         original = {"team-1": [f"p{index}" for index in range(1, 8)]}

@@ -547,6 +547,8 @@ def confirm_roster_changes_dialog(
     original_by_team: dict[str, list[str]],
     selected_by_team: dict[str, list[str]],
     valid_player_ids: set[str],
+    current_by_team: dict[str, list[str]],
+    pool_player_ids: set[str],
     teams: list[dict],
     players: list[dict],
 ) -> None:
@@ -583,6 +585,8 @@ def confirm_roster_changes_dialog(
                 valid_player_ids,
                 window_is_open=window_is_open,
                 changed_by="admin",
+                current_by_team=current_by_team,
+                pool_player_ids=pool_player_ids,
             )
             clear_data_cache()
             st.session_state.roster_changes_saved = True
@@ -1036,6 +1040,8 @@ def page_admin() -> None:
             players = db.fetch_players(client, tournament_id)
             team_players = db.fetch_team_players(client, tournament_id)
             players_by_id = {str(player["id"]): player for player in players}
+            change_pool = roster_changes.build_roster_change_pool(players)
+            pool_player_ids = set(change_pool.player_ids)
             editor_defaults = roster_changes.build_roster_editor_defaults(
                 teams,
                 players,
@@ -1045,6 +1051,8 @@ def page_admin() -> None:
             original_by_team = editor_defaults.original_by_team
             current_by_team = editor_defaults.active_by_team
             roster_errors_by_team = editor_defaults.errors_by_team
+            for error in change_pool.errors:
+                st.error(error)
 
             window_is_open = bool(tournament.get("roster_change_window_open", False))
             control_col, status_col = st.columns([2, 1])
@@ -1101,6 +1109,12 @@ def page_admin() -> None:
                 and roster_changes.validate_rosters(
                     {team_id: selected_by_team[team_id]},
                     valid_player_ids,
+                    {team_id: original_by_team[team_id]},
+                ).is_valid
+                and roster_changes.validate_roster_change_pool(
+                    {team_id: selected_by_team[team_id]},
+                    {team_id: current_by_team[team_id]},
+                    pool_player_ids,
                     {team_id: original_by_team[team_id]},
                 ).is_valid
             }
@@ -1175,7 +1189,17 @@ def page_admin() -> None:
                         valid_player_ids,
                         {team_id: original_ids},
                     )
-                    is_complete = changes_used > 0 and team_validation.is_valid
+                    team_pool_validation = roster_changes.validate_roster_change_pool(
+                        {team_id: team_selected},
+                        {team_id: current_ids},
+                        pool_player_ids,
+                        {team_id: original_ids},
+                    )
+                    is_complete = (
+                        changes_used > 0
+                        and team_validation.is_valid
+                        and team_pool_validation.is_valid
+                    )
                     st.markdown(
                         f'<div id="bytter-{escape(team_id)}"></div>',
                         unsafe_allow_html=True,
@@ -1208,13 +1232,23 @@ def page_admin() -> None:
                                 if slot <= len(original_ids)
                                 else None
                             )
+                            active_id = (
+                                current_ids[slot - 1]
+                                if slot <= len(current_ids)
+                                else None
+                            )
                             lock_unchanged_slot = (
                                 changes_used >= roster_changes.MAX_CHANGES_PER_TEAM
                                 and selected_id == original_id
                             )
                             column.selectbox(
                                 f"Spiller {slot}",
-                                options=list(players_by_id),
+                                options=roster_changes.build_roster_slot_options(
+                                    selected_id,
+                                    change_pool.player_ids,
+                                    original_id,
+                                    active_id,
+                                ),
                                 format_func=lambda value, lookup=players_by_id: str(
                                     lookup[value]["name"]
                                 ),
@@ -1225,6 +1259,9 @@ def page_admin() -> None:
                         if changes_used >= roster_changes.MAX_CHANGES_PER_TEAM:
                             st.caption("Maks tre bytter er brukt. Uendrede spillervalg er låst.")
                         for error in team_validation.errors:
+                            _, _, message = error.partition(": ")
+                            st.error(message)
+                        for error in team_pool_validation.errors:
                             _, _, message = error.partition(": ")
                             st.error(message)
                         try:
@@ -1249,7 +1286,16 @@ def page_admin() -> None:
                     valid_player_ids,
                     original_by_team,
                 )
+                pool_validation = roster_changes.validate_roster_change_pool(
+                    selected_by_team,
+                    current_by_team,
+                    pool_player_ids,
+                    original_by_team,
+                )
                 for error in validation.errors:
+                    team_id, _, message = error.partition(": ")
+                    st.error(f"{owner_by_team.get(team_id, team_id)}: {message}")
+                for error in pool_validation.errors:
                     team_id, _, message = error.partition(": ")
                     st.error(f"{owner_by_team.get(team_id, team_id)}: {message}")
 
@@ -1264,7 +1310,9 @@ def page_admin() -> None:
                     type="primary",
                     disabled=(
                         bool(roster_errors_by_team)
+                        or not change_pool.is_valid
                         or not validation.is_valid
+                        or not pool_validation.is_valid
                         or not has_edits
                     ),
                     key="save_all_roster_changes",
@@ -1276,6 +1324,8 @@ def page_admin() -> None:
                         original_by_team,
                         selected_by_team,
                         valid_player_ids,
+                        current_by_team,
+                        pool_player_ids,
                         teams,
                         players,
                     )

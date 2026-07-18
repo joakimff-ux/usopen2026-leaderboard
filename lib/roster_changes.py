@@ -9,6 +9,19 @@ from typing import Any
 ROSTER_SIZE = 7
 ROUND_FROM = 3
 MAX_CHANGES_PER_TEAM = 3
+ROSTER_CHANGE_POOL_NAMES = (
+    "Collin Morikawa",
+    "Chris Gotterup",
+    "J.J. Spaun",
+    "Matt Wallace",
+    "Thomas Detry",
+    "Victor Perez",
+    "Francesco Molinari",
+    "Justin Thomas",
+    "Patrick Cantlay",
+    "Corey Conners",
+    "Sepp Straka",
+)
 
 
 @dataclass(frozen=True)
@@ -29,6 +42,74 @@ class RosterEditorDefaults:
     @property
     def is_valid(self) -> bool:
         return not self.errors_by_team
+
+
+@dataclass(frozen=True)
+class RosterChangePool:
+    player_ids: tuple[str, ...]
+    errors: tuple[str, ...]
+
+    @property
+    def is_valid(self) -> bool:
+        return not self.errors
+
+
+def build_roster_change_pool(players: list[dict[str, Any]]) -> RosterChangePool:
+    players_by_name: dict[str, list[dict[str, Any]]] = {}
+    for player in players:
+        players_by_name.setdefault(str(player.get("name") or "").casefold(), []).append(player)
+
+    player_ids: list[str] = []
+    errors: list[str] = []
+    for name in ROSTER_CHANGE_POOL_NAMES:
+        matches = players_by_name.get(name.casefold(), [])
+        if not matches:
+            errors.append(f"Byttespilleren {name} mangler i aktiv turnering.")
+            continue
+        if len(matches) > 1:
+            errors.append(f"Byttespilleren {name} finnes flere ganger i aktiv turnering.")
+            continue
+        player_ids.append(str(matches[0]["id"]))
+
+    if len(set(player_ids)) != len(player_ids):
+        errors.append("Byttepoolen inneholder dupliserte player_id-er.")
+    return RosterChangePool(tuple(player_ids), tuple(errors))
+
+
+def build_roster_slot_options(
+    selected_player_id: str,
+    pool_player_ids: tuple[str, ...] | list[str],
+    original_player_id: str | None = None,
+    active_player_id: str | None = None,
+) -> list[str]:
+    return list(
+        dict.fromkeys(
+            player_id
+            for player_id in (
+                selected_player_id,
+                active_player_id,
+                original_player_id,
+                *pool_player_ids,
+            )
+            if player_id
+        )
+    )
+
+
+def validate_roster_change_pool(
+    selected_by_team: dict[str, list[str]],
+    current_by_team: dict[str, list[str]],
+    pool_player_ids: set[str],
+    original_by_team: dict[str, list[str]] | None = None,
+) -> RosterChangeValidation:
+    errors: list[str] = []
+    for team_id, selected_ids in selected_by_team.items():
+        retained_ids = set(current_by_team.get(team_id, []))
+        retained_ids.update((original_by_team or {}).get(team_id, []))
+        disallowed_ids = set(selected_ids) - retained_ids - pool_player_ids
+        if disallowed_ids:
+            errors.append(f"{team_id}: Ett eller flere valg er utenfor tillatt byttepool.")
+    return RosterChangeValidation(tuple(errors))
 
 
 def build_original_rosters(
@@ -185,12 +266,23 @@ def save_roster_changes(
     valid_player_ids: set[str],
     window_is_open: bool,
     changed_by: str = "admin",
+    current_by_team: dict[str, list[str]] | None = None,
+    pool_player_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     if not window_is_open:
         raise ValueError("Byttevinduet er stengt.")
     validation = validate_rosters(selected_by_team, valid_player_ids, original_by_team)
     if not validation.is_valid:
         raise ValueError(" ".join(validation.errors))
+    if current_by_team is not None and pool_player_ids is not None:
+        pool_validation = validate_roster_change_pool(
+            selected_by_team,
+            current_by_team,
+            pool_player_ids,
+            original_by_team,
+        )
+        if not pool_validation.is_valid:
+            raise ValueError(" ".join(pool_validation.errors))
     change_pairs = build_change_pairs(original_by_team, selected_by_team)
 
     rows = [

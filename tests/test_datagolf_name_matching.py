@@ -28,6 +28,7 @@ from lib.datagolf_sync import (  # noqa: E402
     normalize_name,
     run_name_matching_test,
 )
+from lib.roster_changes import ROSTER_CHANGE_POOL_NAMES  # noqa: E402
 
 
 class DataGolfNameMatchingTests(unittest.TestCase):
@@ -150,6 +151,23 @@ class DataGolfNameMatchingTests(unittest.TestCase):
             )
         self.assertEqual(matched, direct)
         warning.assert_not_called()
+
+    def test_all_roster_change_pool_names_match_datagolf_directly(self):
+        players = [
+            {"id": f"pool-{index}", "name": name, "tier": 1}
+            for index, name in enumerate(ROSTER_CHANGE_POOL_NAMES, start=1)
+        ]
+        exact_lookup = build_exact_player_lookup(players)
+        normalized_lookup = build_player_lookup(players)
+
+        for player in players:
+            with self.subTest(name=player["name"]):
+                matched = match_database_player(
+                    player["name"],
+                    normalized_lookup,
+                    exact_player_lookup=exact_lookup,
+                )
+                self.assertEqual(matched, player)
 
     def test_datagolf_id_takes_priority_when_available(self):
         id_match = {
