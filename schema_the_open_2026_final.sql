@@ -13,6 +13,7 @@ create table tournaments (
     counting_scores int not null default 5 check (counting_scores >= 1),
     dropped_scores int not null default 2 check (dropped_scores >= 0),
     is_active boolean not null default false,
+    roster_change_window_open boolean not null default false,
     display_title text not null,
     datagolf_event_name text not null,
     course_name text,
@@ -222,22 +223,10 @@ begin
         raise exception 'Tournament not found.';
     end if;
     if not exists (
-        select 1 from tournament_rounds
-        where tournament_id = p_tournament_id and round = 2 and state = 'FINALIZED'
+        select 1 from tournaments
+        where id = p_tournament_id and roster_change_window_open = true
     ) then
-        raise exception 'Round 2 must be finalized before roster changes.';
-    end if;
-    if exists (
-        select 1 from scores s
-        join players p on p.id = s.player_id
-        where p.tournament_id = p_tournament_id and s.round = 3
-    ) or exists (
-        select 1 from live_player_states
-        where tournament_id = p_tournament_id
-          and round = 3
-          and (hole is not null or is_finished = true)
-    ) then
-        raise exception 'The roster-change window is closed because round 3 has started.';
+        raise exception 'The roster-change window is closed.';
     end if;
     if exists (
         select 1

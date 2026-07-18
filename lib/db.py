@@ -89,6 +89,20 @@ def set_active_tournament(client: Client, tournament_id: str) -> dict[str, Any] 
     return response.data[0] if response.data else None
 
 
+def set_roster_change_window(
+    client: Client,
+    tournament_id: str,
+    is_open: bool,
+) -> dict[str, Any] | None:
+    response = (
+        client.table("tournaments")
+        .update({"roster_change_window_open": bool(is_open)})
+        .eq("id", tournament_id)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
 def event_name_matches(expected: str | None, actual: str | None) -> bool:
     """Return True only when both configured event names match exactly."""
     if not expected or not actual:

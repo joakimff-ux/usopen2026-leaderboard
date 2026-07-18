@@ -7,9 +7,7 @@ from lib.roster_changes import (
     apply_roster_changes,
     build_change_pairs,
     change_count_by_team,
-    round_three_has_started,
     save_roster_changes,
-    round_two_is_finalized,
     validate_rosters,
 )
 
@@ -43,11 +41,13 @@ class RosterChangeTests(unittest.TestCase):
         self.assertNotIn('"Lagre": True', self.app_source)
         self.assertNotIn("unlock_roster_changes", self.app_source)
 
-    def test_admin_ui_shows_automatic_round_three_lock_message(self):
-        self.assertIn(
-            '"Byttevinduet er stengt. Runde 3 har startet."',
-            self.app_source,
-        )
+    def test_admin_ui_uses_manual_persisted_window_control(self):
+        self.assertIn('"🔓 Byttevindu"', self.app_source)
+        self.assertIn('"Steng byttevindu"', self.app_source)
+        self.assertIn('"Åpne byttevindu"', self.app_source)
+        self.assertIn("db.set_roster_change_window", self.app_source)
+        self.assertNotIn("round_two_is_finalized", self.app_source)
+        self.assertNotIn("round_three_has_started", self.app_source)
 
     def test_admin_ui_has_operational_dashboard_and_quick_tools(self):
         for label in (
@@ -146,29 +146,27 @@ class RosterChangeTests(unittest.TestCase):
             original,
             selected,
             {f"p{index}" for index in range(1, 10)},
-            round_two_finalized=True,
-            round_three_started=False,
+            window_is_open=True,
         )
         self.assertEqual(len(client.calls), 1)
         name, params = client.calls[0]
         self.assertEqual(name, "save_roster_changes_atomic")
         self.assertEqual(len(params["p_changes"]), 2)
 
-    def test_swaps_open_only_after_round_two_is_finalized(self):
-        self.assertFalse(round_two_is_finalized([{"round": 2, "state": "OPEN"}]))
-        self.assertTrue(round_two_is_finalized([{"round": 2, "state": "FINALIZED"}]))
-
-    def test_round_three_start_closes_window(self):
-        self.assertTrue(round_three_has_started([{"round": 3}], []))
-        self.assertTrue(
-            round_three_has_started([], [{"round": 3, "hole": 1, "is_finished": False}])
-        )
-        self.assertFalse(
-            round_three_has_started(
-                [],
-                [{"round": 3, "hole": None, "round_score": 0, "is_finished": False}],
+    def test_closed_manual_window_prevents_save(self):
+        client = FakeRpcClient()
+        original = {"team-1": [f"p{index}" for index in range(1, 8)]}
+        selected = {"team-1": ["p8", "p2", "p3", "p4", "p5", "p6", "p7"]}
+        with self.assertRaisesRegex(ValueError, "Byttevinduet er stengt"):
+            save_roster_changes(
+                client,
+                "tournament-1",
+                original,
+                selected,
+                {f"p{index}" for index in range(1, 9)},
+                window_is_open=False,
             )
-        )
+        self.assertEqual(client.calls, [])
 
 
 if __name__ == "__main__":

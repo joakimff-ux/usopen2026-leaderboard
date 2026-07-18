@@ -7,10 +7,10 @@ class SchemaContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.sql = (Path(__file__).parents[1] / "schema.sql").read_text(encoding="utf-8")
-        cls.atomic_roster_migration = (
+        cls.manual_roster_window_migration = (
             Path(__file__).parents[1]
             / "migrations"
-            / "006_atomic_roster_change_window.sql"
+            / "007_manual_roster_change_window.sql"
         ).read_text(encoding="utf-8")
 
     def test_schema_creates_exact_expected_tables(self):
@@ -58,15 +58,25 @@ class SchemaContractTests(unittest.TestCase):
         )
 
     def test_roster_changes_use_one_service_role_only_database_transaction(self):
-        sql = self.atomic_roster_migration.lower()
+        sql = self.manual_roster_window_migration.lower()
         self.assertIn("create or replace function save_roster_changes_atomic", sql)
         self.assertIn("security definer", sql)
         self.assertIn("having count(*) > 3", sql)
-        self.assertIn("round = 3", sql)
+        self.assertIn("p_round_from <> 3", sql)
         self.assertIn("update roster_change_sets", sql)
         self.assertIn("insert into roster_changes", sql)
         self.assertIn("from public, anon, authenticated", sql)
         self.assertIn("to service_role", sql)
+
+    def test_roster_change_window_is_manual_and_persistent(self):
+        sql = self.manual_roster_window_migration.lower()
+        self.assertIn("roster_change_window_open boolean not null default false", sql)
+        self.assertIn("roster_change_window_open = true", sql)
+        self.assertNotIn("tournament_rounds", sql)
+        self.assertNotIn("finalized", sql)
+        self.assertNotIn("live_player_states", sql)
+        self.assertNotIn("from scores", sql)
+        self.assertIn("roster_change_window_open boolean not null default false", self.sql.lower())
 
 
 if __name__ == "__main__":

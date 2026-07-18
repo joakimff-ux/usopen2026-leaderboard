@@ -570,12 +570,10 @@ def confirm_roster_changes_dialog(
         use_container_width=True,
     ):
         try:
-            round_two_ready = roster_changes.round_two_is_finalized(
-                db.fetch_tournament_rounds(client, tournament_id)
-            )
-            round_three_started = roster_changes.round_three_has_started(
-                db.fetch_scores(client, tournament_id),
-                db.fetch_live_player_states(client, tournament_id),
+            current_tournament = db.get_active_tournament(client)
+            window_is_open = bool(
+                current_tournament
+                and current_tournament.get("roster_change_window_open", False)
             )
             roster_changes.save_roster_changes(
                 client,
@@ -583,8 +581,7 @@ def confirm_roster_changes_dialog(
                 original_by_team,
                 selected_by_team,
                 valid_player_ids,
-                round_two_finalized=round_two_ready,
-                round_three_started=round_three_started,
+                window_is_open=window_is_open,
                 changed_by="admin",
             )
             clear_data_cache()
@@ -1020,6 +1017,8 @@ def page_admin() -> None:
         )
         tournament_id = str(tournament["id"])
         try:
+            if "roster_change_window_open" not in tournament:
+                raise RuntimeError("Manual roster-change window migration is missing.")
             active_change_set = db.fetch_active_roster_change_set(client, tournament_id)
             active_change_rows = db.fetch_active_roster_changes(
                 client,
@@ -1029,22 +1028,13 @@ def page_admin() -> None:
         except Exception:
             st.error(
                 "Byttefunksjonen krever databasemigrasjonene "
-                "`005_roster_changes.sql` og `006_atomic_roster_change_window.sql`."
+                "`005_roster_changes.sql`, `006_atomic_roster_change_window.sql` og "
+                "`007_manual_roster_change_window.sql`."
             )
         else:
             teams = db.fetch_teams(client, tournament_id)
             players = db.fetch_players(client, tournament_id)
             team_players = db.fetch_team_players(client, tournament_id)
-            scores = db.fetch_scores(client, tournament_id)
-            try:
-                live_states = db.fetch_live_player_states(client, tournament_id)
-            except Exception:
-                live_states = []
-
-            round_two_ready = roster_changes.round_two_is_finalized(
-                db.fetch_tournament_rounds(client, tournament_id)
-            )
-            round_three_started = roster_changes.round_three_has_started(scores, live_states)
             players_by_id = {str(player["id"]): player for player in players}
             original_by_team = roster_changes.build_original_rosters(
                 teams,
@@ -1056,7 +1046,28 @@ def page_admin() -> None:
                 active_change_rows,
             )
 
-            window_is_open = round_two_ready and not round_three_started
+            window_is_open = bool(tournament.get("roster_change_window_open", False))
+            control_col, status_col = st.columns([2, 1])
+            status_col.metric(
+                "🔓 Byttevindu",
+                "ÅPENT" if window_is_open else "STENGT",
+            )
+            if control_col.button(
+                "Steng byttevindu" if window_is_open else "Åpne byttevindu",
+                type="primary" if not window_is_open else "secondary",
+                use_container_width=True,
+                key="toggle_roster_change_window",
+            ):
+                try:
+                    db.set_roster_change_window(
+                        client,
+                        tournament_id,
+                        not window_is_open,
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Kunne ikke endre byttevinduet: {exc}")
+
             change_set_key = str(active_change_set["id"]) if active_change_set else "original"
             editor_prefix = f"roster_editor_{tournament_id}_{change_set_key}"
             for team in teams:
@@ -1102,13 +1113,8 @@ def page_admin() -> None:
                 st.success("Alle spillerbytter er lagret.")
             render_roster_change_overview(teams, players, active_change_rows)
 
-            if round_three_started:
-                st.warning("Byttevinduet er stengt. Runde 3 har startet.")
-            elif not round_two_ready:
-                st.warning(
-                    "Bytter åpnes når runde 2 er ferdig og markert som FINALIZED "
-                    "under Statuses & penalties."
-                )
+            if not window_is_open:
+                st.warning("Byttevinduet er stengt.")
             else:
                 owner_by_team = {str(team["id"]): str(team["name"]) for team in teams}
                 search_query = st.text_input(

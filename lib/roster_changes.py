@@ -130,40 +130,17 @@ def change_count_by_team(
     }
 
 
-def round_two_is_finalized(tournament_rounds: list[dict[str, Any]]) -> bool:
-    return any(
-        int(row.get("round", 0)) == 2 and str(row.get("state") or "").upper() == "FINALIZED"
-        for row in tournament_rounds
-    )
-
-
-def round_three_has_started(
-    scores: list[dict[str, Any]],
-    live_states: list[dict[str, Any]],
-) -> bool:
-    if any(int(score.get("round", 0)) == 3 for score in scores):
-        return True
-    return any(
-        int(state.get("round", 0)) == 3
-        and (state.get("hole") is not None or bool(state.get("is_finished")))
-        for state in live_states
-    )
-
-
 def save_roster_changes(
     client: Any,
     tournament_id: str,
     original_by_team: dict[str, list[str]],
     selected_by_team: dict[str, list[str]],
     valid_player_ids: set[str],
-    round_two_finalized: bool,
-    round_three_started: bool,
+    window_is_open: bool,
     changed_by: str = "admin",
 ) -> dict[str, Any]:
-    if not round_two_finalized:
-        raise ValueError("Bytter kan først lagres etter at runde 2 er ferdig.")
-    if round_three_started:
-        raise ValueError("Byttevinduet er stengt. Runde 3 har startet.")
+    if not window_is_open:
+        raise ValueError("Byttevinduet er stengt.")
     validation = validate_rosters(selected_by_team, valid_player_ids, original_by_team)
     if not validation.is_valid:
         raise ValueError(" ".join(validation.errors))
