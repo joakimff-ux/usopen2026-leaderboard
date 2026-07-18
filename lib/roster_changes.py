@@ -20,6 +20,17 @@ class RosterChangeValidation:
         return not self.errors
 
 
+@dataclass(frozen=True)
+class RosterEditorDefaults:
+    original_by_team: dict[str, list[str]]
+    active_by_team: dict[str, list[str]]
+    errors_by_team: dict[str, tuple[str, ...]]
+
+    @property
+    def is_valid(self) -> bool:
+        return not self.errors_by_team
+
+
 def build_original_rosters(
     teams: list[dict[str, Any]],
     players: list[dict[str, Any]],
@@ -40,6 +51,42 @@ def build_original_rosters(
             )
         )
     return rosters
+
+
+def build_roster_editor_defaults(
+    teams: list[dict[str, Any]],
+    players: list[dict[str, Any]],
+    team_players: list[dict[str, Any]],
+    active_change_rows: list[dict[str, Any]],
+) -> RosterEditorDefaults:
+    original_by_team = build_original_rosters(teams, players, team_players)
+    active_by_team = apply_roster_changes(original_by_team, active_change_rows)
+    valid_player_ids = {str(player["id"]) for player in players}
+    errors_by_team: dict[str, tuple[str, ...]] = {}
+
+    for team in teams:
+        team_id = str(team["id"])
+        player_ids = active_by_team.get(team_id, [])
+        errors: list[str] = []
+        if len(player_ids) != ROSTER_SIZE:
+            errors.append(
+                f"Fant {len(player_ids)} av {ROSTER_SIZE} gyldige spiller-ID-er i aktiv roster."
+            )
+        if len(set(player_ids)) != len(player_ids):
+            errors.append("Aktiv roster inneholder samme spiller flere ganger.")
+        unknown_ids = [player_id for player_id in player_ids if player_id not in valid_player_ids]
+        if unknown_ids:
+            errors.append(
+                "Aktiv roster inneholder ukjente spiller-ID-er: " + ", ".join(unknown_ids)
+            )
+        if errors:
+            errors_by_team[team_id] = tuple(errors)
+
+    return RosterEditorDefaults(
+        original_by_team=original_by_team,
+        active_by_team=active_by_team,
+        errors_by_team=errors_by_team,
+    )
 
 
 def validate_rosters(

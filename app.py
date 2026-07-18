@@ -1036,15 +1036,15 @@ def page_admin() -> None:
             players = db.fetch_players(client, tournament_id)
             team_players = db.fetch_team_players(client, tournament_id)
             players_by_id = {str(player["id"]): player for player in players}
-            original_by_team = roster_changes.build_original_rosters(
+            editor_defaults = roster_changes.build_roster_editor_defaults(
                 teams,
                 players,
                 team_players,
-            )
-            current_by_team = roster_changes.apply_roster_changes(
-                original_by_team,
                 active_change_rows,
             )
+            original_by_team = editor_defaults.original_by_team
+            current_by_team = editor_defaults.active_by_team
+            roster_errors_by_team = editor_defaults.errors_by_team
 
             window_is_open = bool(tournament.get("roster_change_window_open", False))
             control_col, status_col = st.columns([2, 1])
@@ -1069,9 +1069,11 @@ def page_admin() -> None:
                     st.error(f"Kunne ikke endre byttevinduet: {exc}")
 
             change_set_key = str(active_change_set["id"]) if active_change_set else "original"
-            editor_prefix = f"roster_editor_{tournament_id}_{change_set_key}"
+            editor_prefix = f"roster_editor_v2_{tournament_id}_{change_set_key}"
             for team in teams:
                 team_id = str(team["id"])
+                if team_id in roster_errors_by_team:
+                    continue
                 for slot, player_id in enumerate(current_by_team.get(team_id, []), start=1):
                     state_key = f"{editor_prefix}_{team_id}_{slot}"
                     if state_key not in st.session_state:
@@ -1154,6 +1156,20 @@ def page_admin() -> None:
                     current_ids = current_by_team.get(team_id, [])
                     team_selected = selected_by_team.get(team_id, [])
                     changes_used = changes_by_team.get(team_id, 0)
+                    if team_id in roster_errors_by_team:
+                        st.markdown(
+                            f'<div id="bytter-{escape(team_id)}"></div>',
+                            unsafe_allow_html=True,
+                        )
+                        with st.container(border=True):
+                            st.markdown(f"### ⚠️ {team['name']}")
+                            for message in roster_errors_by_team[team_id]:
+                                st.error(message)
+                            st.caption(
+                                "Lagring er blokkert. Rosterdata må inneholde sju gyldige, "
+                                "unike player_id-er."
+                            )
+                        continue
                     team_validation = roster_changes.validate_rosters(
                         {team_id: team_selected},
                         valid_player_ids,
@@ -1184,6 +1200,9 @@ def page_admin() -> None:
                         for slot, column in enumerate(selector_columns, start=1):
                             state_key = f"{editor_prefix}_{team_id}_{slot}"
                             selected_id = str(st.session_state.get(state_key, ""))
+                            if selected_id not in players_by_id:
+                                column.error("Ugyldig player_id. Lagring er blokkert.")
+                                continue
                             original_id = (
                                 original_ids[slot - 1]
                                 if slot <= len(original_ids)
@@ -1243,7 +1262,11 @@ def page_admin() -> None:
                 if st.button(
                     "💾 Lagre alle bytter",
                     type="primary",
-                    disabled=not validation.is_valid or not has_edits,
+                    disabled=(
+                        bool(roster_errors_by_team)
+                        or not validation.is_valid
+                        or not has_edits
+                    ),
                     key="save_all_roster_changes",
                     use_container_width=True,
                 ):

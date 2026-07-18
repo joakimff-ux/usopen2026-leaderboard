@@ -6,6 +6,7 @@ import unittest
 from lib.roster_changes import (
     apply_roster_changes,
     build_change_pairs,
+    build_roster_editor_defaults,
     change_count_by_team,
     save_roster_changes,
     validate_rosters,
@@ -89,6 +90,83 @@ class RosterChangeTests(unittest.TestCase):
         validation = validate_rosters(selected, {f"p{index}" for index in range(1, 9)})
         self.assertFalse(validation.is_valid)
         self.assertIn("team-1: Samme spiller kan ikke velges flere ganger.", validation.errors)
+
+    def test_editor_prefills_multiple_teams_with_their_actual_player_ids(self):
+        teams = [
+            {"id": "christine", "name": "Christine"},
+            {"id": "joakim", "name": "Joakim"},
+        ]
+        players = [
+            {"id": f"c{index}", "name": f"Christine Player {index}", "tier": index}
+            for index in range(1, 8)
+        ] + [
+            {"id": f"j{index}", "name": f"Joakim Player {index}", "tier": index}
+            for index in range(1, 8)
+        ]
+        links = [
+            {"team_id": team_id, "player_id": f"{prefix}{index}"}
+            for team_id, prefix in (("christine", "c"), ("joakim", "j"))
+            for index in range(1, 8)
+        ]
+
+        defaults = build_roster_editor_defaults(teams, players, links, [])
+
+        self.assertEqual(defaults.active_by_team["christine"], [f"c{i}" for i in range(1, 8)])
+        self.assertEqual(defaults.active_by_team["joakim"], [f"j{i}" for i in range(1, 8)])
+        self.assertTrue(defaults.is_valid)
+        self.assertTrue(
+            all(len(set(player_ids)) == 7 for player_ids in defaults.active_by_team.values())
+        )
+
+    def test_editor_prefills_from_latest_active_roster_changes(self):
+        teams = [{"id": "joakim", "name": "Joakim"}]
+        players = [
+            {"id": f"p{index}", "name": f"Player {index}", "tier": index}
+            for index in range(1, 9)
+        ]
+        links = [
+            {"team_id": "joakim", "player_id": f"p{index}"}
+            for index in range(1, 8)
+        ]
+        active_changes = [
+            {
+                "team_id": "joakim",
+                "old_player_id": "p3",
+                "new_player_id": "p8",
+                "round_from": 3,
+            }
+        ]
+
+        defaults = build_roster_editor_defaults(teams, players, links, active_changes)
+
+        self.assertEqual(
+            defaults.active_by_team["joakim"],
+            ["p1", "p2", "p8", "p4", "p5", "p6", "p7"],
+        )
+        self.assertEqual(defaults.original_by_team["joakim"], [f"p{i}" for i in range(1, 8)])
+
+    def test_missing_player_id_is_an_error_without_first_player_fallback(self):
+        teams = [{"id": "joakim", "name": "Joakim"}]
+        players = [
+            {"id": f"p{index}", "name": f"Player {index}", "tier": index}
+            for index in range(1, 9)
+        ]
+        links = [
+            {"team_id": "joakim", "player_id": f"p{index}"}
+            for index in range(2, 8)
+        ]
+
+        defaults = build_roster_editor_defaults(teams, players, links, [])
+
+        self.assertFalse(defaults.is_valid)
+        self.assertIn("joakim", defaults.errors_by_team)
+        self.assertIn("Fant 6 av 7", defaults.errors_by_team["joakim"][0])
+        self.assertNotIn("p1", defaults.active_by_team["joakim"])
+
+    def test_admin_editor_uses_player_ids_and_never_name_keys(self):
+        self.assertIn('editor_prefix = f"roster_editor_v2_', self.app_source)
+        self.assertIn('options=list(players_by_id)', self.app_source)
+        self.assertNotIn("player_id_by_name", self.app_source)
 
     def test_change_pairs_only_include_actual_replacements(self):
         original = {"team-1": [f"p{index}" for index in range(1, 8)]}
