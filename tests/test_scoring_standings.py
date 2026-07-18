@@ -91,7 +91,23 @@ class LeaderboardStandingTests(unittest.TestCase):
         self.assertEqual(result.total, -2)
 
     def test_all_seven_equal_are_undecided_in_active_round(self):
-        result = self.standings({"Joakim": [[72, 72, 72, 72, 72, 72, 72]]})[0].rounds[1]
+        teams, players, team_players, _ = build_fixture({"Joakim": []})
+        standing = build_team_standings(
+            teams,
+            players,
+            team_players,
+            [],
+            live_states=[
+                {
+                    "player_id": player["id"],
+                    "round": 1,
+                    "round_score": 0,
+                    "is_finished": False,
+                }
+                for player in players
+            ],
+        )[0]
+        result = standing.rounds[1]
 
         self.assertEqual(result.counting, [])
         self.assertEqual(result.dropped, [])
@@ -99,7 +115,22 @@ class LeaderboardStandingTests(unittest.TestCase):
         self.assertEqual(result.total, 0)
 
     def test_three_players_tied_across_fifth_place_are_undecided(self):
-        result = self.standings({"Joakim": [[68, 69, 70, 71, 72, 72, 72]]})[0].rounds[1]
+        teams, players, team_players, _ = build_fixture({"Joakim": []})
+        result = build_team_standings(
+            teams,
+            players,
+            team_players,
+            [],
+            live_states=[
+                {
+                    "player_id": player["id"],
+                    "round": 1,
+                    "round_score": score,
+                    "is_finished": False,
+                }
+                for player, score in zip(players, [-4, -3, -2, -1, 0, 0, 0])
+            ],
+        )[0].rounds[1]
 
         self.assertEqual([player.strokes for player in result.counting], [-4, -3, -2, -1])
         self.assertEqual(result.dropped, [])
@@ -107,13 +138,23 @@ class LeaderboardStandingTests(unittest.TestCase):
         self.assertEqual(result.total, -10)
 
     def test_previous_round_scores_do_not_resolve_active_round_tie(self):
-        standing = self.standings(
-            {
-                "Joakim": [
-                    [66, 67, 68, 69, 70, 80, 81],
-                    [72, 72, 72, 72, 72, 72, 72],
-                ]
-            }
+        teams, players, team_players, scores = build_fixture(
+            {"Joakim": [[66, 67, 68, 69, 70, 80, 81]]}
+        )
+        standing = build_team_standings(
+            teams,
+            players,
+            team_players,
+            scores,
+            live_states=[
+                {
+                    "player_id": player["id"],
+                    "round": 2,
+                    "round_score": 0,
+                    "is_finished": False,
+                }
+                for player in players
+            ],
         )[0]
 
         active_result = standing.rounds[2]
@@ -121,6 +162,52 @@ class LeaderboardStandingTests(unittest.TestCase):
         self.assertEqual(active_result.dropped, [])
         self.assertEqual(len(active_result.undecided), 7)
         self.assertEqual(active_result.total, 0)
+
+    def test_reitan_tie_is_resolved_from_completed_round_two_only(self):
+        names = [
+            "Adam Scott",
+            "Patrick Reed",
+            "Rory McIlroy",
+            "Chris Gotterup",
+            "Kristoffer Reitan",
+            "Min Woo Lee",
+            "Viktor Hovland",
+        ]
+        players = [
+            {"id": f"p{index}", "name": name, "tier": index}
+            for index, name in enumerate(names, start=1)
+        ]
+        scores = [
+            {
+                "player_id": player["id"],
+                "round": round_num,
+                "strokes": strokes,
+                "is_official": True,
+            }
+            for player, round_one, round_two in zip(
+                players,
+                [60, 61, 62, 63, 90, 64, 65],
+                [66, 66, 67, 68, 71, 71, 74],
+            )
+            for round_num, strokes in ((1, round_one), (2, round_two))
+        ]
+        standing = build_team_standings(
+            teams=[{"id": "joakim", "name": "Joakim"}],
+            players=players,
+            team_players=[
+                {"team_id": "joakim", "player_id": player["id"]}
+                for player in players
+            ],
+            scores=scores,
+        )[0]
+        round_two = standing.rounds[2]
+
+        self.assertEqual(round_two.undecided, [])
+        self.assertEqual(len(round_two.counting), 5)
+        self.assertEqual(len(round_two.dropped), 2)
+        self.assertIn("Kristoffer Reitan", [player.player_name for player in round_two.counting])
+        self.assertIn("Min Woo Lee", [player.player_name for player in round_two.dropped])
+        self.assertEqual(round_two.total, -22)
 
     def test_even_formats_as_e(self):
         self.assertEqual(format_relative_score(0), "E")

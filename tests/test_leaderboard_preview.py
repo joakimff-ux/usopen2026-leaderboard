@@ -120,12 +120,13 @@ class LeaderboardPreviewTests(unittest.TestCase):
                 {"team_id": "team-a", "player_id": player["id"]}
                 for player in self.players
             ],
-            scores=[
+            scores=[],
+            live_states=[
                 {
                     "player_id": player["id"],
                     "round": 1,
-                    "strokes": 72,
-                    "is_official": True,
+                    "round_score": 0,
+                    "is_finished": False,
                 }
                 for player in self.players
             ],
@@ -135,7 +136,7 @@ class LeaderboardPreviewTests(unittest.TestCase):
         self.assertTrue(all(row["selection"] == "PENDING" for row in rows))
 
     def test_three_way_cutoff_tie_marks_only_affected_players_pending(self):
-        strokes = [68, 69, 70, 71, 72, 72, 72]
+        round_scores = [-4, -3, -2, -1, 0, 0, 0]
         standing = build_team_standings(
             teams=[{"id": "team-a", "name": "Joakim"}],
             players=self.players,
@@ -143,14 +144,15 @@ class LeaderboardPreviewTests(unittest.TestCase):
                 {"team_id": "team-a", "player_id": player["id"]}
                 for player in self.players
             ],
-            scores=[
+            scores=[],
+            live_states=[
                 {
                     "player_id": player["id"],
                     "round": 1,
-                    "strokes": score,
-                    "is_official": True,
+                    "round_score": score,
+                    "is_finished": False,
                 }
-                for player, score in zip(self.players, strokes)
+                for player, score in zip(self.players, round_scores)
             ],
         )[0]
 
@@ -158,6 +160,45 @@ class LeaderboardPreviewTests(unittest.TestCase):
         self.assertEqual(sum(row["selection"] == "COUNTING" for row in rows), 4)
         self.assertEqual(sum(row["selection"] == "DROPPED" for row in rows), 0)
         self.assertEqual(sum(row["selection"] == "PENDING" for row in rows), 3)
+
+    def test_completed_reitan_tie_is_resolved_in_preview(self):
+        names = [
+            "Adam Scott",
+            "Patrick Reed",
+            "Rory McIlroy",
+            "Chris Gotterup",
+            "Kristoffer Reitan",
+            "Min Woo Lee",
+            "Viktor Hovland",
+        ]
+        players = [
+            {"id": f"reitan-{index}", "name": name, "tier": index}
+            for index, name in enumerate(names, start=1)
+        ]
+        standing = build_team_standings(
+            teams=[{"id": "joakim", "name": "Joakim"}],
+            players=players,
+            team_players=[
+                {"team_id": "joakim", "player_id": player["id"]}
+                for player in players
+            ],
+            scores=[
+                {
+                    "player_id": player["id"],
+                    "round": 2,
+                    "strokes": strokes,
+                    "is_official": True,
+                }
+                for player, strokes in zip(players, [66, 66, 67, 68, 71, 71, 74])
+            ],
+        )[0]
+
+        rows = build_preview_rows(standing, active_round=2)
+        reitan = next(row for row in rows if row["player_name"] == "Kristoffer Reitan")
+        min_woo = next(row for row in rows if row["player_name"] == "Min Woo Lee")
+        self.assertEqual(reitan["selection"], "COUNTING")
+        self.assertEqual(min_woo["selection"], "DROPPED")
+        self.assertFalse(any(row["selection"] == "PENDING" for row in rows))
 
     def test_team_detail_renders_undecided_results(self):
         app_source = (Path(__file__).parents[1] / "app.py").read_text(encoding="utf-8")

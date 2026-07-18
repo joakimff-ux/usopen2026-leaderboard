@@ -8,6 +8,13 @@ from typing import Any
 from lib import roster_changes
 
 
+# A completed round must always expose exactly five counting and two dropped
+# players. Equal round scores are ordered by normalized display name, then
+# player_id as a final uniqueness guard. No previous-round or tournament total
+# participates in this tie-break.
+COMPLETED_ROUND_TIE_BREAK = "round score, player name, player_id"
+
+
 @dataclass
 class PlayerRoundResult:
     player_id: str
@@ -56,6 +63,7 @@ def _split_counting_and_dropped(
     dropped_scores: int,
     penalty_score: int | None = None,
     mark_cutoff_ties_undecided: bool = False,
+    resolve_completed_ties: bool = False,
 ) -> tuple[
     list[PlayerRoundResult],
     list[PlayerRoundResult],
@@ -70,13 +78,23 @@ def _split_counting_and_dropped(
         eligible_for_penalty = [
             result for result in missing if result.status in {"CUT", "WD", "DQ"}
         ]
+        if resolve_completed_ties:
+            eligible_for_penalty.sort(
+                key=lambda item: (item.player_name.casefold(), item.player_id)
+            )
         if penalty_score is not None and len(eligible_for_penalty) >= needed:
             penalty_results = eligible_for_penalty[:needed]
             for result in penalty_results:
                 result.strokes = penalty_score
                 result.score_kind = "PENALTY"
             combined = scored + penalty_results
-            combined.sort(key=lambda item: item.strokes if item.strokes is not None else 999999)
+            combined.sort(
+                key=lambda item: (
+                    item.strokes if item.strokes is not None else 999999,
+                    item.player_name.casefold() if resolve_completed_ties else "",
+                    item.player_id if resolve_completed_ties else "",
+                )
+            )
             for result in combined:
                 result.counts = True
             dropped = [result for result in player_results if result not in combined]
@@ -89,7 +107,13 @@ def _split_counting_and_dropped(
             result.dropped = True
         return [], missing, [], None
 
-    scored.sort(key=lambda item: item.strokes)
+    scored.sort(
+        key=lambda item: (
+            item.strokes,
+            item.player_name.casefold() if resolve_completed_ties else "",
+            item.player_id if resolve_completed_ties else "",
+        )
+    )
     total = sum(
         result.strokes
         for result in scored[:counting_scores]
@@ -129,6 +153,7 @@ def build_team_round_result(
     statuses_by_player_round: dict[tuple[str, int], str] | None = None,
     penalty_score: int | None = None,
     mark_cutoff_ties_undecided: bool = False,
+    resolve_completed_ties: bool = False,
 ) -> TeamRoundResult:
     statuses = statuses_by_player_round or {}
     player_results = [
@@ -148,6 +173,7 @@ def build_team_round_result(
         dropped_scores=dropped_scores,
         penalty_score=penalty_score,
         mark_cutoff_ties_undecided=mark_cutoff_ties_undecided,
+        resolve_completed_ties=resolve_completed_ties,
     )
 
     return TeamRoundResult(
@@ -189,6 +215,7 @@ def build_team_standings(
         for score in scores
         if score.get("is_official", True)
     }
+    official_score_keys = set(scores_by_player_round)
     for state in live_states or []:
         if state.get("round_score") is None or state.get("is_finished"):
             continue
@@ -229,6 +256,11 @@ def build_team_standings(
         if score.get("round") is not None
     ]
     active_round = max([*live_rounds, *score_rounds] or [1])
+    finalized_rounds = {
+        int(round_row["round"])
+        for round_row in tournament_rounds or []
+        if str(round_row.get("state") or "").upper() == "FINALIZED"
+    }
 
     standings: list[TeamStanding] = []
     for team in teams:
@@ -257,6 +289,15 @@ def build_team_standings(
                 for player_id in effective_ids
                 if player_id in players_by_id
             ]
+            has_complete_official_roster = bool(effective_ids) and all(
+                (player_id, round_num) in official_score_keys
+                for player_id in effective_ids
+            )
+            round_is_complete = (
+                round_num in finalized_rounds
+                or round_num < active_round
+                or has_complete_official_roster
+            )
             round_result = build_team_round_result(
                 roster_players=roster_players,
                 scores_by_player_round=scores_by_player_round,
@@ -265,7 +306,10 @@ def build_team_standings(
                 dropped_scores=dropped_scores,
                 statuses_by_player_round=statuses_by_player_round,
                 penalty_score=penalty_score_by_round.get(round_num),
-                mark_cutoff_ties_undecided=round_num == active_round,
+                mark_cutoff_ties_undecided=(
+                    round_num == active_round and not round_is_complete
+                ),
+                resolve_completed_ties=round_is_complete,
             )
             round_results[round_num] = round_result
             round_totals[round_num] = round_result.total

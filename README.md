@@ -41,6 +41,15 @@ Each round has a configurable penalty: the highest official completed round scor
 - Team detail labels a penalty as `Straff (CUT)`, `Straff (WD)`, or `Straff (DQ)`.
 - Admin status and penalty overrides are append-only/audited in `admin_audit_log` and visible on the admin page.
 
+## Completed-round tie-break
+
+While a round is live, players tied across the fifth counting position remain
+`Ikke avgjort`. A round is treated as complete when it is finalized, a newer
+round exists, or all seven players on the effective team roster have official
+scores for that round. Equal scores in a completed round are ordered by player
+name (case-insensitive), with `player_id` only as a final uniqueness guard.
+Previous-round scores and tournament totals are never used for this decision.
+
 ## Excel import
 
 The importer expects `data/The Open 2026 - Resultater.xlsx`, sheet `Ark1`:
