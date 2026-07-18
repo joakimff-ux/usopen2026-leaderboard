@@ -217,12 +217,17 @@ def build_team_standings(
     }
     official_score_keys = set(official_scores_by_player_round)
     live_scores_by_player_round: dict[tuple[str, int], int] = {}
+    unstarted_live_score_keys: set[tuple[str, int]] = set()
     for state in live_states or []:
+        key = (str(state["player_id"]), int(state["round"]))
+        has_started = bool(state.get("is_finished")) or state.get("hole") is not None
+        if not has_started:
+            if str(state.get("status") or "ACTIVE").upper() == "ACTIVE":
+                unstarted_live_score_keys.add(key)
+            continue
         if state.get("round_score") is None or state.get("is_finished"):
             continue
-        live_scores_by_player_round[(str(state["player_id"]), int(state["round"]))] = int(
-            state["round_score"]
-        )
+        live_scores_by_player_round[key] = int(state["round_score"])
     events_by_player: dict[str, list[dict[str, Any]]] = {}
     for event in player_status_events or []:
         events_by_player.setdefault(event["player_id"], []).append(event)
@@ -298,10 +303,8 @@ def build_team_standings(
                 int(state.get("round") or 0) == round_num
                 and not state.get("is_finished")
                 and str(state.get("status") or "ACTIVE").upper() == "ACTIVE"
-                and (
-                    state.get("hole") is None
-                    or int(state.get("hole") or 0) < 18
-                )
+                and state.get("hole") is not None
+                and int(state.get("hole") or 0) < 18
                 for state in live_states or []
             )
             round_is_complete = (
@@ -310,10 +313,16 @@ def build_team_standings(
                 or (
                     has_complete_official_roster
                     and not round_has_live_play_in_progress
+                    and not any(
+                        key[1] == round_num for key in unstarted_live_score_keys
+                    )
                 )
             )
             scores_for_round = dict(official_scores_by_player_round)
             if not round_is_complete:
+                for key in unstarted_live_score_keys:
+                    if key[1] == round_num:
+                        scores_for_round.pop(key, None)
                 scores_for_round.update(live_scores_by_player_round)
             round_result = build_team_round_result(
                 roster_players=roster_players,
@@ -350,10 +359,16 @@ def build_team_standings(
 
     standings.sort(
         key=lambda item: (
-            -item.completed_rounds,
             item.tournament_total is None,
             item.tournament_total if item.tournament_total is not None else 999999,
-            item.team_name,
+            item.round_totals.get(active_round) is None,
+            (
+                item.round_totals.get(active_round)
+                if item.round_totals.get(active_round) is not None
+                else 999999
+            ),
+            item.team_name.casefold(),
+            item.team_id,
         )
     )
     return standings

@@ -147,7 +147,7 @@ class LeaderboardStandingTests(unittest.TestCase):
         self.assertEqual(standings[0].tournament_total, -10)
         self.assertEqual(standings[0].completed_rounds, 1)
 
-    def test_team_with_more_completed_rounds_sorts_first(self):
+    def test_lowest_total_sorts_first_even_with_fewer_completed_rounds(self):
         standings = self.standings(
             {
                 "One round": [[68, 68, 68, 68, 68, 90, 91]],
@@ -158,9 +158,9 @@ class LeaderboardStandingTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(standings[0].team_name, "Two rounds")
-        self.assertEqual(standings[0].completed_rounds, 2)
-        self.assertEqual(standings[0].tournament_total, 20)
+        self.assertEqual(standings[0].team_name, "One round")
+        self.assertEqual(standings[0].completed_rounds, 1)
+        self.assertEqual(standings[0].tournament_total, -20)
 
     def test_no_completed_rounds_falls_back_to_team_name(self):
         standings = self.standings({"Zulu": [], "Alpha": []})
@@ -191,6 +191,7 @@ class LeaderboardStandingTests(unittest.TestCase):
                 {
                     "player_id": player["id"],
                     "round": 1,
+                    "hole": 1,
                     "round_score": 0,
                     "is_finished": False,
                 }
@@ -215,6 +216,7 @@ class LeaderboardStandingTests(unittest.TestCase):
                 {
                     "player_id": player["id"],
                     "round": 1,
+                    "hole": 1,
                     "round_score": score,
                     "is_finished": False,
                 }
@@ -240,6 +242,7 @@ class LeaderboardStandingTests(unittest.TestCase):
                 {
                     "player_id": player["id"],
                     "round": 2,
+                    "hole": 1,
                     "round_score": 0,
                     "is_finished": False,
                 }
@@ -312,6 +315,7 @@ class LeaderboardStandingTests(unittest.TestCase):
             {
                 "player_id": player["id"],
                 "round": 1,
+                "hole": 1,
                 "round_score": score,
                 "is_finished": False,
             }

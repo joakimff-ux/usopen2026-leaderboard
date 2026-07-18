@@ -1,6 +1,11 @@
 import unittest
 
-from lib.competition_data import load_competition_data, resolve_course_par
+from lib.competition_data import (
+    leaderboard_positions,
+    load_competition_data,
+    resolve_course_par,
+)
+from lib.scoring import format_relative_score
 
 
 class FakeProductionDataSource:
@@ -91,6 +96,75 @@ class FakeProductionDataSource:
         return self.live_states
 
 
+class NineTeamProductionDataSource(FakeProductionDataSource):
+    TOTALS = {
+        "Philip": -18,
+        "Mats": -15,
+        "Christine": -15,
+        "Ulls": -15,
+        "Lars": -14,
+        "Johan": -13,
+        "Steven": -13,
+        "Joakim": -11,
+        "Thomas": -10,
+    }
+
+    def __init__(self):
+        self.teams = [
+            {"id": f"team-{name.casefold()}", "name": name}
+            for name in self.TOTALS
+        ]
+        self.players = []
+        self.team_players = []
+        self.scores = []
+        self.live_states = []
+        self.changes = []
+        for team in self.teams:
+            team_name = team["name"]
+            team_total = self.TOTALS[team_name]
+            for slot in range(1, 8):
+                player_id = f"{team['id']}-p{slot}"
+                self.players.append(
+                    {"id": player_id, "name": f"{team_name} Player {slot}", "tier": slot}
+                )
+                self.team_players.append(
+                    {"team_id": team["id"], "player_id": player_id}
+                )
+                r1_strokes = 70 + team_total if slot == 1 else (70 if slot <= 5 else 90)
+                self.scores.extend(
+                    [
+                        {
+                            "player_id": player_id,
+                            "round": 1,
+                            "strokes": r1_strokes,
+                            "is_official": True,
+                        },
+                        {
+                            "player_id": player_id,
+                            "round": 2,
+                            "strokes": 70 if slot <= 5 else 90,
+                            "is_official": True,
+                        },
+                        {
+                            "player_id": player_id,
+                            "round": 3,
+                            "strokes": 70,
+                            "is_official": True,
+                        },
+                    ]
+                )
+                self.live_states.append(
+                    {
+                        "player_id": player_id,
+                        "round": 3,
+                        "round_score": 0,
+                        "hole": None,
+                        "is_finished": False,
+                        "status": "ACTIVE",
+                    }
+                )
+
+
 class ProductionLeaderboardPathTests(unittest.TestCase):
     def test_royal_birkdale_uses_par_70(self):
         self.assertEqual(resolve_course_par({"course_name": "Royal Birkdale"}), 70)
@@ -132,6 +206,65 @@ class ProductionLeaderboardPathTests(unittest.TestCase):
         )["standings"][0]
         self.assertEqual(standing.round_totals[1], before_swaps.round_totals[1])
         self.assertEqual(standing.round_totals[2], before_swaps.round_totals[2])
+
+    def test_actual_app_path_sorts_all_nine_teams_and_rebuilds_positions(self):
+        data = load_competition_data(
+            object(),
+            "the-open-2026",
+            {"course_name": "Royal Birkdale"},
+            data_source=NineTeamProductionDataSource(),
+        )
+        standings = data["standings"]
+
+        self.assertEqual(
+            [(item.team_name, item.tournament_total) for item in standings],
+            [
+                ("Philip", -18),
+                ("Christine", -15),
+                ("Mats", -15),
+                ("Ulls", -15),
+                ("Lars", -14),
+                ("Johan", -13),
+                ("Steven", -13),
+                ("Joakim", -11),
+                ("Thomas", -10),
+            ],
+        )
+        self.assertEqual(leaderboard_positions(standings, 3), [1, 2, 2, 2, 5, 6, 6, 8, 9])
+        self.assertTrue(all(item.round_totals[3] is None for item in standings))
+        self.assertTrue(
+            all(format_relative_score(item.round_totals[3]) == "\u2014" for item in standings)
+        )
+
+    def test_real_zero_and_minus_two_round_three_scores_affect_total_and_order(self):
+        source = NineTeamProductionDataSource()
+        selected = {"Philip": [0, 0, 0, 0, 0], "Mats": [-2, 0, 0, 0, 0]}
+        for team_name, live_scores in selected.items():
+            for slot, round_score in enumerate(live_scores, start=1):
+                player_id = f"team-{team_name.casefold()}-p{slot}"
+                state = next(
+                    item for item in source.live_states if item["player_id"] == player_id
+                )
+                state["hole"] = slot
+                state["round_score"] = round_score
+
+        standings = load_competition_data(
+            object(),
+            "the-open-2026",
+            {"course_name": "Royal Birkdale"},
+            data_source=source,
+        )["standings"]
+        by_name = {item.team_name: item for item in standings}
+
+        self.assertEqual(by_name["Philip"].round_totals[3], 0)
+        self.assertEqual(format_relative_score(by_name["Philip"].round_totals[3]), "E")
+        self.assertEqual(by_name["Philip"].tournament_total, -18)
+        self.assertEqual(by_name["Mats"].round_totals[3], -2)
+        self.assertEqual(by_name["Mats"].tournament_total, -17)
+        self.assertLess(
+            standings.index(by_name["Mats"]),
+            standings.index(next(item for item in standings if item.team_name == "Christine")),
+        )
 
 
 if __name__ == "__main__":

@@ -125,6 +125,7 @@ class LeaderboardPreviewTests(unittest.TestCase):
                 {
                     "player_id": player["id"],
                     "round": 1,
+                    "hole": 1,
                     "round_score": 0,
                     "is_finished": False,
                 }
@@ -149,6 +150,7 @@ class LeaderboardPreviewTests(unittest.TestCase):
                 {
                     "player_id": player["id"],
                     "round": 1,
+                    "hole": 1,
                     "round_score": score,
                     "is_finished": False,
                 }

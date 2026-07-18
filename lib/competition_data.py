@@ -23,6 +23,26 @@ def resolve_course_par(tournament_rules: dict[str, Any]) -> int:
     return COURSE_PAR_BY_NAME.get(course_name, 72)
 
 
+def leaderboard_positions(
+    standings: list[scoring.TeamStanding],
+    active_round: int,
+) -> list[int]:
+    """Return competition ranks after total and active-round sorting."""
+    positions: list[int] = []
+    previous_key: tuple[int | None, int | None] | None = None
+    current_position = 0
+    for index, standing in enumerate(standings, start=1):
+        rank_key = (
+            standing.tournament_total,
+            standing.round_totals.get(active_round),
+        )
+        if index == 1 or rank_key != previous_key:
+            current_position = index
+        positions.append(current_position)
+        previous_key = rank_key
+    return positions
+
+
 def load_competition_data(
     client: Any,
     tournament_id: str,

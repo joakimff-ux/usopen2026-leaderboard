@@ -610,11 +610,17 @@ def page_leaderboard() -> None:
     with st.expander("Live scoring-status", expanded=False):
         render_sync_status(tournament)
 
+    active_round = leaderboard_preview.active_round_number(
+        data["scores"],
+        data["live_states"],
+        num_rounds=int(tournament.get("num_rounds", 4)),
+    )
+    positions = competition_data.leaderboard_positions(standings, active_round)
     rows = []
-    for index, standing in enumerate(standings, start=1):
+    for position, standing in zip(positions, standings):
         rows.append(
             {
-                "Rank": index,
+                "Rank": position,
                 "Team ID": str(standing.team_id),
                 "Team": standing.team_name,
                 "Selected": str(standing.team_id) == selected_team_id,
@@ -634,11 +640,6 @@ def page_leaderboard() -> None:
     if selected_team_id:
         selected_standing = next(
             standing for standing in standings if str(standing.team_id) == selected_team_id
-        )
-        active_round = leaderboard_preview.active_round_number(
-            data["scores"],
-            data["live_states"],
-            num_rounds=int(tournament.get("num_rounds", 4)),
         )
         preview_rows = leaderboard_preview.build_preview_rows(
             selected_standing,
